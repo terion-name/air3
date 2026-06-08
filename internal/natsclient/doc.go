@@ -1,2 +1,2 @@
-// Package natsclient will wrap NATS Core request/reply and publish/subscribe wiring.
+// Package natsclient publishes and consumes live NATS Core ticket messages.
 package natsclient
