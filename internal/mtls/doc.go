@@ -1,2 +1,3 @@
-// Package mtls will prepare mutual TLS settings for private control-plane links.
+// Package mtls prepares TLS configurations for NATS and private ingest links,
+// including server-side client certificate verification and client identities.
 package mtls
