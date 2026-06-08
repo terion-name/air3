@@ -35,6 +35,7 @@ services:
       AIR3_EDGE_INGEST_ADDR: ":9443"
       AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
       AIR3_ALLOWED_BUCKETS: "demo"
+      AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES: "connector-ingest-client"
       AIR3_PENDING_TTL: "5s"
       AIR3_STREAM_TIMEOUT: "30s"
       AIR3_SIGNING_SECRET: "dev-signing-secret-change-me"

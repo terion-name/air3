@@ -45,6 +45,16 @@ func validTicket(url, method string) tickets.Ticket {
 	return tickets.Ticket{Version: tickets.Version, RequestID: "req-1", Bucket: "demo-bucket", Key: "objects/file.txt", Method: method, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli(), IngestURL: url, IngestToken: "ingest-token"}
 }
 
+func TestConnectorSafeLogErrorRedactsDetails(t *testing.T) {
+	leakyErr := errors.New("post https://edge-gateway:9443/_ingest/req failed with secret=topsecret")
+	got := safeLogError(leakyErr)
+	for _, secret := range []string{"edge-gateway", "9443", "topsecret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("safeLogError() leaked %q in %q", secret, got)
+		}
+	}
+}
+
 func TestConnectorStreamsFetchedObjectToIngest(t *testing.T) {
 	var gotToken, gotStatus, gotContentType, gotBody string
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +77,30 @@ func TestConnectorStreamsFetchedObjectToIngest(t *testing.T) {
 	}
 	if len(fetcher.requests) != 1 || fetcher.requests[0].Bucket != "demo-bucket" || fetcher.requests[0].Key != "objects/file.txt" {
 		t.Fatalf("fetch requests = %#v", fetcher.requests)
+	}
+}
+
+func TestConnectorPassesRangeToFetcherAndIngest(t *testing.T) {
+	var gotStatus, gotContentRange string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotStatus = r.Header.Get(ingest.StatusCodeHeader)
+		gotContentRange = r.Header.Get("Content-Range")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusPartialContent, ContentLength: 5, ContentRange: "bytes 0-4/11", AcceptRanges: "bytes", Body: io.NopCloser(strings.NewReader("hello"))}}
+	worker := newConnector(connectorConfig(), fetcher, ts.Client(), nil)
+	ticket := validTicket(ts.URL, http.MethodGet)
+	ticket.Range = "bytes=0-4"
+	if err := worker.handleTicket(context.Background(), ticket); err != nil {
+		t.Fatalf("handleTicket() error = %v", err)
+	}
+	if len(fetcher.requests) != 1 || fetcher.requests[0].Range != "bytes=0-4" {
+		t.Fatalf("fetch requests = %#v, want signed range forwarded", fetcher.requests)
+	}
+	if gotStatus != "206" || gotContentRange != "bytes 0-4/11" {
+		t.Fatalf("ingest status=%q content-range=%q", gotStatus, gotContentRange)
 	}
 }
 
@@ -109,6 +143,26 @@ func TestConnectorMissingObjectPosts404Metadata(t *testing.T) {
 	}
 	if gotStatus != "404" || gotBody != "" {
 		t.Fatalf("status=%q body=%q, want 404 empty", gotStatus, gotBody)
+	}
+}
+
+func TestConnectorDropsUnsafeMetadataHeaderValues(t *testing.T) {
+	h := http.Header{}
+	metadataForObject(&s3fetch.Object{
+		StatusCode:    http.StatusOK,
+		ContentType:   "text/plain\r\nX-Leak: secret",
+		ContentLength: 7,
+		ContentRange:  "bytes 0-6/7",
+		ETag:          "\"abc\"\r\nSet-Cookie: leak",
+		LastModified:  "Mon, 08 Jun 2026 12:00:00 GMT",
+		AcceptRanges:  "bytes",
+	}).setHeaders(h)
+
+	if h.Get("Content-Type") != "" || h.Get("ETag") != "" {
+		t.Fatalf("unsafe headers were propagated: %#v", h)
+	}
+	if h.Get(ingest.StatusCodeHeader) != "200" || h.Get(ingest.ObjectContentLengthHeader) != "7" || h.Get("Content-Range") != "bytes 0-6/7" {
+		t.Fatalf("safe headers missing: %#v", h)
 	}
 }
 

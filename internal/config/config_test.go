@@ -52,6 +52,21 @@ func TestLoadConnectorParsesS3AndDoesNotRequireSigning(t *testing.T) {
 	}
 }
 
+func TestLoadEdgeParsesAllowedConnectorIdentities(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED":                  "true",
+		"AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES": "connector-ingest-client, spiffe://air3/demo/connector ,connector-ingest-client",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	want := []string{"connector-ingest-client", "spiffe://air3/demo/connector"}
+	if !reflect.DeepEqual(cfg.AllowedConnectorIdentities, want) {
+		t.Fatalf("AllowedConnectorIdentities = %#v, want %#v", cfg.AllowedConnectorIdentities, want)
+	}
+}
+
 func TestLoadNATSUserPassword(t *testing.T) {
 	env := map[string]string{
 		"AIR3_SIGNING_DISABLED": "true",

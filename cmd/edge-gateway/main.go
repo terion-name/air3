@@ -43,7 +43,7 @@ type edgeServer struct {
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if err := run(context.Background(), logger); err != nil {
-		logger.Error("edge gateway stopped", "error", err)
+		logger.Error("edge gateway stopped", "error", safeLogError(err))
 		os.Exit(1)
 	}
 }
@@ -66,7 +66,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	reg := pending.NewRegistry(pending.Options{})
 	edge := newEdgeServer(cfg, reg, publisher, logger)
-	ingestHandler, err := ingest.NewHandler(ingest.Options{Registry: reg})
+	ingestHandler, err := ingest.NewHandler(ingest.Options{Registry: reg, AllowedConnectorIdentities: cfg.AllowedConnectorIdentities})
 	if err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	err = s.publisher.PublishTicket(publishCtx, ticket)
 	cancelPublish()
 	if err != nil {
-		s.logger.Warn("ticket publish failed", "request_id", reqID, "error", err)
+		s.logger.Warn("ticket publish failed", "request_id", reqID, "error", safeLogError(err))
 		writePublicError(w, http.StatusServiceUnavailable, "backend unavailable")
 		return
 	}
@@ -182,7 +182,7 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		s.logger.Warn("public response stream failed", "request_id", reqID, "error", err)
+		s.logger.Warn("public response stream failed", "request_id", reqID, "error", safeLogError(err))
 	}
 }
 
@@ -322,6 +322,13 @@ func statusText(status int) string {
 		return "request failed"
 	}
 	return strings.ToLower(text)
+}
+
+func safeLogError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "redacted"
 }
 
 func writePublicError(w http.ResponseWriter, status int, message string) {

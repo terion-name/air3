@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -32,6 +34,12 @@ func (p *fakePublisher) PublishTicket(ctx context.Context, t tickets.Ticket) err
 		p.on(t)
 	}
 	return p.err
+}
+
+func (p *fakePublisher) snapshot() []tickets.Ticket {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]tickets.Ticket(nil), p.tickets...)
 }
 
 func (p *fakePublisher) count() int {
@@ -108,6 +116,118 @@ func TestSignedURLAcceptedAndPublishesTicket(t *testing.T) {
 	edge.ServeHTTP(resp, req)
 	if got := pub.count(); got != 1 {
 		t.Fatalf("published %d tickets, want 1", got)
+	}
+}
+
+func TestRangeRequestValidationAndTicketPropagation(t *testing.T) {
+	t.Run("valid unsigned range is included in ticket", func(t *testing.T) {
+		pub := &fakePublisher{err: errors.New("stop after publish")}
+		edge, _ := testEdge(pub, time.Second)
+		req := httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil)
+		req.Header.Set("Range", "bytes=0-4")
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, req)
+
+		tickets := pub.snapshot()
+		if len(tickets) != 1 || tickets[0].Range != "bytes=0-4" {
+			t.Fatalf("published tickets = %#v, want one ticket with range", tickets)
+		}
+	})
+
+	t.Run("invalid range is rejected before publish", func(t *testing.T) {
+		pub := &fakePublisher{}
+		edge, _ := testEdge(pub, time.Second)
+		req := httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil)
+		req.Header.Set("Range", "bytes=10-1")
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, req)
+
+		if got := resp.Result().StatusCode; got != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+		}
+		if pub.count() != 0 {
+			t.Fatalf("published %d tickets, want 0", pub.count())
+		}
+	})
+
+	t.Run("signed range query is included in ticket", func(t *testing.T) {
+		pub := &fakePublisher{err: errors.New("stop after publish")}
+		now := time.Now()
+		edge := newEdgeServer(config.EdgeConfig{
+			IngestURL:      "https://edge.internal/_ingest",
+			AllowedBuckets: []string{"demo-bucket"},
+			Signing:        config.SigningConfig{Secret: "secret"},
+			Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
+		}, pending.NewRegistry(pending.Options{}), pub, nil)
+		edge.now = func() time.Time { return now }
+		edge.newToken = func() (string, error) { return "signed-range-token", nil }
+
+		signed, err := signing.SignURL(signing.SignInput{Method: http.MethodGet, BaseURL: "https://files.example", Bucket: "demo-bucket", Key: "file.txt", Range: "bytes=0-4", Expires: now.Add(time.Minute), Secret: "secret"})
+		if err != nil {
+			t.Fatalf("SignURL() error = %v", err)
+		}
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, signed, nil))
+
+		tickets := pub.snapshot()
+		if len(tickets) != 1 || tickets[0].Range != "bytes=0-4" {
+			t.Fatalf("published tickets = %#v, want one ticket with signed range", tickets)
+		}
+	})
+
+	t.Run("signed range must be part of signature", func(t *testing.T) {
+		pub := &fakePublisher{}
+		now := time.Now()
+		edge := newEdgeServer(config.EdgeConfig{
+			IngestURL:      "https://edge.internal/_ingest",
+			AllowedBuckets: []string{"demo-bucket"},
+			Signing:        config.SigningConfig{Secret: "secret"},
+			Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
+		}, pending.NewRegistry(pending.Options{}), pub, nil)
+		edge.now = func() time.Time { return now }
+
+		signed, err := signing.SignURL(signing.SignInput{Method: http.MethodGet, BaseURL: "https://files.example", Bucket: "demo-bucket", Key: "file.txt", Expires: now.Add(time.Minute), Secret: "secret"})
+		if err != nil {
+			t.Fatalf("SignURL() error = %v", err)
+		}
+		req := httptest.NewRequest(http.MethodGet, signed, nil)
+		req.Header.Set("Range", "bytes=0-4")
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, req)
+
+		if got := resp.Result().StatusCode; got != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+		}
+		if pub.count() != 0 {
+			t.Fatalf("published %d tickets, want 0", pub.count())
+		}
+	})
+}
+
+func TestPublicErrorAndRequestLogsDoNotLeakSensitiveDetails(t *testing.T) {
+	leakyErr := errors.New("dial nats://edge:password@private-nats.internal:4222 subject air3.tickets secret=topsecret")
+	var logBuffer bytes.Buffer
+	edge, _ := testEdge(&fakePublisher{err: leakyErr}, time.Second)
+	edge.logger = slog.New(slog.NewTextHandler(&logBuffer, nil))
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil))
+
+	if got := resp.Result().StatusCode; got != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+	body := resp.Body.String()
+	logs := logBuffer.String()
+	for _, secret := range []string{"password", "private-nats.internal", "air3.tickets", "topsecret"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("public body leaked %q: %q", secret, body)
+		}
+		if strings.Contains(logs, secret) {
+			t.Fatalf("logs leaked %q: %q", secret, logs)
+		}
+	}
+	if !strings.Contains(body, "backend unavailable") {
+		t.Fatalf("public body = %q, want generic backend unavailable message", body)
 	}
 }
 

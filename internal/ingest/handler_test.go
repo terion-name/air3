@@ -176,6 +176,15 @@ func TestHandlerRequiresConfiguredMTLSIdentity(t *testing.T) {
 		t.Fatalf("missing cert status = %d, want %d", got, http.StatusUnauthorized)
 	}
 
+	denied := httptest.NewRequest(http.MethodPost, PathPrefix+req.ID, strings.NewReader("body"))
+	denied.Header.Set(TokenHeader, req.IngestToken)
+	denied.TLS = tlsState{cert: certificate("connector-b")}.connectionState()
+	deniedRecorder := httptest.NewRecorder()
+	h.ServeHTTP(deniedRecorder, denied)
+	if got := deniedRecorder.Result().StatusCode; got != http.StatusUnauthorized {
+		t.Fatalf("wrong cert status = %d, want %d", got, http.StatusUnauthorized)
+	}
+
 	allowed := httptest.NewRequest(http.MethodPost, PathPrefix+req.ID, strings.NewReader("body"))
 	allowed.Header.Set(TokenHeader, req.IngestToken)
 	allowed.TLS = tlsState{cert: certificate("connector-a")}.connectionState()

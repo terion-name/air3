@@ -38,7 +38,7 @@ type connector struct {
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if err := run(context.Background(), logger); err != nil {
-		logger.Error("private connector stopped", "error", err)
+		logger.Error("private connector stopped", "error", safeLogError(err))
 		os.Exit(1)
 	}
 }
@@ -70,7 +70,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	defer nats.Close()
 
 	sub, err := nats.QueueSubscribeTickets(ctx, worker.handleTicket, func(err error) {
-		logger.Warn("ticket handling failed", "error", err)
+		logger.Warn("ticket handling failed", "error", safeLogError(err))
 	})
 	if err != nil {
 		return err
@@ -185,6 +185,13 @@ func (m ingestMetadata) setHeaders(h http.Header) {
 	setSafeHeader(h, "ETag", m.ETag)
 	setSafeHeader(h, "Last-Modified", m.LastModified)
 	setSafeHeader(h, "Accept-Ranges", m.AcceptRanges)
+}
+
+func safeLogError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "redacted"
 }
 
 func setSafeHeader(h http.Header, name, value string) {

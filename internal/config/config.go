@@ -18,14 +18,15 @@ type Options struct {
 }
 
 type EdgeConfig struct {
-	PublicListenAddr string
-	IngestListenAddr string
-	IngestURL        string
-	AllowedBuckets   []string
-	NATS             NATSConfig
-	Signing          SigningConfig
-	MTLS             MTLSPaths
-	Timeouts         TimeoutConfig
+	PublicListenAddr           string
+	IngestListenAddr           string
+	IngestURL                  string
+	AllowedBuckets             []string
+	AllowedConnectorIdentities []string
+	NATS                       NATSConfig
+	Signing                    SigningConfig
+	MTLS                       MTLSPaths
+	Timeouts                   TimeoutConfig
 }
 
 type ConnectorConfig struct {
@@ -94,6 +95,10 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	}
 	var err error
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
+	if err != nil {
+		return EdgeConfig{}, err
+	}
+	cfg.AllowedConnectorIdentities, err = env.optionalList("AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES")
 	if err != nil {
 		return EdgeConfig{}, err
 	}
@@ -348,6 +353,30 @@ func (e envReader) list(name, fallback string) ([]string, error) {
 		if !seen[bucket] {
 			out = append(out, bucket)
 			seen[bucket] = true
+		}
+	}
+	return out, nil
+}
+
+func (e envReader) optionalList(name string) ([]string, error) {
+	text, ok := e.lookup(name)
+	if !ok || strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(text, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			return nil, fmt.Errorf("%s contains an empty entry", name)
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("%s contains an unsafe entry", name)
+		}
+		if !seen[value] {
+			out = append(out, value)
+			seen[value] = true
 		}
 	}
 	return out, nil
