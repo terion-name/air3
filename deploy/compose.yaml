@@ -1,0 +1,126 @@
+name: air3-demo
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    networks:
+      - broker
+    volumes:
+      - ./nats/nats.conf:/etc/nats/nats.conf:ro
+      - ./certs/generated:/etc/nats/certs:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  edge-gateway:
+    build:
+      context: ..
+    image: air3:demo
+    command: ["/usr/local/bin/edge-gateway"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - public
+      - broker
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./certs/generated:/certs:ro
+    environment:
+      AIR3_EDGE_PUBLIC_ADDR: ":8443"
+      AIR3_EDGE_INGEST_ADDR: ":9443"
+      AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
+      AIR3_ALLOWED_BUCKETS: "demo"
+      AIR3_PENDING_TTL: "5s"
+      AIR3_STREAM_TIMEOUT: "30s"
+      AIR3_SIGNING_SECRET: "dev-signing-secret-change-me"
+      AIR3_EDGE_MTLS_CA_FILE: "/certs/dev-ca.crt"
+      AIR3_EDGE_MTLS_CERT_FILE: "/certs/edge-server.crt"
+      AIR3_EDGE_MTLS_KEY_FILE: "/certs/edge-server.key"
+      AIR3_NATS_URL: "tls://nats:4222"
+      AIR3_NATS_SUBJECT: "air3.tickets"
+      AIR3_NATS_USER: "edge"
+      AIR3_NATS_PASSWORD: "edge-demo-pass"
+      AIR3_NATS_TLS_CA_FILE: "/certs/dev-ca.crt"
+      AIR3_NATS_TLS_CERT_FILE: "/certs/edge-nats-client.crt"
+      AIR3_NATS_TLS_KEY_FILE: "/certs/edge-nats-client.key"
+      AIR3_NATS_TLS_SERVER_NAME: "nats"
+
+  private-connector:
+    build:
+      context: ..
+    image: air3:demo
+    command: ["/usr/local/bin/private-connector"]
+    depends_on:
+      nats:
+        condition: service_healthy
+      versitygw:
+        condition: service_started
+    networks:
+      - broker
+      - private
+    volumes:
+      - ./certs/generated:/certs:ro
+    environment:
+      AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
+      AIR3_ALLOWED_BUCKETS: "demo"
+      AIR3_PENDING_TTL: "5s"
+      AIR3_STREAM_TIMEOUT: "30s"
+      AIR3_CONNECTOR_MTLS_CA_FILE: "/certs/dev-ca.crt"
+      AIR3_CONNECTOR_MTLS_CERT_FILE: "/certs/connector-ingest-client.crt"
+      AIR3_CONNECTOR_MTLS_KEY_FILE: "/certs/connector-ingest-client.key"
+      AIR3_CONNECTOR_MTLS_SERVER_NAME: "edge-gateway"
+      AIR3_NATS_URL: "tls://nats:4222"
+      AIR3_NATS_SUBJECT: "air3.tickets"
+      AIR3_NATS_QUEUE: "air3-connectors"
+      AIR3_NATS_USER: "connector"
+      AIR3_NATS_PASSWORD: "connector-demo-pass"
+      AIR3_NATS_TLS_CA_FILE: "/certs/dev-ca.crt"
+      AIR3_NATS_TLS_CERT_FILE: "/certs/connector-nats-client.crt"
+      AIR3_NATS_TLS_KEY_FILE: "/certs/connector-nats-client.key"
+      AIR3_NATS_TLS_SERVER_NAME: "nats"
+      AIR3_S3_ENDPOINT: "http://versitygw:10000"
+      AIR3_S3_REGION: "us-east-1"
+      AIR3_S3_ALLOWED_BUCKETS: "demo"
+      AIR3_S3_ACCESS_KEY_ID: "testuser"
+      AIR3_S3_SECRET_ACCESS_KEY: "secret"
+      AIR3_S3_USE_PATH_STYLE: "true"
+
+  versitygw:
+    image: versity/versitygw:latest
+    command: ["--port", ":10000", "--iam-dir", "/tmp/vgw-iam", "posix", "--versioning-dir", "/tmp/vgw-versions", "/tmp/vgw-data"]
+    networks:
+      - private
+    environment:
+      ROOT_ACCESS_KEY: "testuser"
+      ROOT_SECRET_KEY: "secret"
+    volumes:
+      - versity-data:/tmp/vgw-data
+      - versity-iam:/tmp/vgw-iam
+      - versity-versions:/tmp/vgw-versions
+
+  aws-cli:
+    image: amazon/aws-cli:latest
+    profiles: ["tools"]
+    networks:
+      - private
+    environment:
+      AWS_ACCESS_KEY_ID: "testuser"
+      AWS_SECRET_ACCESS_KEY: "secret"
+      AWS_DEFAULT_REGION: "us-east-1"
+    entrypoint: ["/bin/sh", "-c"]
+
+networks:
+  public: {}
+  broker: {}
+  private:
+    internal: true
+
+volumes:
+  versity-data: {}
+  versity-iam: {}
+  versity-versions: {}

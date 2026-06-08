@@ -44,6 +44,8 @@ type NATSConfig struct {
 	TLS        MTLSPaths
 	CredsFile  string
 	NKeyFile   string
+	User       string
+	Password   string
 }
 
 type S3Config struct {
@@ -160,6 +162,8 @@ func loadNATS(env envReader, edge bool) (NATSConfig, error) {
 		QueueGroup: env.get("AIR3_NATS_QUEUE", queueDefault),
 		CredsFile:  env.get("AIR3_NATS_CREDS_FILE", ""),
 		NKeyFile:   env.get("AIR3_NATS_NKEY_FILE", ""),
+		User:       env.get("AIR3_NATS_USER", ""),
+		Password:   env.get("AIR3_NATS_PASSWORD", ""),
 	}
 	var err error
 	cfg.TLS, err = loadMTLS(env, "AIR3_NATS_TLS")
@@ -168,6 +172,9 @@ func loadNATS(env envReader, edge bool) (NATSConfig, error) {
 	}
 	if cfg.URL == "" || cfg.Subject == "" {
 		return NATSConfig{}, errors.New("nats url and subject are required")
+	}
+	if (cfg.User == "") != (cfg.Password == "") {
+		return NATSConfig{}, errors.New("nats user and password must be configured together")
 	}
 	if err := env.requireFile("AIR3_NATS_CREDS_FILE", cfg.CredsFile); err != nil {
 		return NATSConfig{}, err

@@ -52,6 +52,29 @@ func TestLoadConnectorParsesS3AndDoesNotRequireSigning(t *testing.T) {
 	}
 }
 
+func TestLoadNATSUserPassword(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED": "true",
+		"AIR3_NATS_USER":        "edge",
+		"AIR3_NATS_PASSWORD":    "secret",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.NATS.User != "edge" || cfg.NATS.Password != "secret" {
+		t.Fatalf("NATS user/password not parsed: %#v", cfg.NATS)
+	}
+
+	_, err = LoadEdge(testOptions(map[string]string{
+		"AIR3_SIGNING_DISABLED": "true",
+		"AIR3_NATS_USER":        "edge",
+	}, nil))
+	if err == nil || !strings.Contains(err.Error(), "user and password") {
+		t.Fatalf("LoadEdge() error = %v, want NATS user/password pair error", err)
+	}
+}
+
 func TestLoadConnectorRequiresS3Credentials(t *testing.T) {
 	if _, err := LoadConnector(testOptions(nil, nil)); err == nil || !strings.Contains(err.Error(), "s3 access key") {
 		t.Fatalf("LoadConnector() error = %v, want S3 credential error", err)

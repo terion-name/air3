@@ -1,8 +1,10 @@
 BIN_DIR := bin
 COMMANDS := edge-gateway private-connector signurl
 GO_PACKAGES := ./...
+COMPOSE_FILE := deploy/compose.yaml
+COMPOSE := docker compose -f $(COMPOSE_FILE)
 
-.PHONY: fmt test build validate compose-up compose-down certs seed smoke clean
+.PHONY: fmt test build validate compose-config compose-up compose-down certs seed smoke e2e clean
 
 fmt:
 	gofmt -w cmd internal
@@ -16,22 +18,27 @@ build:
 	go build -o $(BIN_DIR)/private-connector ./cmd/private-connector
 	go build -o $(BIN_DIR)/signurl ./cmd/signurl
 
-validate: fmt test build
+compose-config:
+	$(COMPOSE) config >/dev/null
 
-compose-up:
-	@echo "Docker Compose environment is not implemented yet."
-
-compose-down:
-	@echo "Docker Compose environment is not implemented yet."
+validate: fmt test build compose-config
 
 certs:
-	@echo "Certificate generation is not implemented yet."
+	./deploy/scripts/certs.sh
+
+compose-up:
+	$(COMPOSE) up -d --build
+
+compose-down:
+	$(COMPOSE) down --remove-orphans
 
 seed:
-	@echo "S3 seed data setup is not implemented yet."
+	./deploy/scripts/seed-s3.sh
 
 smoke:
-	@echo "Smoke tests are not implemented yet."
+	./deploy/scripts/smoke.sh
+
+e2e: certs compose-up seed smoke compose-down
 
 clean:
 	rm -rf $(BIN_DIR)

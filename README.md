@@ -1,54 +1,93 @@
 # air3: NATS S3 File Gateway
 
-air3 is a planned file gateway that lets an edge service coordinate uploads and downloads with a private connector over NATS while keeping object bytes out of the NATS control plane.
+air3 is a file gateway that lets an edge service coordinate signed public object downloads with a private connector over NATS while keeping object bytes out of the NATS control plane.
 
 ## Architecture constraints
 
-- **NATS Core only:** the gateway uses NATS Core request/reply and publish/subscribe patterns; JetStream is out of scope.
+- **NATS Core only:** the gateway uses NATS Core publish/subscribe patterns; JetStream is out of scope.
 - **No object bytes through NATS:** NATS carries control messages, tickets, and status only. File content moves over HTTP/S3 paths.
 - **Single edge gateway:** the edge gateway is intentionally single-instance for the approved design.
-- **Connector-only S3 credentials:** the edge gateway must not have S3 credentials. S3 access belongs to the private connector side.
+- **Connector-only S3 credentials:** the edge gateway has no S3 credentials and is not attached to the private S3 network. S3 access belongs to the private connector side.
 
-## Planned components
+## Components
 
-- `cmd/edge-gateway`: public edge entry point for client upload/download requests.
-- `cmd/private-connector`: private-side connector that can access S3 and respond to edge control-plane requests.
-- `cmd/signurl`: development utility planned for signing URL workflows.
-- `internal/config`: configuration loading and validation.
+- `cmd/edge-gateway`: public HTTPS entry point for signed `GET`/`HEAD` object requests and private mTLS ingest listener for connector responses.
+- `cmd/private-connector`: private-side worker that receives NATS Core tickets, fetches from S3-compatible storage, and posts object bytes to the edge ingest listener.
+- `cmd/signurl`: development utility for signing public object URLs.
+- `internal/config`: environment configuration loading and validation.
 - `internal/tickets`: transfer ticket models.
-- `internal/signing`: ticket signing and verification.
-- `internal/mtls`: mutual TLS support.
+- `internal/signing`: signed URL HMAC creation and verification.
+- `internal/mtls`: TLS and mTLS support.
 - `internal/natsclient`: NATS Core client wiring.
 - `internal/pending`: in-flight request tracking.
-- `internal/ingest`: edge-side HTTP flow coordination.
-- `internal/s3fetch`: connector-side S3 coordination.
-
-Runtime behavior is not implemented yet. This repository currently contains the compiling foundation for those components.
+- `internal/ingest`: edge-side ingest coordination.
+- `internal/s3fetch`: connector-side S3 object fetching.
 
 ## Development
 
-Prerequisites for the current skeleton:
+Prerequisites:
 
 - Go 1.22 or newer
 - `make`
+- Docker with the Compose plugin for the demo environment
+- `openssl` for development certificate generation
+- `curl` for smoke tests
 
 Common commands:
 
 ```sh
-make fmt       # format Go code
-make test      # run Go tests
-make build     # build placeholder binaries into ./bin
-make validate  # format, test, and build
+make fmt             # format Go code
+make test            # run Go tests
+make build           # build binaries into ./bin
+make compose-config  # validate deploy/compose.yaml
+make validate        # format, test, build, and validate Compose config
 ```
 
-The following quickstart steps are planned but not implemented yet:
+## Docker Compose demo quickstart
 
-1. Generate development certificates with `make certs`.
-2. Start NATS, S3-compatible storage, the edge gateway, and the private connector with `make compose-up`.
-3. Seed S3 test data with `make seed`.
-4. Run smoke tests with `make smoke`.
-5. Stop local services with `make compose-down`.
+The demo starts four runtime services:
 
-## Docker
+- `edge-gateway` on the `public` and `broker` networks, with public HTTPS exposed on <https://localhost:8443>.
+- `private-connector` on the `broker` and `private` networks, with no host-published application port.
+- `nats` on the `broker` network, using TLS/mTLS and NATS Core only.
+- `versitygw` on the `private` network only, with no host-published S3 port.
 
-The root `Dockerfile` builds all three placeholder binaries into a small runtime image. Runtime image layout and entrypoint conventions may change once the gateway behavior is implemented.
+Generated development certificates live under `deploy/certs/generated/`, which is ignored by git.
+
+Run the end-to-end demo:
+
+```sh
+make certs
+make compose-up
+make seed
+make smoke
+make compose-down
+```
+
+Or run the same sequence as one target:
+
+```sh
+make e2e
+```
+
+`make smoke` verifies:
+
+- signed `GET` returns the seeded object content,
+- signed `HEAD` succeeds without a response body,
+- bad and expired signatures are rejected,
+- missing objects map to `404`,
+- connector downtime maps to a gateway timeout and fresh requests work after restart,
+- the edge container cannot connect directly to `versitygw:10000`.
+
+If Docker is unavailable, `make validate` remains the local non-e2e validation path. It runs Go formatting, Go tests, binary builds, and `docker compose -f deploy/compose.yaml config`.
+
+## Demo configuration details
+
+- NATS config is in `deploy/nats/nats.conf`. It enables TLS with client certificate verification and does not configure JetStream, streams, or persistence.
+- Dev certificates are generated by `deploy/scripts/certs.sh` for the local CA, NATS server, edge server, edge NATS client, connector NATS client, and connector ingest client.
+- S3 seed data is created by `deploy/scripts/seed-s3.sh` using the `amazon/aws-cli` helper service on the private network.
+- Smoke tests are implemented in `deploy/scripts/smoke.sh` and use `cmd/signurl` to produce signed URLs.
+
+## Docker image
+
+The root `Dockerfile` builds all three binaries into a small runtime image. The Compose demo overrides the command per service to run either `/usr/local/bin/edge-gateway` or `/usr/local/bin/private-connector`.

@@ -173,6 +173,9 @@ func options(ctx context.Context, cfg config.NATSConfig) ([]nats.Option, error) 
 		}
 		opts = append(opts, nats.Secure(tlsCfg))
 	}
+	if cfg.User != "" {
+		opts = append(opts, nats.UserInfo(cfg.User, cfg.Password))
+	}
 	if cfg.CredsFile != "" {
 		opts = append(opts, nats.UserCredentials(cfg.CredsFile))
 	}
