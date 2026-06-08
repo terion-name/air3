@@ -57,7 +57,9 @@ make fmt             # format Go code
 make test            # run Go tests
 make build           # build binaries into ./bin
 make compose-config  # validate deploy/compose.yaml
-make validate        # format, test, build, and validate Compose config
+make validate        # format, test all packages, build, and validate Compose config
+make ts-test         # run TypeScript edge signing package tests
+make python-test     # run Python edge signing package tests
 go test ./... -race  # run race-enabled Go tests (expected to pass)
 ```
 
@@ -115,7 +117,70 @@ make e2e
 - connector downtime maps to a gateway timeout and fresh requests work after restart,
 - the edge container cannot connect directly to `versitygw:10000`.
 
-If Docker is unavailable, `make validate` remains the local non-e2e validation path. It runs Go formatting, Go tests, binary builds, and `docker compose -f deploy/compose.yaml config`.
+If Docker is unavailable, `make validate` remains the local non-e2e validation path, except for the final Compose config check. It runs Go formatting, Go tests, TypeScript and Python edge signing package tests, binary builds, and `docker compose -f deploy/compose.yaml config`.
+
+## Edge signed URL packages
+
+Applications can generate and verify air3 edge signed URLs from importable packages under `packages/`:
+
+- Go: `packages/go/edgesign` (`github.com/terion-name/air3/packages/go/edgesign`)
+- TypeScript: `packages/ts`, exporting pure functions from `src/index.ts`
+- Python: `packages/python/edgesign`
+
+These helpers create **edge gateway signed URLs**, not S3 SigV4 presigned URLs. The edge gateway verifies the HMAC signature before it publishes a NATS Core ticket for the private connector; the signed URL is never a direct S3 credential or S3 API authorization.
+
+The signature covers these canonical newline-delimited fields: HTTP method, bucket, key, Unix expiration seconds, optional signed byte range, optional response content type, and optional response content disposition. If a public request sends a `Range` header while signing is enabled, that exact range must be included in the signed URL.
+
+Go example:
+
+```go
+raw, err := edgesign.SignURL(edgesign.SignInput{
+    Method:  "GET",
+    BaseURL: "https://files.example.com",
+    Bucket:  "demo-bucket",
+    Key:     "dir/object.txt",
+    Secret:  signingSecret,
+    Expires: time.Now().Add(15 * time.Minute),
+    Range:   "bytes=0-99", // optional
+})
+```
+
+TypeScript example:
+
+```ts
+import { signUrl, verifyUrl } from './packages/ts/src/index.ts';
+
+const raw = signUrl({
+  method: 'GET',
+  baseUrl: 'https://files.example.com',
+  bucket: 'demo-bucket',
+  key: 'dir/object.txt',
+  secret: signingSecret,
+  expires: Math.floor(Date.now() / 1000) + 900,
+  range: 'bytes=0-99', // optional
+});
+
+const claims = verifyUrl({ method: 'GET', url: raw, secret: signingSecret, now: Date.now() / 1000 });
+```
+
+Python example:
+
+```python
+from datetime import datetime, timedelta, timezone
+from edgesign import sign_url, verify_url
+
+raw = sign_url(
+    method="GET",
+    base_url="https://files.example.com",
+    bucket="demo-bucket",
+    key="dir/object.txt",
+    secret=signing_secret,
+    expires=datetime.now(timezone.utc) + timedelta(minutes=15),
+    range="bytes=0-99",  # optional
+)
+
+claims = verify_url(method="GET", url=raw, secret=signing_secret, now=datetime.now(timezone.utc))
+```
 
 ## HTTP and Range behavior
 

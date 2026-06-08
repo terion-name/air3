@@ -1,0 +1,54 @@
+[
+  {
+    "name": "vector-1",
+    "input": {
+      "method": "GET",
+      "baseUrl": "https://files.example.com",
+      "bucket": "demo-bucket",
+      "key": "dir/object.txt",
+      "secret": "top-secret",
+      "expires": 1780938000,
+      "range": "bytes=0-9",
+      "responseContentType": "text/plain"
+    },
+    "now": 1780934400,
+    "canonical": "GET\ndemo-bucket\ndir/object.txt\n1780938000\nbytes=0-9\ntext/plain\n",
+    "signature": "38c3a3d595419c343d039a66618c9e2b21ed56bae704fe615061223dc73f65b8",
+    "url": "https://files.example.com/demo-bucket/dir/object.txt?expires=1780938000\u0026range=bytes%3D0-9\u0026response-content-type=text%2Fplain\u0026sig=38c3a3d595419c343d039a66618c9e2b21ed56bae704fe615061223dc73f65b8",
+    "verifyRange": "bytes=0-9"
+  },
+  {
+    "name": "vector-2",
+    "input": {
+      "method": "HEAD",
+      "baseUrl": "https://files.example.com?tenant=acme\u0026foo=bar",
+      "bucket": "demo-bucket",
+      "key": "reports/2026/Q2+summary.txt",
+      "secret": "another-secret",
+      "expires": 1780941600,
+      "responseContentDisposition": "attachment; filename=\"q2.txt\""
+    },
+    "now": 1780934400,
+    "canonical": "HEAD\ndemo-bucket\nreports/2026/Q2+summary.txt\n1780941600\n\n\nattachment; filename=\"q2.txt\"",
+    "signature": "1b1d7a20d8897f624c6bdd10c047b942905e6af422127dc9833758c03f9d34b9",
+    "url": "https://files.example.com/demo-bucket/reports/2026/Q2+summary.txt?expires=1780941600\u0026foo=bar\u0026response-content-disposition=attachment%3B+filename%3D%22q2.txt%22\u0026sig=1b1d7a20d8897f624c6bdd10c047b942905e6af422127dc9833758c03f9d34b9\u0026tenant=acme"
+  },
+  {
+    "name": "vector-3",
+    "input": {
+      "method": "GET",
+      "baseUrl": "http://localhost:8080",
+      "bucket": "media.bucket",
+      "key": "video:clip@1.mp4",
+      "secret": "range-secret",
+      "expires": 1780945200,
+      "range": "bytes=100-",
+      "responseContentType": "video/mp4"
+    },
+    "now": 1780934400,
+    "canonical": "GET\nmedia.bucket\nvideo:clip@1.mp4\n1780945200\nbytes=100-\nvideo/mp4\n",
+    "signature": "c295a6b761947ed18cce59e3c0a6c57f3ff687f8dd21d9d598ee82e9d0a80e11",
+    "url": "http://localhost:8080/media.bucket/video:clip@1.mp4?expires=1780945200\u0026range=bytes%3D100-\u0026response-content-type=video%2Fmp4\u0026sig=c295a6b761947ed18cce59e3c0a6c57f3ff687f8dd21d9d598ee82e9d0a80e11",
+    "verifyRange": "bytes=100-"
+  }
+]

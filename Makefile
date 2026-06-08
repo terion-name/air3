@@ -4,13 +4,19 @@ GO_PACKAGES := ./...
 COMPOSE_FILE := deploy/compose.yaml
 COMPOSE := docker compose -f $(COMPOSE_FILE)
 
-.PHONY: fmt test build validate compose-config compose-up compose-down certs seed smoke e2e clean
+.PHONY: fmt test ts-test python-test build validate compose-config compose-up compose-down certs seed smoke e2e clean
 
 fmt:
-	gofmt -w cmd internal
+	gofmt -w cmd internal packages/go
 
 test:
 	go test $(GO_PACKAGES)
+
+ts-test:
+	npm --prefix packages/ts test
+
+python-test:
+	PYTHONPATH=packages/python python3 -m unittest discover -s packages/python/tests
 
 build:
 	mkdir -p $(BIN_DIR)
@@ -21,7 +27,7 @@ build:
 compose-config:
 	$(COMPOSE) config >/dev/null
 
-validate: fmt test build compose-config
+validate: fmt test ts-test python-test build compose-config
 
 certs:
 	./deploy/scripts/certs.sh

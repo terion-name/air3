@@ -1,4 +1,7 @@
 /bin/
 /dist/
 *.test
+__pycache__/
+*.py[cod]
+node_modules/
 /deploy/certs/generated/

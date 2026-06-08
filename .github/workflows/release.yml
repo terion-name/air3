@@ -26,6 +26,22 @@ jobs:
       - name: Run Go tests
         run: go test ./...
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run TypeScript package tests
+        run: npm --prefix packages/ts test
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Python package tests
+        run: PYTHONPATH=packages/python python -m unittest discover -s packages/python/tests
+
       - name: Validate Docker Compose config
         run: |
           set -euo pipefail
