@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Validate Docker Compose config
+        run: |
+          set -euo pipefail
+          if docker compose version >/dev/null 2>&1; then
+            docker compose -f deploy/compose.yaml config >/dev/null
+          else
+            echo "Docker Compose is unavailable; skipping compose config validation."
+          fi
+
+      - name: Build release artifacts
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          commands=(edge-gateway private-connector signurl)
+          targets=(
+            linux/amd64
+            linux/arm64
+            darwin/amd64
+            darwin/arm64
+            windows/amd64
+            windows/arm64
+          )
+
+          mkdir -p build dist
+
+          for command in "${commands[@]}"; do
+            for target in "${targets[@]}"; do
+              goos="${target%/*}"
+              goarch="${target#*/}"
+              extension=""
+              if [[ "${goos}" == "windows" ]]; then
+                extension=".exe"
+              fi
+
+              binary_path="build/${command}-${goos}-${goarch}${extension}"
+              archive_name="air3-${command}-${TAG_NAME}-${goos}-${goarch}.tar.gz"
+              package_dir="$(mktemp -d)"
+
+              echo "Building ${command} for ${goos}/${goarch}"
+              env CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+                go build -trimpath -ldflags="-s -w" -o "${binary_path}" "./cmd/${command}"
+
+              cp "${binary_path}" "${package_dir}/${command}${extension}"
+              tar -C "${package_dir}" -czf "dist/${archive_name}" "${command}${extension}"
+              rm -rf "${package_dir}"
+            done
+          done
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: air3-${{ github.ref_name }}-release-artifacts
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release edit "${TAG_NAME}" --title "${TAG_NAME}" --notes "Release ${TAG_NAME}"
+            gh release upload "${TAG_NAME}" dist/* --clobber
+          else
+            gh release create "${TAG_NAME}" dist/* --title "${TAG_NAME}" --notes "Release ${TAG_NAME}"
+          fi

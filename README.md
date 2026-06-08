@@ -61,6 +61,10 @@ make validate        # format, test, build, and validate Compose config
 go test ./... -race  # run race-enabled Go tests (expected to pass)
 ```
 
+## Releases
+
+Pushing a bare semver-like tag such as `0.0.1` runs the release workflow. The workflow tests the Go packages, validates the Compose file when Docker Compose is available, cross-compiles `edge-gateway`, `private-connector`, and `signurl` for Linux, macOS, and Windows on amd64 and arm64, uploads the packaged artifacts, and publishes them to the GitHub Release for the tag with SHA-256 checksums.
+
 ## Docker Compose demo quickstart
 
 The demo starts four runtime services:
