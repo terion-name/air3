@@ -1,10 +1,362 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
+	"path"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/terion-name/air3/internal/config"
+	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/mtls"
+	"github.com/terion-name/air3/internal/natsclient"
+	"github.com/terion-name/air3/internal/pending"
+	"github.com/terion-name/air3/internal/signing"
+	"github.com/terion-name/air3/internal/tickets"
 )
 
+type ticketPublisher interface {
+	PublishTicket(context.Context, tickets.Ticket) error
+}
+
+type edgeServer struct {
+	cfg       config.EdgeConfig
+	registry  *pending.Registry
+	publisher ticketPublisher
+	logger    *slog.Logger
+	now       func() time.Time
+	newToken  func() (string, error)
+}
+
 func main() {
-	fmt.Fprintln(os.Stdout, "edge-gateway skeleton: runtime behavior is not implemented yet")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if err := run(context.Background(), logger); err != nil {
+		logger.Error("edge gateway stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, logger *slog.Logger) error {
+	cfg, err := config.LoadEdgeFromEnv()
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	natsCtx, cancelNATS := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelNATS()
+	publisher, err := natsclient.Connect(natsCtx, cfg.NATS)
+	if err != nil {
+		return err
+	}
+	defer publisher.Close()
+
+	reg := pending.NewRegistry(pending.Options{})
+	edge := newEdgeServer(cfg, reg, publisher, logger)
+	ingestHandler, err := ingest.NewHandler(ingest.Options{Registry: reg})
+	if err != nil {
+		return err
+	}
+
+	publicServer := &http.Server{Addr: cfg.PublicListenAddr, Handler: edge}
+	ingestServer := &http.Server{Addr: cfg.IngestListenAddr, Handler: ingestHandler}
+	if tlsConfigured(cfg.MTLS) {
+		tlsCfg, err := mtls.ServerConfig(mtls.ServerOptions{Files: mtls.Files{CAFile: cfg.MTLS.CAFile, CertFile: cfg.MTLS.CertFile, KeyFile: cfg.MTLS.KeyFile}, RequireClientCert: cfg.MTLS.CAFile != ""})
+		if err != nil {
+			return fmt.Errorf("load ingest tls config: %w", err)
+		}
+		ingestServer.TLSConfig = tlsCfg
+		publicServer.TLSConfig = publicTLSConfig(tlsCfg)
+	}
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- serveHTTP(publicServer, cfg.MTLS) }()
+	go func() { errCh <- serveHTTP(ingestServer, cfg.MTLS) }()
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = publicServer.Shutdown(shutdownCtx)
+		_ = ingestServer.Shutdown(shutdownCtx)
+		return nil
+	case err := <-errCh:
+		_ = publicServer.Close()
+		_ = ingestServer.Close()
+		return err
+	}
+}
+
+func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, publisher ticketPublisher, logger *slog.Logger) *edgeServer {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	return &edgeServer{cfg: cfg, registry: reg, publisher: publisher, logger: logger, now: time.Now, newToken: randomToken}
+}
+
+func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	object, err := s.validatePublicRequest(r)
+	if err != nil {
+		writePublicError(w, statusForValidationError(err), statusText(statusForValidationError(err)))
+		return
+	}
+
+	reqID, err := s.newToken()
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "request setup failed")
+		return
+	}
+	ingestToken, err := s.newToken()
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "request setup failed")
+		return
+	}
+	deadline := s.now().Add(s.cfg.Timeouts.PendingRequestTTL)
+	ingestURL, err := ingestURLForRequest(s.cfg.IngestURL, reqID)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "request setup failed")
+		return
+	}
+
+	pendingReq := pending.Request{ID: reqID, Deadline: deadline, IngestToken: ingestToken, Method: r.Method, Bucket: object.bucket, Key: object.key, Range: object.rangeHeader}
+	if err := s.registry.Register(pendingReq); err != nil {
+		writePublicError(w, http.StatusInternalServerError, "request setup failed")
+		return
+	}
+	published := false
+	defer func() {
+		if !published {
+			s.registry.Cancel(reqID)
+		}
+	}()
+
+	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: object.bucket, Key: object.key, Method: r.Method, Range: object.rangeHeader, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
+	publishCtx, cancelPublish := context.WithDeadline(r.Context(), deadline)
+	err = s.publisher.PublishTicket(publishCtx, ticket)
+	cancelPublish()
+	if err != nil {
+		s.logger.Warn("ticket publish failed", "request_id", reqID, "error", err)
+		writePublicError(w, http.StatusServiceUnavailable, "backend unavailable")
+		return
+	}
+	published = true
+
+	waitCtx, cancelWait := context.WithDeadline(r.Context(), deadline)
+	defer cancelWait()
+	resp, err := s.registry.Wait(waitCtx, reqID)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.logger.Info("public request canceled", "request_id", reqID)
+			return
+		}
+		writePublicError(w, statusForWaitError(err), statusText(statusForWaitError(err)))
+		return
+	}
+	defer resp.Body.Close()
+
+	copyMetadata(w.Header(), resp.Metadata.Header())
+	status := resp.Metadata.StatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	if r.Method == http.MethodHead || resp.Body == http.NoBody {
+		return
+	}
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		s.logger.Warn("public response stream failed", "request_id", reqID, "error", err)
+	}
+}
+
+type publicObject struct {
+	bucket      string
+	key         string
+	rangeHeader string
+}
+
+func (s *edgeServer) validatePublicRequest(r *http.Request) (publicObject, error) {
+	bucket, key, err := objectFromPath(r.URL.EscapedPath())
+	if err != nil {
+		return publicObject{}, err
+	}
+	if !bucketAllowed(bucket, s.cfg.AllowedBuckets) {
+		return publicObject{}, errForbidden
+	}
+
+	queryRange := ""
+	if !s.cfg.Signing.Disabled {
+		claims, err := signing.ValidateURL(r.Method, r.URL.RequestURI(), signing.ValidationConfig{Secret: s.cfg.Signing.Secret}, s.now())
+		if err != nil {
+			return publicObject{}, errUnauthorized
+		}
+		if claims.Bucket != bucket || claims.Key != key || claims.Method != r.Method {
+			return publicObject{}, errUnauthorized
+		}
+		queryRange = claims.Range
+	}
+
+	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
+	if !s.cfg.Signing.Disabled && rangeHeader != "" && queryRange == "" {
+		return publicObject{}, errUnauthorized
+	}
+	if queryRange != "" {
+		if rangeHeader != "" && rangeHeader != queryRange {
+			return publicObject{}, errBadRequest
+		}
+		rangeHeader = queryRange
+	}
+	if rangeHeader != "" && !validRange(bucket, key, r.Method, rangeHeader, s.now()) {
+		return publicObject{}, errBadRequest
+	}
+	return publicObject{bucket: bucket, key: key, rangeHeader: rangeHeader}, nil
+}
+
+var (
+	errBadRequest   = errors.New("bad public request")
+	errForbidden    = errors.New("object not allowed")
+	errUnauthorized = errors.New("unauthorized public request")
+)
+
+func objectFromPath(escapedPath string) (string, string, error) {
+	cleaned := strings.TrimPrefix(path.Clean("/"+escapedPath), "/")
+	parts := strings.SplitN(cleaned, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", errBadRequest
+	}
+	bucket, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return "", "", errBadRequest
+	}
+	key, err := url.PathUnescape(parts[1])
+	if err != nil {
+		return "", "", errBadRequest
+	}
+	if err := tickets.ValidateBucket(bucket); err != nil {
+		return "", "", errBadRequest
+	}
+	if err := tickets.ValidateKey(key); err != nil {
+		return "", "", errBadRequest
+	}
+	return bucket, key, nil
+}
+
+func validRange(bucket, key, method, rangeHeader string, now time.Time) bool {
+	t := tickets.Ticket{Version: tickets.Version, RequestID: "range-check", Bucket: bucket, Key: key, Method: method, Range: rangeHeader, DeadlineUnixMS: now.Add(time.Minute).UnixMilli(), IngestURL: "https://edge.invalid/_ingest/range-check", IngestToken: "range-check-token"}
+	return t.Validate(now) == nil
+}
+
+func bucketAllowed(bucket string, allowlist []string) bool {
+	for _, allowed := range allowlist {
+		if bucket == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func ingestURLForRequest(base, requestID string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+		return "", errors.New("ingest url must be an absolute https url without credentials")
+	}
+	prefix := strings.TrimSuffix(u.Path, "/")
+	if prefix == "" || prefix == "/" {
+		prefix = strings.TrimSuffix(ingest.PathPrefix, "/")
+	}
+	if !strings.HasSuffix(prefix, strings.TrimSuffix(ingest.PathPrefix, "/")) {
+		prefix = strings.TrimSuffix(ingest.PathPrefix, "/")
+	}
+	u.Path = prefix + "/" + url.PathEscape(requestID)
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+func copyMetadata(dst, src http.Header) {
+	for name, values := range src {
+		for _, value := range values {
+			dst.Add(name, value)
+		}
+	}
+}
+
+func statusForValidationError(err error) int {
+	switch {
+	case errors.Is(err, errForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, errUnauthorized):
+		return http.StatusForbidden
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+func statusForWaitError(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, pending.ErrExpired) {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusBadGateway
+}
+
+func statusText(status int) string {
+	text := http.StatusText(status)
+	if text == "" {
+		return "request failed"
+	}
+	return strings.ToLower(text)
+}
+
+func writePublicError(w http.ResponseWriter, status int, message string) {
+	http.Error(w, message, status)
+}
+
+func randomToken() (string, error) {
+	var b [18]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+func serveHTTP(server *http.Server, paths config.MTLSPaths) error {
+	if server.TLSConfig != nil {
+		return ignoreServerClosed(server.ListenAndServeTLS("", ""))
+	}
+	if paths.CertFile != "" || paths.KeyFile != "" {
+		return ignoreServerClosed(server.ListenAndServeTLS(paths.CertFile, paths.KeyFile))
+	}
+	return ignoreServerClosed(server.ListenAndServe())
+}
+
+func ignoreServerClosed(err error) error {
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func tlsConfigured(paths config.MTLSPaths) bool {
+	return paths.CertFile != "" || paths.KeyFile != "" || paths.CAFile != ""
+}
+
+func publicTLSConfig(source *tls.Config) *tls.Config {
+	return &tls.Config{MinVersion: tls.VersionTLS12, Certificates: source.Certificates}
 }

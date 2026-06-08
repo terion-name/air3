@@ -1,2 +1,2 @@
-// Package s3fetch will coordinate connector-side S3 access and pre-signed URLs.
+// Package s3fetch provides connector-side S3-compatible object reads.
 package s3fetch

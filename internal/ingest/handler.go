@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	TokenHeader      = "X-Air3-Ingest-Token"
-	StatusCodeHeader = "X-Air3-Status-Code"
-	PathPrefix       = "/_ingest/"
+	TokenHeader               = "X-Air3-Ingest-Token"
+	StatusCodeHeader          = "X-Air3-Status-Code"
+	ObjectContentLengthHeader = "X-Air3-Content-Length"
+	PathPrefix                = "/_ingest/"
 )
 
 type Handler struct {
@@ -124,9 +125,13 @@ func certificateIdentities(cert *x509.Certificate) []string {
 }
 
 func metadataFromHeaders(h http.Header) (pending.Metadata, error) {
+	contentLength := safeHeaderValue(h.Get(ObjectContentLengthHeader))
+	if contentLength == "" {
+		contentLength = safeHeaderValue(h.Get("Content-Length"))
+	}
 	metadata := pending.Metadata{
 		ContentType:   safeHeaderValue(h.Get("Content-Type")),
-		ContentLength: safeHeaderValue(h.Get("Content-Length")),
+		ContentLength: contentLength,
 		ContentRange:  safeHeaderValue(h.Get("Content-Range")),
 		ETag:          safeHeaderValue(h.Get("ETag")),
 		LastModified:  safeHeaderValue(h.Get("Last-Modified")),
