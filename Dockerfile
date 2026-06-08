@@ -1,23 +1,32 @@
 # syntax=docker/dockerfile:1
 
-# Repository foundation image. The binaries are placeholders until runtime behavior
-# is implemented, but this build path is intended to remain the multi-binary path.
-FROM golang:1.22-alpine AS build
+ARG GO_VERSION=1.22
+ARG ALPINE_VERSION=3.20
+
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
 
-COPY go.mod ./
+ARG APP=edge-gateway
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/edge-gateway ./cmd/edge-gateway \
- && CGO_ENABLED=0 GOOS=linux go build -o /out/private-connector ./cmd/private-connector \
- && CGO_ENABLED=0 GOOS=linux go build -o /out/signurl ./cmd/signurl
+RUN case "${APP}" in \
+      edge-gateway|private-connector|signurl) ;; \
+      *) echo "unsupported APP=${APP}" >&2; exit 1 ;; \
+    esac \
+ && targetos="${TARGETOS:-linux}" \
+ && targetarch="${TARGETARCH:-$(go env GOARCH)}" \
+ && CGO_ENABLED=0 GOOS="${targetos}" GOARCH="${targetarch}" \
+      go build -trimpath -ldflags="-s -w" -o /out/air3 "./cmd/${APP}"
 
-FROM alpine:3.20
+FROM alpine:${ALPINE_VERSION}
 RUN adduser -D -H -u 10001 appuser
-COPY --from=build /out/ /usr/local/bin/
+COPY --from=build /out/air3 /usr/local/bin/air3
 USER appuser
 
-# Run the edge gateway by default. Override the command to run another binary,
-# for example: docker run --rm air3 /usr/local/bin/private-connector
-CMD ["/usr/local/bin/edge-gateway"]
+# The selected APP binary is copied to this stable runtime path.
+CMD ["/usr/local/bin/air3"]

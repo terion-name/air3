@@ -18,8 +18,9 @@ services:
   edge-gateway:
     build:
       context: ..
-    image: air3:demo
-    command: ["/usr/local/bin/edge-gateway"]
+      args:
+        APP: edge-gateway
+    image: air3-edge-gateway:demo
     depends_on:
       nats:
         condition: service_healthy
@@ -54,8 +55,9 @@ services:
   private-connector:
     build:
       context: ..
-    image: air3:demo
-    command: ["/usr/local/bin/private-connector"]
+      args:
+        APP: private-connector
+    image: air3-private-connector:demo
     depends_on:
       nats:
         condition: service_healthy

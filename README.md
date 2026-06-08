@@ -65,6 +65,20 @@ go test ./... -race  # run race-enabled Go tests (expected to pass)
 
 Pushing a bare semver-like tag such as `0.0.1` runs the release workflow. The workflow tests the Go packages, validates the Compose file when Docker Compose is available, cross-compiles `edge-gateway`, `private-connector`, and `signurl` for Linux, macOS, and Windows on amd64 and arm64, uploads the packaged artifacts, and publishes them to the GitHub Release for the tag with SHA-256 checksums.
 
+The same release workflow also publishes separate multi-architecture Linux images to GitHub Container Registry. Images are tagged with the release tag:
+
+- `ghcr.io/terion-name/air3/edge-gateway:<tag>`
+- `ghcr.io/terion-name/air3/private-connector:<tag>`
+- `ghcr.io/terion-name/air3/signurl:<tag>`
+
+Pull a released image with, for example:
+
+```sh
+docker pull ghcr.io/terion-name/air3/edge-gateway:0.0.1
+docker pull ghcr.io/terion-name/air3/private-connector:0.0.1
+docker pull ghcr.io/terion-name/air3/signurl:0.0.1
+```
+
 ## Docker Compose demo quickstart
 
 The demo starts four runtime services:
@@ -119,4 +133,12 @@ When URL signing is enabled, a ranged request must include the range claim in th
 
 ## Docker image
 
-The root `Dockerfile` builds all three binaries into a small runtime image. The Compose demo overrides the command per service to run either `/usr/local/bin/edge-gateway` or `/usr/local/bin/private-connector`.
+The root `Dockerfile` builds one selected binary into a small runtime image. Select the command with the `APP` build argument; supported values are `edge-gateway`, `private-connector`, and `signurl`. The selected binary is copied to `/usr/local/bin/air3`, which is the image default command.
+
+```sh
+docker build --build-arg APP=edge-gateway -t air3-edge-gateway:dev .
+docker build --build-arg APP=private-connector -t air3-private-connector:dev .
+docker build --build-arg APP=signurl -t air3-signurl:dev .
+```
+
+The Compose demo sets `APP` per service and builds separate local images for `edge-gateway` and `private-connector`.
