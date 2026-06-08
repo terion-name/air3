@@ -2,13 +2,13 @@
 
 Date: 2026-06-08  
 Status: Approved design specification  
-Scope: Documentation for the MVP architecture; no implementation is included in this step.
+Scope: Documentation for the approved architecture; no implementation is included in this step.
 
 ## Summary
 
 This project is a Go monorepo for a demo that securely exposes files from private S3-compatible storage to the public internet without placing S3 credentials, the S3 service, or the private storage network on the public edge.
 
-The MVP uses:
+The design uses:
 
 - A public **edge gateway** that accepts file requests and holds the HTTP response open while waiting for a private connector to stream the object back.
 - A **private connector** that runs inside the private perimeter, receives control-plane tickets over NATS, fetches objects from S3-compatible storage, and streams object bytes to a private edge ingest endpoint.
@@ -16,7 +16,7 @@ The MVP uses:
 - **VersityGW** as the S3-compatible demo storage service.
 - Docker Compose networks that keep public, broker, and private responsibilities separated.
 
-The MVP deliberately does not use JetStream and does not attempt multi-edge reverse-proxy fanout. Requests are ephemeral: if the broker, connector, storage backend, or ingest path is unavailable, the public request fails by timeout or mapped error response.
+The design intentionally does not use JetStream and does not attempt multi-edge reverse-proxy fanout. Tickets are live ephemeral HTTP work items: if the broker, connector, storage backend, or ingest path is unavailable, the public request fails by timeout or mapped error response.
 
 ## Goals
 
@@ -27,7 +27,7 @@ The MVP deliberately does not use JetStream and does not attempt multi-edge reve
 - Support a Docker Compose demo with clear network boundaries.
 - Provide a monorepo shape that can grow from demo to production without changing the core trust model.
 
-## Non-goals for the MVP
+## Non-goals
 
 - No JetStream persistence, replay, durable work queues, or object byte transport through NATS.
 - No reverse-proxy fanout or request routing across multiple edge gateway instances.
@@ -102,7 +102,7 @@ The edge gateway has two separate listeners:
    - Does not serve public file requests.
    - Forwards the connector's stream to the matching held public response.
 
-The edge gateway is a single instance in the MVP. This makes request ownership simple: the process that created a request ID is the only process that can receive its ingest stream. Production deployments can later add instance-ID routing, a shared request registry, or a fronting private load-balancer strategy, but those are outside the MVP.
+The edge gateway is a single instance in this design. This makes request ownership simple: the process that created a request ID is the only process that can receive its ingest stream. Multi-edge instance-ID routing, a shared request registry, or a fronting private load-balancer strategy are outside this design.
 
 ### Private connector
 
@@ -121,7 +121,7 @@ The connector bridges the broker and private storage networks through outbound c
 
 NATS is the control plane. It carries small tickets and optional control replies, not object bytes.
 
-The MVP uses core NATS publish/subscribe and queue groups. It does not use JetStream. This choice keeps the request model ephemeral and aligned with held HTTP responses: if no connector is available while the public request is pending, the gateway times out the request rather than relying on replay.
+The design uses Core NATS publish/subscribe and queue groups. It does not use JetStream. This choice keeps tickets as live ephemeral HTTP work items aligned with held HTTP responses: if no connector is available while the public request is pending, the gateway times out the request rather than relying on replay.
 
 All application connections to NATS use TLS or mTLS. Subject permissions should restrict the edge gateway and connector to only the subjects they require.
 
@@ -176,7 +176,7 @@ A ticket is a small control message. It should include only information required
 - Requested byte range when accepted by the edge.
 - Request deadline or pending TTL.
 - One-time ingest token or token reference.
-- Edge ingest endpoint URL for the specific MVP edge instance.
+- Edge ingest endpoint URL for the specific edge instance.
 - Safe request metadata needed by the connector.
 
 Tickets must not include S3 credentials, object bytes, public client secrets, or unvalidated user-controlled headers.
@@ -185,7 +185,7 @@ Tickets must not include S3 credentials, object bytes, public client secrets, or
 
 ### Methods
 
-The MVP should support:
+The design should support:
 
 - `GET` for object retrieval.
 - `HEAD` for object metadata without a response body.
@@ -303,9 +303,9 @@ Required boundaries:
 - NATS is reachable only by components that need the control plane.
 - The public file listener and private ingest listener are exposed on separate ports with separate TLS configuration.
 
-## MVP operational behavior
+## Operational behavior
 
-Because the MVP uses core NATS without JetStream and keeps the edge gateway single-instance:
+Because the design uses Core NATS without JetStream and keeps the edge gateway single-instance:
 
 - Tickets are not durable.
 - Public requests are not replayed after gateway restart.
@@ -314,15 +314,14 @@ Because the MVP uses core NATS without JetStream and keeps the edge gateway sing
 - If the edge process restarts, held public responses are lost.
 - If NATS is unavailable, new public requests fail fast or after a short control-plane timeout.
 
-These are acceptable demo constraints and should be visible in smoke tests and documentation.
+These are expected constraints and should be visible in smoke tests and documentation.
 
 ## Future production considerations
 
-The following are intentionally outside the MVP but should remain compatible with the design:
+The following are intentionally outside this design but should remain compatible with the core trust model:
 
 - Multiple edge gateway instances with instance-ID routing for ingest callbacks.
 - A private ingest load balancer or per-edge private endpoint discovery.
-- JetStream for durable ticketing only if paired with a production model that no longer depends on a single held HTTP response.
 - Connector fleet autoscaling and health-aware routing.
 - Stronger policy engines for bucket/key authorization.
 - Structured audit logs and SIEM integration.
