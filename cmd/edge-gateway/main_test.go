@@ -68,16 +68,20 @@ func testEdge(pub *fakePublisher, ttl time.Duration) (*edgeServer, *pending.Regi
 	return edge, reg
 }
 
-func TestTCPIngestListenerDisabledForHTTPTransport(t *testing.T) {
-	tcpIngest, err := newTCPIngestListener(config.EdgeConfig{
-		IngestTransport:     config.IngestTransportHTTP,
-		IngestTCPListenAddr: "not a valid listen address",
-	}, pending.NewRegistry(pending.Options{}), nil)
-	if err != nil {
-		t.Fatalf("newTCPIngestListener() error = %v, want nil", err)
-	}
-	if tcpIngest != nil {
-		t.Fatalf("newTCPIngestListener() = %#v, want nil for HTTP transport", tcpIngest)
+func TestTCPIngestListenerDisabledForHTTPTransports(t *testing.T) {
+	for _, transport := range []config.IngestTransport{config.IngestTransportHTTP, config.IngestTransportHTTP1, config.IngestTransportHTTP2} {
+		t.Run(string(transport), func(t *testing.T) {
+			tcpIngest, err := newTCPIngestListener(config.EdgeConfig{
+				IngestTransport:     transport,
+				IngestTCPListenAddr: "not a valid listen address",
+			}, pending.NewRegistry(pending.Options{}), nil)
+			if err != nil {
+				t.Fatalf("newTCPIngestListener() error = %v, want nil", err)
+			}
+			if tcpIngest != nil {
+				t.Fatalf("newTCPIngestListener() = %#v, want nil for %s transport", tcpIngest, transport)
+			}
+		})
 	}
 }
 

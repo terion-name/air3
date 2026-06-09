@@ -496,15 +496,43 @@ func TestTCPIngestSenderPropagatesDialAndSendError(t *testing.T) {
 }
 
 func TestNewIngestSenderSelectsTransport(t *testing.T) {
-	t.Run("http", func(t *testing.T) {
-		cfg := connectorConfig()
-		cfg.IngestTransport = config.IngestTransportHTTP
-		sender, err := newIngestSender(cfg)
-		if err != nil {
-			t.Fatalf("newIngestSender() error = %v", err)
+	t.Run("http protocols", func(t *testing.T) {
+		tests := []struct {
+			name              string
+			transport         config.IngestTransport
+			disableHTTP2Flag  bool
+			wantHTTP2Disabled bool
+		}{
+			{name: "legacy http honors disable flag", transport: config.IngestTransportHTTP, disableHTTP2Flag: true, wantHTTP2Disabled: true},
+			{name: "legacy http honors enable flag", transport: config.IngestTransportHTTP, disableHTTP2Flag: false, wantHTTP2Disabled: false},
+			{name: "http1 ignores enable flag", transport: config.IngestTransportHTTP1, disableHTTP2Flag: false, wantHTTP2Disabled: true},
+			{name: "http2 ignores disable flag", transport: config.IngestTransportHTTP2, disableHTTP2Flag: true, wantHTTP2Disabled: false},
 		}
-		if _, ok := sender.(httpIngestSender); !ok {
-			t.Fatalf("sender = %T, want httpIngestSender", sender)
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := connectorConfig()
+				cfg.IngestTransport = tc.transport
+				cfg.IngestDisableHTTP2 = tc.disableHTTP2Flag
+				sender, err := newIngestSender(cfg)
+				if err != nil {
+					t.Fatalf("newIngestSender() error = %v", err)
+				}
+				httpSender, ok := sender.(httpIngestSender)
+				if !ok {
+					t.Fatalf("sender = %T, want httpIngestSender", sender)
+				}
+				transport, ok := httpSender.client.Transport.(*http.Transport)
+				if !ok {
+					t.Fatalf("http transport = %T, want *http.Transport", httpSender.client.Transport)
+				}
+				if tc.wantHTTP2Disabled {
+					if transport.ForceAttemptHTTP2 || transport.TLSNextProto == nil || len(transport.TLSNextProto) != 0 {
+						t.Fatalf("HTTP/2 disabled transport ForceAttemptHTTP2=%t TLSNextProto=%#v, want false and empty non-nil map", transport.ForceAttemptHTTP2, transport.TLSNextProto)
+					}
+				} else if !transport.ForceAttemptHTTP2 || transport.TLSNextProto != nil {
+					t.Fatalf("HTTP/2 enabled transport ForceAttemptHTTP2=%t TLSNextProto=%#v, want true and nil", transport.ForceAttemptHTTP2, transport.TLSNextProto)
+				}
+			})
 		}
 	})
 

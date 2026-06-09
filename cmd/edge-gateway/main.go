@@ -76,7 +76,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	publicServer := &http.Server{Addr: cfg.PublicListenAddr, Handler: edge}
 	ingestServer := &http.Server{Addr: cfg.IngestListenAddr, Handler: ingestHandler}
 	var tlsCfg *tls.Config
-	if tlsConfigured(cfg.MTLS) || cfg.IngestTransport == config.IngestTransportTCP {
+	if tlsConfigured(cfg.MTLS) || cfg.IngestTransport.IsTCP() {
 		tlsCfg, err = edgeServerTLSConfig(cfg.MTLS)
 		if err != nil {
 			return fmt.Errorf("load ingest tls config: %w", err)
@@ -366,7 +366,7 @@ type tcpIngestListener struct {
 }
 
 func newTCPIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg *tls.Config) (*tcpIngestListener, error) {
-	if cfg.IngestTransport != config.IngestTransportTCP {
+	if !cfg.IngestTransport.IsTCP() {
 		return nil, nil
 	}
 	server, err := ingesttcp.NewServer(ingesttcp.ServerOptions{

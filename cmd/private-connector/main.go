@@ -215,6 +215,18 @@ func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
 			return nil, err
 		}
 		return httpIngestSender{client: client}, nil
+	case config.IngestTransportHTTP1:
+		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, true)
+		if err != nil {
+			return nil, err
+		}
+		return httpIngestSender{client: client}, nil
+	case config.IngestTransportHTTP2:
+		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, false)
+		if err != nil {
+			return nil, err
+		}
+		return httpIngestSender{client: client}, nil
 	case config.IngestTransportTCP:
 		tlsCfg, err := mtls.ClientConfig(mtls.ClientOptions{Files: mtls.Files{CAFile: cfg.MTLS.CAFile, CertFile: cfg.MTLS.CertFile, KeyFile: cfg.MTLS.KeyFile, ServerName: cfg.MTLS.ServerName, InsecureSkipVerify: cfg.MTLS.InsecureSkipVerify}})
 		if err != nil {
