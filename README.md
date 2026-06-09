@@ -116,7 +116,11 @@ The smoke tests (`make smoke`) automatically verify that signed `GET`/`HEAD` req
 
 To allow users to download files, your backend application must generate an **edge signed URL**. These use a standard HMAC signature. Since the gateway verifies the signature before generating a ticket, bogus requests are dropped at the edge—saving your private network from dealing with malicious traffic.
 
-We provide drop-in packages for Go, TypeScript, and Python under the `packages/` directory.
+We provide drop-in packages for Go, TypeScript, and Python under the `packages/` directory. The TypeScript package is published to GitHub Packages as `@terion-name/air3-edgesign`:
+
+```sh
+npm install @terion-name/air3-edgesign --registry=https://npm.pkg.github.com
+```
 
 ### Go Example
 
@@ -135,7 +139,7 @@ raw, err := edgesign.SignURL(edgesign.SignInput{
 ### TypeScript Example
 
 ```ts
-import { signUrl, verifyUrl } from './packages/ts/src/index.ts';
+import { signUrl, verifyUrl } from '@terion-name/air3-edgesign';
 
 const raw = signUrl({
   method: 'GET',
@@ -178,14 +182,14 @@ make validate        # format, test, build, and check compose config
 make fmt             # format Go code
 make test            # run Go tests
 make build           # build binaries into ./bin
-make ts-test         # run TypeScript package tests
+make ts-test         # install, test, and build the TypeScript package
 make python-test     # run Python package tests
 go test ./... -race  # run race-enabled Go tests
 ```
 
 ## Releases & Docker Images
 
-We publish multi-architecture Docker images (Linux on `amd64` and `arm64`) to the GitHub Container Registry on every release. Cross-compiled binaries for macOS, Windows, and Linux are also attached to GitHub releases.
+We publish multi-architecture Docker images (Linux on `amd64` and `arm64`) to the GitHub Container Registry on every release. Cross-compiled binaries for macOS, Windows, and Linux are also attached to GitHub releases. The same tag workflow publishes `@terion-name/air3-edgesign` to GitHub Packages with the tag as the npm version.
 
 - `ghcr.io/terion-name/air3/edge-gateway:<tag>`
 - `ghcr.io/terion-name/air3/private-connector:<tag>`
