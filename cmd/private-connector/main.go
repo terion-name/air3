@@ -16,8 +16,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/terion-name/air3/internal/config"
 	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/ingestquic"
 	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/mtls"
@@ -200,6 +203,29 @@ func (s tcpIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metada
 	return nil
 }
 
+type quicClientSender interface {
+	Send(context.Context, ingestquic.ClientRequest) error
+}
+
+type quicIngestSender struct {
+	sender quicClientSender
+}
+
+func (s quicIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metadata ingestMetadata, body io.Reader) error {
+	body, bodyLength := ingestRequestBody(body, metadata, ingestquic.UnknownBodyLength)
+	req := ingestquic.ClientRequest{
+		RequestID:   ticket.RequestID,
+		IngestToken: ticket.IngestToken,
+		Metadata:    metadata.pendingMetadata(),
+		Body:        body,
+		BodyLength:  bodyLength,
+	}
+	if err := s.sender.Send(ctx, req); err != nil {
+		return fmt.Errorf("send ingest quic: %w", err)
+	}
+	return nil
+}
+
 type smuxClientSender interface {
 	Send(context.Context, ingestsmux.ClientRequest) error
 }
@@ -258,6 +284,12 @@ func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
 			return nil, err
 		}
 		return httpIngestSender{client: client}, nil
+	case config.IngestTransportHTTP3:
+		client, err := ingestHTTP3Client(cfg.MTLS, cfg.Timeouts.StreamTimeout)
+		if err != nil {
+			return nil, err
+		}
+		return httpIngestSender{client: client}, nil
 	case config.IngestTransportTCP:
 		tlsCfg, err := ingestClientTLSConfig(cfg.MTLS)
 		if err != nil {
@@ -274,6 +306,16 @@ func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
 			return nil, fmt.Errorf("create ingest smux sender: %w", err)
 		}
 		return smuxIngestSender{address: cfg.IngestTCPAddr, tlsConfig: tlsCfg, sender: sender}, nil
+	case config.IngestTransportQUIC:
+		tlsCfg, err := ingestClientTLSConfig(cfg.MTLS)
+		if err != nil {
+			return nil, fmt.Errorf("load ingest quic client tls config: %w", err)
+		}
+		sender, err := ingestquic.NewSender(cfg.IngestQUICAddr, tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("create ingest quic sender: %w", err)
+		}
+		return quicIngestSender{sender: sender}, nil
 	default:
 		return nil, fmt.Errorf("unsupported ingest transport %q", cfg.IngestTransport)
 	}
@@ -378,6 +420,25 @@ func validateIngestURL(raw string) error {
 
 func ingestClientTLSConfig(paths config.MTLSPaths) (*tls.Config, error) {
 	return mtls.ClientConfig(mtls.ClientOptions{Files: mtls.Files{CAFile: paths.CAFile, CertFile: paths.CertFile, KeyFile: paths.KeyFile, ServerName: paths.ServerName, InsecureSkipVerify: paths.InsecureSkipVerify}})
+}
+
+func ingestHTTP3Client(paths config.MTLSPaths, timeout time.Duration) (*http.Client, error) {
+	var tlsCfg *tls.Config
+	if paths.CAFile != "" || paths.CertFile != "" || paths.KeyFile != "" || paths.ServerName != "" || paths.InsecureSkipVerify {
+		var err error
+		tlsCfg, err = ingestClientTLSConfig(paths)
+		if err != nil {
+			return nil, fmt.Errorf("load ingest client tls config: %w", err)
+		}
+	}
+	return &http.Client{
+		Transport: &http3.Transport{
+			TLSClientConfig:    tlsCfg,
+			QUICConfig:         &quic.Config{},
+			DisableCompression: true,
+		},
+		Timeout: timeout,
+	}, nil
 }
 
 func ingestHTTPClient(paths config.MTLSPaths, timeout time.Duration, disableHTTP2 bool) (*http.Client, error) {

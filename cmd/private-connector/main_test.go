@@ -11,8 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
 	"github.com/terion-name/air3/internal/config"
 	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/ingestquic"
 	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/pending"
@@ -52,6 +54,16 @@ func (s *fakeIngestSender) Send(ctx context.Context, ticket tickets.Ticket, meta
 		payload = string(data)
 	}
 	s.sends = append(s.sends, sentIngest{ticket: ticket, metadata: metadata, body: payload})
+	return s.err
+}
+
+type fakeQuicSender struct {
+	requests []ingestquic.ClientRequest
+	err      error
+}
+
+func (s *fakeQuicSender) Send(ctx context.Context, req ingestquic.ClientRequest) error {
+	s.requests = append(s.requests, req)
 	return s.err
 }
 
@@ -157,6 +169,32 @@ func TestIngestHTTPClientClonesDefaultTransportWithConnectorSettings(t *testing.
 	}
 	if defaultTransport.DisableCompression != defaultDisableCompression || defaultTransport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
 		t.Fatal("ingestHTTPClient(disableHTTP2) mutated http.DefaultTransport")
+	}
+}
+
+func TestIngestHTTP3ClientUsesHTTP3TransportAndMTLS(t *testing.T) {
+	client, err := ingestHTTP3Client(config.MTLSPaths{ServerName: "edge.internal", InsecureSkipVerify: true}, 9*time.Second)
+	if err != nil {
+		t.Fatalf("ingestHTTP3Client() error = %v", err)
+	}
+	if client.Timeout != 9*time.Second {
+		t.Fatalf("client timeout = %v, want 9s", client.Timeout)
+	}
+	transport, ok := client.Transport.(*http3.Transport)
+	if !ok {
+		t.Fatalf("client transport = %T, want *http3.Transport", client.Transport)
+	}
+	if !transport.DisableCompression {
+		t.Fatal("DisableCompression = false, want true")
+	}
+	if transport.QUICConfig == nil {
+		t.Fatal("QUICConfig = nil, want non-nil")
+	}
+	if transport.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig = nil, want mTLS config")
+	}
+	if transport.TLSClientConfig.ServerName != "edge.internal" || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("TLSClientConfig ServerName=%q InsecureSkipVerify=%t, want connector mTLS settings", transport.TLSClientConfig.ServerName, transport.TLSClientConfig.InsecureSkipVerify)
 	}
 }
 
@@ -506,6 +544,78 @@ func TestTCPIngestSenderPropagatesDialAndSendError(t *testing.T) {
 	}
 }
 
+func TestQUICIngestSenderBuildsKnownLengthRequestAndSanitizesMetadata(t *testing.T) {
+	fakeSender := &fakeQuicSender{}
+	sender := quicIngestSender{sender: fakeSender}
+	metadata := ingestMetadata{
+		StatusCode:    http.StatusOK,
+		ContentType:   " text/plain ",
+		ContentLength: 12,
+		ContentRange:  " bytes 0-11/12 ",
+		ETag:          "\"abc\"\r\nSet-Cookie: leak",
+		LastModified:  " Mon, 08 Jun 2026 12:00:00 GMT ",
+		AcceptRanges:  " bytes ",
+	}
+
+	if err := sender.Send(context.Background(), validTicket("https://edge.internal/_ingest/req-1", http.MethodGet), metadata, strings.NewReader("hello world!")); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if len(fakeSender.requests) != 1 {
+		t.Fatalf("quic requests = %#v, want one request", fakeSender.requests)
+	}
+	gotReq := fakeSender.requests[0]
+	if gotReq.RequestID != "req-1" || gotReq.IngestToken != "ingest-token" || gotReq.BodyLength != 12 {
+		t.Fatalf("request id/token/bodyLength = %q/%q/%d", gotReq.RequestID, gotReq.IngestToken, gotReq.BodyLength)
+	}
+	wantMetadata := pending.Metadata{StatusCode: http.StatusOK, ContentType: "text/plain", ContentLength: "12", ContentRange: "bytes 0-11/12", LastModified: "Mon, 08 Jun 2026 12:00:00 GMT", AcceptRanges: "bytes"}
+	if gotReq.Metadata != wantMetadata {
+		t.Fatalf("metadata = %#v, want %#v", gotReq.Metadata, wantMetadata)
+	}
+	body, _ := io.ReadAll(gotReq.Body)
+	if string(body) != "hello world!" {
+		t.Fatalf("body = %q, want hello world!", body)
+	}
+}
+
+func TestQUICIngestSenderBodyLengthRules(t *testing.T) {
+	tests := []struct {
+		name       string
+		metadata   ingestMetadata
+		body       io.Reader
+		wantLength int64
+	}{
+		{name: "no body", metadata: ingestMetadata{StatusCode: http.StatusNotFound, ContentLength: 42}, body: http.NoBody, wantLength: 0},
+		{name: "nil body", metadata: ingestMetadata{StatusCode: http.StatusNotFound, ContentLength: 42}, body: nil, wantLength: 0},
+		{name: "unknown body", metadata: ingestMetadata{StatusCode: http.StatusOK, ContentLength: -1}, body: strings.NewReader("stream"), wantLength: ingestquic.UnknownBodyLength},
+		{name: "known body", metadata: ingestMetadata{StatusCode: http.StatusOK, ContentLength: 6}, body: strings.NewReader("stream"), wantLength: 6},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeSender := &fakeQuicSender{}
+			sender := quicIngestSender{sender: fakeSender}
+			if err := sender.Send(context.Background(), validTicket("https://edge.internal/_ingest/req-1", http.MethodGet), tc.metadata, tc.body); err != nil {
+				t.Fatalf("Send() error = %v", err)
+			}
+			if len(fakeSender.requests) != 1 {
+				t.Fatalf("quic requests = %#v, want one request", fakeSender.requests)
+			}
+			if fakeSender.requests[0].BodyLength != tc.wantLength {
+				t.Fatalf("BodyLength = %d, want %d", fakeSender.requests[0].BodyLength, tc.wantLength)
+			}
+		})
+	}
+}
+
+func TestQUICIngestSenderPropagatesSendError(t *testing.T) {
+	wantErr := errors.New("session failed")
+	sender := quicIngestSender{sender: &fakeQuicSender{err: wantErr}}
+
+	err := sender.Send(context.Background(), validTicket("https://edge.internal/_ingest/req-1", http.MethodGet), ingestMetadata{StatusCode: http.StatusOK, ContentLength: 4}, strings.NewReader("body"))
+	if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "send ingest quic") {
+		t.Fatalf("Send() error = %v, want wrapped quic error", err)
+	}
+}
+
 func TestSMUXIngestSenderBuildsKnownLengthRequestAndSanitizesMetadata(t *testing.T) {
 	fakeSender := &fakeSmuxSender{}
 	sender := smuxIngestSender{sender: fakeSender}
@@ -619,6 +729,32 @@ func TestNewIngestSenderSelectsTransport(t *testing.T) {
 		}
 	})
 
+	t.Run("http3", func(t *testing.T) {
+		cfg := connectorConfig()
+		cfg.IngestTransport = config.IngestTransportHTTP3
+		cfg.Timeouts.StreamTimeout = 11 * time.Second
+		cfg.MTLS.ServerName = "edge.internal"
+		cfg.MTLS.InsecureSkipVerify = true
+		sender, err := newIngestSender(cfg)
+		if err != nil {
+			t.Fatalf("newIngestSender() error = %v", err)
+		}
+		httpSender, ok := sender.(httpIngestSender)
+		if !ok {
+			t.Fatalf("sender = %T, want httpIngestSender", sender)
+		}
+		transport, ok := httpSender.client.Transport.(*http3.Transport)
+		if !ok {
+			t.Fatalf("http transport = %T, want *http3.Transport", httpSender.client.Transport)
+		}
+		if httpSender.client.Timeout != 11*time.Second || transport.QUICConfig == nil || !transport.DisableCompression {
+			t.Fatalf("http3 client timeout=%v quicConfig=%p DisableCompression=%t, want configured HTTP/3 client", httpSender.client.Timeout, transport.QUICConfig, transport.DisableCompression)
+		}
+		if transport.TLSClientConfig == nil || transport.TLSClientConfig.ServerName != "edge.internal" || !transport.TLSClientConfig.InsecureSkipVerify {
+			t.Fatalf("http3 TLS config = %#v, want connector mTLS settings", transport.TLSClientConfig)
+		}
+	})
+
 	t.Run("tcp", func(t *testing.T) {
 		cfg := connectorConfig()
 		cfg.IngestTransport = config.IngestTransportTCP
@@ -658,9 +794,28 @@ func TestNewIngestSenderSelectsTransport(t *testing.T) {
 		}
 	})
 
+	t.Run("quic", func(t *testing.T) {
+		cfg := connectorConfig()
+		cfg.IngestTransport = config.IngestTransportQUIC
+		cfg.IngestQUICAddr = "edge.internal:9443"
+		cfg.MTLS.ServerName = "edge.internal"
+		cfg.MTLS.InsecureSkipVerify = true
+		sender, err := newIngestSender(cfg)
+		if err != nil {
+			t.Fatalf("newIngestSender() error = %v", err)
+		}
+		quicSender, ok := sender.(quicIngestSender)
+		if !ok {
+			t.Fatalf("sender = %T, want quicIngestSender", sender)
+		}
+		if quicSender.sender == nil {
+			t.Fatal("quic sender = nil, want reusable sender")
+		}
+	})
+
 	t.Run("unknown", func(t *testing.T) {
 		cfg := connectorConfig()
-		cfg.IngestTransport = config.IngestTransport("quic")
+		cfg.IngestTransport = config.IngestTransport("bogus")
 		if _, err := newIngestSender(cfg); err == nil {
 			t.Fatal("newIngestSender() error = nil, want unsupported transport error")
 		}
