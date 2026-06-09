@@ -76,7 +76,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, err := h.registry.StartIngest(requestID, r.Header.Get(TokenHeader), metadata)
 	if err != nil {
-		http.Error(w, "ingest rejected", statusForPendingError(err))
+		status := statusForPendingError(err)
+		if !isPendingRejection(err) {
+			status = http.StatusBadGateway
+		}
+		http.Error(w, "ingest rejected", status)
 		return
 	}
 
@@ -189,6 +193,15 @@ func safeHeaderValue(value string) string {
 		return ""
 	}
 	return value
+}
+
+func isPendingRejection(err error) bool {
+	return errors.Is(err, pending.ErrInvalidToken) ||
+		errors.Is(err, pending.ErrExpired) ||
+		errors.Is(err, pending.ErrCanceled) ||
+		errors.Is(err, pending.ErrReplayed) ||
+		errors.Is(err, pending.ErrNotFound) ||
+		errors.Is(err, pending.ErrInvalidRequest)
 }
 
 func statusForPendingError(err error) int {
