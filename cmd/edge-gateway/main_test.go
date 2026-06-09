@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/terion-name/air3/internal/config"
+	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/pending"
 	"github.com/terion-name/air3/internal/signing"
 	"github.com/terion-name/air3/internal/tickets"
@@ -64,6 +66,122 @@ func testEdge(pub *fakePublisher, ttl time.Duration) (*edgeServer, *pending.Regi
 		return v, nil
 	}
 	return edge, reg
+}
+
+func TestTCPIngestListenerDisabledForHTTPTransport(t *testing.T) {
+	tcpIngest, err := newTCPIngestListener(config.EdgeConfig{
+		IngestTransport:     config.IngestTransportHTTP,
+		IngestTCPListenAddr: "not a valid listen address",
+	}, pending.NewRegistry(pending.Options{}), nil)
+	if err != nil {
+		t.Fatalf("newTCPIngestListener() error = %v, want nil", err)
+	}
+	if tcpIngest != nil {
+		t.Fatalf("newTCPIngestListener() = %#v, want nil for HTTP transport", tcpIngest)
+	}
+}
+
+func TestTCPIngestListenerRequiresTLSConfig(t *testing.T) {
+	_, err := newTCPIngestListener(config.EdgeConfig{
+		IngestTransport:     config.IngestTransportTCP,
+		IngestTCPListenAddr: "127.0.0.1:0",
+	}, pending.NewRegistry(pending.Options{}), nil)
+	if err == nil || !strings.Contains(err.Error(), "TLS config is required") {
+		t.Fatalf("newTCPIngestListener() error = %v, want TLS config error", err)
+	}
+}
+
+func TestTCPIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
+	tlsTemplate := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(tlsTemplate.Close)
+	clientTLS := tlsTemplate.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	serverTLS := &tls.Config{MinVersion: tls.VersionTLS12, Certificates: tlsTemplate.TLS.Certificates}
+
+	reg := pending.NewRegistry(pending.Options{})
+	tcpIngest, err := newTCPIngestListener(config.EdgeConfig{
+		IngestTransport:       config.IngestTransportTCP,
+		IngestTCPListenAddr:   "127.0.0.1:0",
+		StreamCopyBufferBytes: 1024,
+	}, reg, serverTLS)
+	if err != nil {
+		t.Fatalf("newTCPIngestListener() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- tcpIngest.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = tcpIngest.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("tcpIngest.Serve() error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("tcpIngest.Serve() did not stop")
+		}
+	})
+
+	uploadDone := make(chan error, 1)
+	pub := &fakePublisher{}
+	pub.on = func(ticket tickets.Ticket) {
+		go func() {
+			uploadDone <- ingesttcp.DialAndSend(context.Background(), "tcp", tcpIngest.listener.Addr().String(), clientTLS, ingesttcp.ClientRequest{
+				RequestID:   ticket.RequestID,
+				IngestToken: ticket.IngestToken,
+				Metadata:    pending.Metadata{StatusCode: http.StatusOK, ContentType: "text/plain", ContentLength: "8"},
+				Body:        strings.NewReader("tcp-body"),
+				BodyLength:  8,
+			})
+		}()
+	}
+	edge := newEdgeServer(config.EdgeConfig{
+		IngestURL:           "https://edge.internal/_ingest",
+		IngestTransport:     config.IngestTransportTCP,
+		IngestTCPListenAddr: tcpIngest.listener.Addr().String(),
+		AllowedBuckets:      []string{"demo-bucket"},
+		Signing:             config.SigningConfig{Disabled: true},
+		Timeouts:            config.TimeoutConfig{PendingRequestTTL: 2 * time.Second},
+	}, reg, pub, nil)
+	tokens := []string{"req-tcp", "ingest-tcp-token"}
+	edge.newToken = func() (string, error) {
+		v := tokens[0]
+		tokens = tokens[1:]
+		return v, nil
+	}
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil))
+	if got := resp.Result().StatusCode; got != http.StatusOK {
+		select {
+		case err := <-uploadDone:
+			t.Fatalf("status = %d, want %d; upload error = %v", got, http.StatusOK, err)
+		default:
+			t.Fatalf("status = %d, want %d", got, http.StatusOK)
+		}
+	}
+	if body := resp.Body.String(); body != "tcp-body" {
+		t.Fatalf("body = %q, want tcp-body", body)
+	}
+	select {
+	case err := <-uploadDone:
+		if err != nil {
+			t.Fatalf("TCP ingest upload error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for TCP ingest upload")
+	}
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	if published[0].IngestURL != "https://edge.internal/_ingest/req-tcp" {
+		t.Fatalf("ticket ingest URL = %q, want HTTPS ingest URL", published[0].IngestURL)
+	}
+	if strings.Contains(published[0].IngestURL, tcpIngest.listener.Addr().String()) {
+		t.Fatalf("ticket ingest URL %q unexpectedly contains TCP listener address", published[0].IngestURL)
+	}
 }
 
 func TestBadSignatureAndDisallowedPathFailBeforePublish(t *testing.T) {

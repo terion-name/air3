@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/terion-name/air3/internal/config"
 	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/mtls"
 	"github.com/terion-name/air3/internal/natsclient"
 	"github.com/terion-name/air3/internal/pending"
@@ -73,29 +75,56 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	publicServer := &http.Server{Addr: cfg.PublicListenAddr, Handler: edge}
 	ingestServer := &http.Server{Addr: cfg.IngestListenAddr, Handler: ingestHandler}
-	if tlsConfigured(cfg.MTLS) {
-		tlsCfg, err := mtls.ServerConfig(mtls.ServerOptions{Files: mtls.Files{CAFile: cfg.MTLS.CAFile, CertFile: cfg.MTLS.CertFile, KeyFile: cfg.MTLS.KeyFile}, RequireClientCert: cfg.MTLS.CAFile != ""})
+	var tlsCfg *tls.Config
+	if tlsConfigured(cfg.MTLS) || cfg.IngestTransport == config.IngestTransportTCP {
+		tlsCfg, err = edgeServerTLSConfig(cfg.MTLS)
 		if err != nil {
 			return fmt.Errorf("load ingest tls config: %w", err)
 		}
+	}
+	if tlsConfigured(cfg.MTLS) {
 		ingestServer.TLSConfig = tlsCfg
 		publicServer.TLSConfig = publicTLSConfig(tlsCfg)
 	}
+	tcpIngest, err := newTCPIngestListener(cfg, reg, tlsCfg)
+	if err != nil {
+		return err
+	}
+	if tcpIngest != nil {
+		defer tcpIngest.Close()
+	}
 
-	errCh := make(chan error, 2)
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+	serverCount := 2
+	if tcpIngest != nil {
+		serverCount++
+	}
+	errCh := make(chan error, serverCount)
 	go func() { errCh <- serveHTTP(publicServer, cfg.MTLS) }()
 	go func() { errCh <- serveHTTP(ingestServer, cfg.MTLS) }()
+	if tcpIngest != nil {
+		go func() { errCh <- tcpIngest.Serve(serveCtx) }()
+	}
 
 	select {
 	case <-ctx.Done():
+		cancelServe()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = publicServer.Shutdown(shutdownCtx)
 		_ = ingestServer.Shutdown(shutdownCtx)
+		if tcpIngest != nil {
+			_ = tcpIngest.Close()
+		}
 		return nil
 	case err := <-errCh:
+		cancelServe()
 		_ = publicServer.Close()
 		_ = ingestServer.Close()
+		if tcpIngest != nil {
+			_ = tcpIngest.Close()
+		}
 		return err
 	}
 }
@@ -318,6 +347,57 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+func edgeServerTLSConfig(paths config.MTLSPaths) (*tls.Config, error) {
+	return mtls.ServerConfig(mtls.ServerOptions{
+		Files: mtls.Files{
+			CAFile:   paths.CAFile,
+			CertFile: paths.CertFile,
+			KeyFile:  paths.KeyFile,
+		},
+		RequireClientCert: paths.CAFile != "",
+	})
+}
+
+type tcpIngestListener struct {
+	server   *ingesttcp.Server
+	listener net.Listener
+}
+
+func newTCPIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg *tls.Config) (*tcpIngestListener, error) {
+	if cfg.IngestTransport != config.IngestTransportTCP {
+		return nil, nil
+	}
+	server, err := ingesttcp.NewServer(ingesttcp.ServerOptions{
+		Registry:                   reg,
+		TLSConfig:                  tlsCfg,
+		AllowedConnectorIdentities: cfg.AllowedConnectorIdentities,
+		CopyBufferBytes:            cfg.StreamCopyBufferBytes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create ingest tcp server: %w", err)
+	}
+	ln, err := net.Listen("tcp", cfg.IngestTCPListenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("listen ingest tcp: %w", err)
+	}
+	return &tcpIngestListener{server: server, listener: ln}, nil
+}
+
+func (l *tcpIngestListener) Serve(ctx context.Context) error {
+	return ignoreTCPServerClosed(l.server.Serve(ctx, l.listener))
+}
+
+func (l *tcpIngestListener) Close() error {
+	return l.listener.Close()
+}
+
+func ignoreTCPServerClosed(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
+	}
+	return err
 }
 
 func serveHTTP(server *http.Server, paths config.MTLSPaths) error {

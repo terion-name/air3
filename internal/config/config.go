@@ -17,10 +17,19 @@ type Options struct {
 	FileExists FileExistsFunc
 }
 
+type IngestTransport string
+
+const (
+	IngestTransportHTTP IngestTransport = "http"
+	IngestTransportTCP  IngestTransport = "tcp"
+)
+
 type EdgeConfig struct {
 	PublicListenAddr           string
 	IngestListenAddr           string
 	IngestURL                  string
+	IngestTransport            IngestTransport
+	IngestTCPListenAddr        string
 	StreamCopyBufferBytes      int
 	AllowedBuckets             []string
 	AllowedConnectorIdentities []string
@@ -33,6 +42,8 @@ type EdgeConfig struct {
 type ConnectorConfig struct {
 	IngestURL          string
 	IngestDisableHTTP2 bool
+	IngestTransport    IngestTransport
+	IngestTCPAddr      string
 	AllowedBuckets     []string
 	NATS               NATSConfig
 	S3                 S3Config
@@ -94,10 +105,16 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	if err != nil {
 		return EdgeConfig{}, err
 	}
+	ingestTransport, err := loadIngestTransport(env)
+	if err != nil {
+		return EdgeConfig{}, err
+	}
 	cfg := EdgeConfig{
 		PublicListenAddr:      env.get("AIR3_EDGE_PUBLIC_ADDR", ":8080"),
 		IngestListenAddr:      env.get("AIR3_EDGE_INGEST_ADDR", ":8443"),
 		IngestURL:             env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
+		IngestTransport:       ingestTransport,
+		IngestTCPListenAddr:   env.get("AIR3_EDGE_INGEST_TCP_ADDR", ""),
 		StreamCopyBufferBytes: streamCopyBufferBytes,
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
@@ -127,6 +144,9 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	if cfg.PublicListenAddr == "" || cfg.IngestListenAddr == "" || cfg.IngestURL == "" {
 		return EdgeConfig{}, errors.New("edge listener addresses and ingest url are required")
 	}
+	if cfg.IngestTransport == IngestTransportTCP && cfg.IngestTCPListenAddr == "" {
+		return EdgeConfig{}, errors.New("AIR3_EDGE_INGEST_TCP_ADDR is required when AIR3_INGEST_TRANSPORT=tcp")
+	}
 	return cfg, nil
 }
 
@@ -136,9 +156,15 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 	if err != nil {
 		return ConnectorConfig{}, err
 	}
+	ingestTransport, err := loadIngestTransport(env)
+	if err != nil {
+		return ConnectorConfig{}, err
+	}
 	cfg := ConnectorConfig{
 		IngestURL:          env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
 		IngestDisableHTTP2: ingestDisableHTTP2,
+		IngestTransport:    ingestTransport,
+		IngestTCPAddr:      env.get("AIR3_INGEST_TCP_ADDR", ""),
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
@@ -163,7 +189,20 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 	if cfg.IngestURL == "" {
 		return ConnectorConfig{}, errors.New("ingest url is required")
 	}
+	if cfg.IngestTransport == IngestTransportTCP && cfg.IngestTCPAddr == "" {
+		return ConnectorConfig{}, errors.New("AIR3_INGEST_TCP_ADDR is required when AIR3_INGEST_TRANSPORT=tcp")
+	}
 	return cfg, nil
+}
+
+func loadIngestTransport(env envReader) (IngestTransport, error) {
+	transport := IngestTransport(env.get("AIR3_INGEST_TRANSPORT", string(IngestTransportHTTP)))
+	switch transport {
+	case IngestTransportHTTP, IngestTransportTCP:
+		return transport, nil
+	default:
+		return "", fmt.Errorf("AIR3_INGEST_TRANSPORT must be one of %s, %s", IngestTransportHTTP, IngestTransportTCP)
+	}
 }
 
 func loadNATS(env envReader, edge bool) (NATSConfig, error) {

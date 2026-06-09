@@ -18,8 +18,10 @@ import (
 
 	"github.com/terion-name/air3/internal/config"
 	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/mtls"
 	"github.com/terion-name/air3/internal/natsclient"
+	"github.com/terion-name/air3/internal/pending"
 	"github.com/terion-name/air3/internal/s3fetch"
 	"github.com/terion-name/air3/internal/tickets"
 )
@@ -30,12 +32,16 @@ type objectFetcher interface {
 	Fetch(context.Context, s3fetch.Request) (*s3fetch.Object, error)
 }
 
+type ingestSender interface {
+	Send(context.Context, tickets.Ticket, ingestMetadata, io.Reader) error
+}
+
 type connector struct {
-	cfg        config.ConnectorConfig
-	fetcher    objectFetcher
-	httpClient *http.Client
-	logger     *slog.Logger
-	now        func() time.Time
+	cfg     config.ConnectorConfig
+	fetcher objectFetcher
+	sender  ingestSender
+	logger  *slog.Logger
+	now     func() time.Time
 }
 
 func main() {
@@ -58,11 +64,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	httpClient, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, cfg.IngestDisableHTTP2)
+	sender, err := newIngestSender(cfg)
 	if err != nil {
 		return err
 	}
-	worker := newConnector(cfg, fetcher, httpClient, logger)
+	worker := newConnector(cfg, fetcher, sender, logger)
 
 	natsCtx, cancelNATS := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelNATS()
@@ -85,14 +91,14 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	return nats.Drain(drainCtx)
 }
 
-func newConnector(cfg config.ConnectorConfig, fetcher objectFetcher, httpClient *http.Client, logger *slog.Logger) *connector {
+func newConnector(cfg config.ConnectorConfig, fetcher objectFetcher, sender ingestSender, logger *slog.Logger) *connector {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	if httpClient == nil {
-		httpClient = http.DefaultClient
+	if sender == nil {
+		sender = httpIngestSender{client: http.DefaultClient}
 	}
-	return &connector{cfg: cfg, fetcher: fetcher, httpClient: httpClient, logger: logger, now: time.Now}
+	return &connector{cfg: cfg, fetcher: fetcher, sender: sender, logger: logger, now: time.Now}
 }
 
 func (c *connector) handleTicket(ctx context.Context, ticket tickets.Ticket) error {
@@ -106,7 +112,7 @@ func (c *connector) handleTicket(ctx context.Context, ticket tickets.Ticket) err
 	obj, err := c.fetcher.Fetch(ticketCtx, s3fetch.Request{Method: ticket.Method, Bucket: ticket.Bucket, Key: ticket.Key, Range: ticket.Range})
 	if err != nil {
 		status := statusForFetchError(err)
-		return c.postIngest(ticketCtx, ticket, metadataForStatus(status), http.NoBody)
+		return c.sender.Send(ticketCtx, ticket, metadataForStatus(status), http.NoBody)
 	}
 	defer obj.Body.Close()
 
@@ -115,7 +121,7 @@ func (c *connector) handleTicket(ctx context.Context, ticket tickets.Ticket) err
 	if ticket.Method == http.MethodHead {
 		body = http.NoBody
 	}
-	return c.postIngest(ticketCtx, ticket, metadata, body)
+	return c.sender.Send(ticketCtx, ticket, metadata, body)
 }
 
 func (c *connector) validateTicket(ticket tickets.Ticket) error {
@@ -134,7 +140,11 @@ func (c *connector) validateTicket(ticket tickets.Ticket) error {
 	return nil
 }
 
-func (c *connector) postIngest(ctx context.Context, ticket tickets.Ticket, metadata ingestMetadata, body io.Reader) error {
+type httpIngestSender struct {
+	client *http.Client
+}
+
+func (s httpIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metadata ingestMetadata, body io.Reader) error {
 	if body == nil {
 		body = http.NoBody
 	}
@@ -147,7 +157,11 @@ func (c *connector) postIngest(ctx context.Context, ticket tickets.Ticket, metad
 	if metadata.ContentLength >= 0 && body != http.NoBody {
 		req.ContentLength = metadata.ContentLength
 	}
-	resp, err := c.httpClient.Do(req)
+	client := s.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("post ingest: %w", err)
 	}
@@ -157,6 +171,59 @@ func (c *connector) postIngest(ctx context.Context, ticket tickets.Ticket, metad
 		return fmt.Errorf("ingest rejected with status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+type tcpIngestSender struct {
+	address     string
+	tlsConfig   *tls.Config
+	dialAndSend func(context.Context, string, string, *tls.Config, ingesttcp.ClientRequest) error
+}
+
+func (s tcpIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metadata ingestMetadata, body io.Reader) error {
+	bodyLength := int64(0)
+	if body == nil {
+		body = http.NoBody
+	} else if body != http.NoBody {
+		bodyLength = ingesttcp.UnknownBodyLength
+		if metadata.ContentLength >= 0 {
+			bodyLength = metadata.ContentLength
+		}
+	}
+
+	dialAndSend := s.dialAndSend
+	if dialAndSend == nil {
+		dialAndSend = ingesttcp.DialAndSend
+	}
+	req := ingesttcp.ClientRequest{
+		RequestID:   ticket.RequestID,
+		IngestToken: ticket.IngestToken,
+		Metadata:    metadata.pendingMetadata(),
+		Body:        body,
+		BodyLength:  bodyLength,
+	}
+	if err := dialAndSend(ctx, "tcp", s.address, s.tlsConfig, req); err != nil {
+		return fmt.Errorf("send ingest tcp: %w", err)
+	}
+	return nil
+}
+
+func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
+	switch cfg.IngestTransport {
+	case config.IngestTransportHTTP:
+		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, cfg.IngestDisableHTTP2)
+		if err != nil {
+			return nil, err
+		}
+		return httpIngestSender{client: client}, nil
+	case config.IngestTransportTCP:
+		tlsCfg, err := mtls.ClientConfig(mtls.ClientOptions{Files: mtls.Files{CAFile: cfg.MTLS.CAFile, CertFile: cfg.MTLS.CertFile, KeyFile: cfg.MTLS.KeyFile, ServerName: cfg.MTLS.ServerName, InsecureSkipVerify: cfg.MTLS.InsecureSkipVerify}})
+		if err != nil {
+			return nil, fmt.Errorf("load ingest tcp client tls config: %w", err)
+		}
+		return tcpIngestSender{address: cfg.IngestTCPAddr, tlsConfig: tlsCfg}, nil
+	default:
+		return nil, fmt.Errorf("unsupported ingest transport %q", cfg.IngestTransport)
+	}
 }
 
 type ingestMetadata struct {
@@ -193,6 +260,19 @@ func (m ingestMetadata) setHeaders(h http.Header) {
 	setSafeHeader(h, "Accept-Ranges", m.AcceptRanges)
 }
 
+func (m ingestMetadata) pendingMetadata() pending.Metadata {
+	metadata := pending.Metadata{StatusCode: m.StatusCode}
+	metadata.ContentType = safeMetadataValue(m.ContentType)
+	if m.ContentLength >= 0 {
+		metadata.ContentLength = strconv.FormatInt(m.ContentLength, 10)
+	}
+	metadata.ContentRange = safeMetadataValue(m.ContentRange)
+	metadata.ETag = safeMetadataValue(m.ETag)
+	metadata.LastModified = safeMetadataValue(m.LastModified)
+	metadata.AcceptRanges = safeMetadataValue(m.AcceptRanges)
+	return metadata
+}
+
 func safeLogError(err error) string {
 	if err == nil {
 		return ""
@@ -201,11 +281,19 @@ func safeLogError(err error) string {
 }
 
 func setSafeHeader(h http.Header, name, value string) {
-	value = strings.TrimSpace(value)
-	if value == "" || strings.ContainsAny(value, "\r\n") {
+	value = safeMetadataValue(value)
+	if value == "" {
 		return
 	}
 	h.Set(name, value)
+}
+
+func safeMetadataValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	return value
 }
 
 func statusForFetchError(err error) int {
