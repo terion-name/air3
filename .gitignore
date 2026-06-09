@@ -5,3 +5,5 @@ __pycache__/
 *.py[cod]
 node_modules/
 /deploy/certs/generated/
+packages/ts/dist/
+*.tgz

@@ -13,7 +13,9 @@ test:
 	go test $(GO_PACKAGES)
 
 ts-test:
+	npm --prefix packages/ts ci
 	npm --prefix packages/ts test
+	npm --prefix packages/ts run build
 
 python-test:
 	PYTHONPATH=packages/python python3 -m unittest discover -s packages/python/tests

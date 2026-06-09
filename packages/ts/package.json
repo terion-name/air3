@@ -1,14 +1,38 @@
 {
-  "name": "@air3/edgesign",
-  "private": true,
+  "name": "@terion-name/air3-edgesign",
+  "version": "0.0.0",
+  "description": "TypeScript helpers for signing and verifying air3 edge gateway URLs.",
+  "license": "UNLICENSED",
   "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/terion-name/air3.git",
+    "directory": "packages/ts"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types test/*.test.ts"
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "build": "tsc -p tsconfig.build.json"
   },
   "engines": {
     "node": ">=22.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
   }
 }
