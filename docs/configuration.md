@@ -1,135 +1,106 @@
-# air3 configuration
+# Configuration Guide
 
-air3 is configured with environment variables. The edge gateway and private connector share NATS, timeout, allowlist, and mTLS settings, but only the private connector has S3 credentials.
+**air3** uses environment variables for all configuration. The Edge Gateway and Private Connector share some settings (like timeouts, allowed buckets, and NATS details), but **only the Private Connector has your S3 credentials**.
 
-Durations use Go duration syntax such as `5s`, `30s`, or `15m`. Comma-separated lists trim spaces, reject empty entries, and deduplicate values.
+*Note: Durations use standard Go syntax (e.g., `5s`, `30s`, `15m`). Comma-separated lists automatically trim spaces and remove empty or duplicate entries.*
 
-## Edge gateway
+## Edge Gateway
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `AIR3_EDGE_PUBLIC_ADDR` | `:8080` | Address for the public `GET`/`HEAD` listener. |
-| `AIR3_EDGE_INGEST_ADDR` | `:8443` | Address for the private connector ingest listener. |
-| `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | URL placed in tickets so the connector knows where to `POST /ingest`. In Compose this is `https://edge-gateway:9443/ingest`. |
-| `AIR3_ALLOWED_BUCKETS` | `demo` | Buckets the edge accepts before publishing tickets. |
-| `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` | unset | Optional comma-separated connector certificate identities allowed on the edge ingest listener. |
-
-The edge gateway has no S3 endpoint, access key, or secret key settings. It should not be attached to the private S3 network.
-
-## Private connector
+The Edge Gateway is your public-facing entry point. It has **no** S3 settings and should **never** be attached to your private S3 network.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | Edge ingest endpoint used for outbound mTLS upload streams. |
-| `AIR3_ALLOWED_BUCKETS` | `demo` | Buckets accepted by the connector for defense-in-depth before S3 access. |
+| `AIR3_EDGE_PUBLIC_ADDR` | `:8080` | The host and port for public HTTP `GET`/`HEAD` traffic. |
+| `AIR3_EDGE_INGEST_ADDR` | `:8443` | The host and port for the private Connector's ingest stream. |
+| `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The ingest URL the Edge embeds in tickets so the Connector knows where to push the file. In the Compose demo, this is `https://edge-gateway:9443/ingest`. |
+| `AIR3_ALLOWED_BUCKETS` | `demo` | A strict comma-separated allowlist of bucket names. The Edge drops requests for unlisted buckets before even making a NATS ticket. |
+| `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` | unset | (Optional) Comma-separated list of allowed Connector certificate identities for mTLS ingest connections. |
 
-The connector has no public inbound application listener. It connects outbound to NATS, S3-compatible storage, and the edge ingest URL.
+## Private Connector
 
-## NATS broker
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `AIR3_NATS_URL` | `nats://localhost:4222` | NATS server URL. Use `tls://...` when TLS is enabled. |
-| `AIR3_NATS_SUBJECT` | `air3.tickets` | Subject used for transfer tickets. |
-| `AIR3_NATS_QUEUE` | edge: unset; connector: `air3-connectors` | Queue group. The edge normally publishes only; connectors use the queue so one connector handles each ticket. |
-| `AIR3_NATS_CREDS_FILE` | unset | Optional NATS credentials file. If set, the file must exist. |
-| `AIR3_NATS_NKEY_FILE` | unset | Optional NKey seed file. If set, the file must exist. |
-| `AIR3_NATS_USER` | unset | Optional username. Must be paired with `AIR3_NATS_PASSWORD`. |
-| `AIR3_NATS_PASSWORD` | unset | Optional password. Must be paired with `AIR3_NATS_USER`. |
-
-NATS carries short-lived fetch tickets and control messages between the edge gateway and private connector. Object bytes stream over HTTPS ingest from the connector to the edge gateway; the broker is not the object data path.
-
-## S3-compatible storage
-
-These variables belong to the private connector only.
+The Private Connector is your secure worker. It has **no public inbound listeners** and connects outbound to NATS, S3, and the Edge Gateway.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AIR3_S3_ENDPOINT` | `http://localhost:7070` | S3-compatible endpoint reachable from the connector. |
-| `AIR3_S3_REGION` | `us-east-1` | S3 region passed to the SDK. |
-| `AIR3_S3_ALLOWED_BUCKETS` | value of `AIR3_ALLOWED_BUCKETS` | Connector-side S3 bucket allowlist. |
-| `AIR3_S3_ACCESS_KEY_ID` | unset | S3 access key ID. Required for the connector. |
-| `AIR3_S3_SECRET_ACCESS_KEY` | unset | S3 secret access key. Required for the connector. |
-| `AIR3_S3_USE_PATH_STYLE` | `true` | Use path-style S3 addressing. Useful for many S3-compatible services and the Compose demo. |
-| `AIR3_S3_INSECURE_SKIP_VERIFY` | `false` | Skip S3 TLS verification. Use only for controlled test endpoints. |
+| `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The default fallback Edge ingest endpoint for outbound mTLS uploads. |
+| `AIR3_ALLOWED_BUCKETS` | `demo` | Defense-in-depth: the Connector also enforces this allowlist before attempting to reach S3. |
 
-## Signing
+## NATS Broker
+
+NATS coordinates transfers between the Edge and the Connector. Object bytes **do not** stream through NATS.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AIR3_SIGNING_SECRET` | unset | HMAC secret used by the edge gateway and signing helpers. Required unless signing is disabled. |
-| `AIR3_SIGNING_TTL` | `15m` | Default lifetime used by signing-related configuration. |
-| `AIR3_SIGNING_DISABLED` | `false` | Disable signed URL verification. Intended only for controlled local scenarios. |
+| `AIR3_NATS_URL` | `nats://localhost:4222` | NATS connection string. Use `tls://...` for secure connections. |
+| `AIR3_NATS_SUBJECT` | `air3.tickets` | The NATS subject used for transferring fetch tickets. |
+| `AIR3_NATS_QUEUE` | edge: unset; connector: `air3-connectors` | Queue group. Connectors use this so that only one Connector picks up a given ticket. |
+| `AIR3_NATS_CREDS_FILE` | unset | (Optional) Path to a NATS credentials file. |
+| `AIR3_NATS_NKEY_FILE` | unset | (Optional) Path to an NKey seed file. |
+| `AIR3_NATS_USER` | unset | (Optional) NATS username. Must be paired with `AIR3_NATS_PASSWORD`. |
+| `AIR3_NATS_PASSWORD` | unset | (Optional) NATS password. Must be paired with `AIR3_NATS_USER`. |
 
-Edge signed URLs authorize air3 edge requests. They are not S3 presigned URLs and never grant direct S3 API access.
+## S3-Compatible Storage (Connector Only)
 
-## TLS and mTLS
+These highly sensitive settings belong **only** to the Private Connector.
 
-The TLS helpers use the same suffixes for edge ingest mTLS, connector ingest-client mTLS, and NATS TLS:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AIR3_S3_ENDPOINT` | `http://localhost:7070` | Your private S3-compatible service URL. |
+| `AIR3_S3_REGION` | `us-east-1` | S3 region used by the internal AWS SDK. |
+| `AIR3_S3_ALLOWED_BUCKETS` | value of `AIR3_ALLOWED_BUCKETS` | Connector-specific bucket allowlist (defaults to the shared allowlist). |
+| `AIR3_S3_ACCESS_KEY_ID` | unset | **Your private S3 Access Key ID.** |
+| `AIR3_S3_SECRET_ACCESS_KEY` | unset | **Your private S3 Secret Access Key.** |
+| `AIR3_S3_USE_PATH_STYLE` | `true` | Use path-style addressing (great for self-hosted S3 alternatives). |
+| `AIR3_S3_INSECURE_SKIP_VERIFY` | `false` | Skip S3 TLS verification. (Use for local testing only!) |
+
+## URL Signing
+
+Edge signed URLs authorize requests against the air3 gateway itself. They are **not** S3 presigned URLs.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AIR3_SIGNING_SECRET` | unset | The HMAC secret used to verify incoming signed URLs. Required in production. |
+| `AIR3_SIGNING_TTL` | `15m` | Default lifetime for signing-related tasks. |
+| `AIR3_SIGNING_DISABLED` | `false` | Disable URL signature verification completely. **Do not use in production.** |
+
+## TLS and mTLS (Security)
+
+We use standardized variable suffixes for configuring TLS and mutual TLS (mTLS) across the different components:
 
 | Prefix | Used by |
 | --- | --- |
-| `AIR3_EDGE_MTLS_*` | Edge private ingest listener. |
-| `AIR3_CONNECTOR_MTLS_*` | Connector client connection to edge ingest. |
-| `AIR3_NATS_TLS_*` | Edge and connector NATS connections. |
+| `AIR3_EDGE_MTLS_*` | The Edge Gateway's private ingest listener. |
+| `AIR3_CONNECTOR_MTLS_*` | The Connector's outbound client connection to the Edge ingest port. |
+| `AIR3_NATS_TLS_*` | Edge and Connector connections to the NATS broker. |
 
 | Suffix | Purpose |
 | --- | --- |
-| `_CA_FILE` | CA certificate file. If set, the file must exist. |
-| `_CERT_FILE` | Client or server certificate file. Must be paired with `_KEY_FILE`. |
-| `_KEY_FILE` | Client or server private key file. Must be paired with `_CERT_FILE`. |
-| `_SERVER_NAME` | Optional TLS server name override for outbound clients. |
-| `_INSECURE_SKIP_VERIFY` | Skip TLS verification for that connection. Use only in controlled test environments. |
+| `_CA_FILE` | Path to the CA certificate file. |
+| `_CERT_FILE` | Path to the client or server certificate. (Requires `_KEY_FILE`). |
+| `_KEY_FILE` | Path to the client or server private key. (Requires `_CERT_FILE`). |
+| `_SERVER_NAME` | (Optional) TLS server name override for outbound connections. |
+| `_INSECURE_SKIP_VERIFY` | Skip TLS verification. **(Testing only!)** |
 
-For example, the Compose demo sets `AIR3_EDGE_MTLS_CA_FILE`, `AIR3_EDGE_MTLS_CERT_FILE`, and `AIR3_EDGE_MTLS_KEY_FILE` for the edge ingest listener, and sets `AIR3_CONNECTOR_MTLS_*` for the connector's outbound ingest client certificate.
+*Example:* To secure the ingest port, the Edge uses `AIR3_EDGE_MTLS_CA_FILE`, `AIR3_EDGE_MTLS_CERT_FILE`, and `AIR3_EDGE_MTLS_KEY_FILE`. The Connector then uses `AIR3_CONNECTOR_MTLS_*` to securely connect to it.
 
-## Timeouts and allowlists
+## Timeouts and Limits
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AIR3_PENDING_TTL` | `30s` | How long the edge holds a public request waiting for connector ingest. |
-| `AIR3_STREAM_TIMEOUT` | `5m` | End-to-end stream timeout budget. |
-| `AIR3_ALLOWED_BUCKETS` | `demo` | Shared high-level bucket allowlist for edge and connector. |
-| `AIR3_S3_ALLOWED_BUCKETS` | value of `AIR3_ALLOWED_BUCKETS` | Connector S3-specific bucket allowlist. |
-| `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` | unset | Optional mTLS identity allowlist for connector ingest clients. |
+| `AIR3_PENDING_TTL` | `30s` | Maximum time the Edge will wait for the Connector to start pushing file data before giving up. |
+| `AIR3_STREAM_TIMEOUT` | `5m` | Maximum total time allowed for the entire file stream transfer. |
 
-Bucket names must be DNS-style names: 3-63 characters with lowercase letters, numbers, dots, or hyphens, without leading/trailing dots or hyphens and without adjacent dots.
+*Bucket Name Rules:* Bucket names must be 3-63 characters long, containing only lowercase letters, numbers, dots, or hyphens (DNS style). They cannot start or end with a dot or hyphen, and cannot have adjacent dots.
 
-## Compose demo configuration
+## Docker Compose Demo Network Map
 
-The Compose demo is defined in `deploy/compose.yaml` and uses separated networks:
+Our included `deploy/compose.yaml` demo clearly illustrates the required network isolation:
 
-| Network | Services | Purpose |
+| Network | Services | Security Posture |
 | --- | --- | --- |
-| `public` | `edge-gateway` | Host-published public HTTPS on `https://localhost:8443`. |
-| `broker` | `edge-gateway`, `nats`, `private-connector` | NATS control messages and edge ingest reachability. |
-| `private` | `private-connector`, `versitygw`, `aws-cli` tools profile | S3-compatible storage access. Marked `internal: true`. |
-
-Demo highlights:
-
-- `edge-gateway` exposes only public HTTPS to the host and is not attached to the `private` network.
-- `private-connector` has S3 credentials and no host-published application port.
-- `nats` uses `deploy/nats/nats.conf`, TLS/mTLS, and username/password auth for broker connections.
-- `versitygw` is reachable only from the private network.
-- Demo certificates are generated by `deploy/scripts/certs.sh` under `deploy/certs/generated/`, which is ignored by git.
-- `deploy/scripts/seed-s3.sh` uses the private-network `aws-cli` helper to seed demo objects.
-- `deploy/scripts/smoke.sh` uses `cmd/signurl` to generate edge signed URLs and verify the end-to-end path.
-
-Useful demo commands:
-
-```sh
-make certs
-make compose-up
-make seed
-make smoke
-make compose-down
-```
-
-or:
-
-```sh
-make e2e
-```
+| `public` | `edge-gateway` | The only network exposed to your host (via `https://localhost:8443`). |
+| `broker` | `edge-gateway`, `nats`, `private-connector` | The middle ground for NATS control messages and Edge ingest routing. |
+| `private` | `private-connector`, `versitygw`, `aws-cli` | Deeply isolated S3 access. Marked `internal: true`. The Edge Gateway cannot reach this. |
 
 ## Release artifacts and images
 
