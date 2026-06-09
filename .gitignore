@@ -5,5 +5,7 @@ __pycache__/
 *.py[cod]
 node_modules/
 /deploy/certs/generated/
+/.air3-perf-cache/
+/.air3-perf-results/
 packages/ts/dist/
 *.tgz

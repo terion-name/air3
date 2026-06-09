@@ -112,6 +112,30 @@ make e2e
 
 The smoke tests (`make smoke`) automatically verify that signed `GET`/`HEAD` requests work, expired signatures are rejected, missing objects return `404`, and most importantly, that the Edge container *cannot* bypass the system to connect directly to the private S3 server.
 
+## Compose Performance Test
+
+The Compose benchmark starts the demo stack with a performance override, exposes VersityGW on localhost for direct S3 timing, seeds three Wikimedia objects into the demo bucket, and compares direct S3 downloads against signed air3 gateway-through downloads.
+
+```sh
+make perf                         # one private connector, 5 iterations per object
+AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 make perf
+make perf-multi                   # AIR3_PERF_MULTI_CONNECTORS private connectors (default: 3)
+AIR3_PERF_PARALLELISM=8 make perf # optional parallel gateway-through phase
+```
+
+Results are written under `.air3-perf-results/` as per-request CSV plus a summary CSV with average direct/gateway latency, speed, throughput, and penalty percentages. Downloaded source files are cached under `.air3-perf-cache/` so repeat runs do not re-download them.
+
+Useful knobs:
+
+- `AIR3_PERF_ITERATIONS` (default `5`)
+- `AIR3_PERF_CONNECTORS` (default `1`)
+- `AIR3_PERF_MULTI_CONNECTORS` (default `3`, used by `make perf-multi`)
+- `AIR3_PERF_SKIP_BIG=1` to skip the video object for a quick run
+- `AIR3_PERF_S3_PORT` to change the temporary localhost VersityGW port
+- `AIR3_PERF_CACHE_DIR` and `AIR3_PERF_RESULTS_DIR` to relocate cache/results
+
+The perf override limits each `edge-gateway` and `private-connector` container to one CPU. Direct S3 measurements use curl SigV4 against the perf-exposed VersityGW endpoint; gateway measurements use `cmd/signurl` and `curl --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443`.
+
 ## Generating Signed URLs
 
 To allow users to download files, your backend application must generate an **edge signed URL**. These use a standard HMAC signature. Since the gateway verifies the signature before generating a ticket, bogus requests are dropped at the edge—saving your private network from dealing with malicious traffic.
