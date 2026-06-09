@@ -24,6 +24,7 @@ const (
 	IngestTransportHTTP1 IngestTransport = "http1"
 	IngestTransportHTTP2 IngestTransport = "http2"
 	IngestTransportTCP   IngestTransport = "tcp"
+	IngestTransportSMUX  IngestTransport = "smux"
 )
 
 func (t IngestTransport) IsHTTP() bool {
@@ -37,6 +38,15 @@ func (t IngestTransport) IsHTTP() bool {
 
 func (t IngestTransport) IsTCP() bool {
 	return t == IngestTransportTCP
+}
+
+func (t IngestTransport) UsesTCPIngestAddr() bool {
+	switch t {
+	case IngestTransportTCP, IngestTransportSMUX:
+		return true
+	default:
+		return false
+	}
 }
 
 type EdgeConfig struct {
@@ -159,8 +169,8 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	if cfg.PublicListenAddr == "" || cfg.IngestListenAddr == "" || cfg.IngestURL == "" {
 		return EdgeConfig{}, errors.New("edge listener addresses and ingest url are required")
 	}
-	if cfg.IngestTransport.IsTCP() && cfg.IngestTCPListenAddr == "" {
-		return EdgeConfig{}, errors.New("AIR3_EDGE_INGEST_TCP_ADDR is required when AIR3_INGEST_TRANSPORT=tcp")
+	if cfg.IngestTransport.UsesTCPIngestAddr() && cfg.IngestTCPListenAddr == "" {
+		return EdgeConfig{}, fmt.Errorf("AIR3_EDGE_INGEST_TCP_ADDR is required when AIR3_INGEST_TRANSPORT=%s", cfg.IngestTransport)
 	}
 	return cfg, nil
 }
@@ -204,8 +214,8 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 	if cfg.IngestURL == "" {
 		return ConnectorConfig{}, errors.New("ingest url is required")
 	}
-	if cfg.IngestTransport.IsTCP() && cfg.IngestTCPAddr == "" {
-		return ConnectorConfig{}, errors.New("AIR3_INGEST_TCP_ADDR is required when AIR3_INGEST_TRANSPORT=tcp")
+	if cfg.IngestTransport.UsesTCPIngestAddr() && cfg.IngestTCPAddr == "" {
+		return ConnectorConfig{}, fmt.Errorf("AIR3_INGEST_TCP_ADDR is required when AIR3_INGEST_TRANSPORT=%s", cfg.IngestTransport)
 	}
 	return cfg, nil
 }
@@ -213,10 +223,10 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 func loadIngestTransport(env envReader) (IngestTransport, error) {
 	transport := IngestTransport(env.get("AIR3_INGEST_TRANSPORT", string(IngestTransportHTTP)))
 	switch transport {
-	case IngestTransportHTTP, IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportTCP:
+	case IngestTransportHTTP, IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportTCP, IngestTransportSMUX:
 		return transport, nil
 	default:
-		return "", fmt.Errorf("AIR3_INGEST_TRANSPORT must be one of %s, %s, %s (or legacy %s)", IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportTCP, IngestTransportHTTP)
+		return "", fmt.Errorf("AIR3_INGEST_TRANSPORT must be one of %s, %s, %s, %s (or legacy %s)", IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportTCP, IngestTransportSMUX, IngestTransportHTTP)
 	}
 }
 

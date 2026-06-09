@@ -142,8 +142,8 @@ func TestLoadEdgeParsesTCPIngestTransport(t *testing.T) {
 	if cfg.IngestTransport != IngestTransportTCP || cfg.IngestTCPListenAddr != ":9000" {
 		t.Fatalf("edge TCP ingest config = %q/%q, want tcp/:9000", cfg.IngestTransport, cfg.IngestTCPListenAddr)
 	}
-	if !cfg.IngestTransport.IsTCP() || cfg.IngestTransport.IsHTTP() {
-		t.Fatalf("edge transport predicates for %q: IsTCP=%t IsHTTP=%t, want true/false", cfg.IngestTransport, cfg.IngestTransport.IsTCP(), cfg.IngestTransport.IsHTTP())
+	if !cfg.IngestTransport.IsTCP() || cfg.IngestTransport.IsHTTP() || !cfg.IngestTransport.UsesTCPIngestAddr() {
+		t.Fatalf("edge transport predicates for %q: IsTCP=%t IsHTTP=%t UsesTCPIngestAddr=%t, want true/false/true", cfg.IngestTransport, cfg.IngestTransport.IsTCP(), cfg.IngestTransport.IsHTTP(), cfg.IngestTransport.UsesTCPIngestAddr())
 	}
 	if cfg.IngestURL != "https://localhost:8443/ingest" {
 		t.Fatalf("IngestURL = %q, want default HTTP ingest URL unchanged", cfg.IngestURL)
@@ -164,8 +164,51 @@ func TestLoadConnectorParsesTCPIngestTransport(t *testing.T) {
 	if cfg.IngestTransport != IngestTransportTCP || cfg.IngestTCPAddr != "edge.internal:9000" {
 		t.Fatalf("connector TCP ingest config = %q/%q, want tcp/edge.internal:9000", cfg.IngestTransport, cfg.IngestTCPAddr)
 	}
-	if !cfg.IngestTransport.IsTCP() || cfg.IngestTransport.IsHTTP() {
-		t.Fatalf("connector transport predicates for %q: IsTCP=%t IsHTTP=%t, want true/false", cfg.IngestTransport, cfg.IngestTransport.IsTCP(), cfg.IngestTransport.IsHTTP())
+	if !cfg.IngestTransport.IsTCP() || cfg.IngestTransport.IsHTTP() || !cfg.IngestTransport.UsesTCPIngestAddr() {
+		t.Fatalf("connector transport predicates for %q: IsTCP=%t IsHTTP=%t UsesTCPIngestAddr=%t, want true/false/true", cfg.IngestTransport, cfg.IngestTransport.IsTCP(), cfg.IngestTransport.IsHTTP(), cfg.IngestTransport.UsesTCPIngestAddr())
+	}
+	if cfg.IngestURL != "https://localhost:8443/ingest" {
+		t.Fatalf("IngestURL = %q, want default HTTP ingest URL unchanged", cfg.IngestURL)
+	}
+}
+
+func TestLoadEdgeParsesSMUXIngestTransport(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED":     "true",
+		"AIR3_INGEST_TRANSPORT":     "smux",
+		"AIR3_EDGE_INGEST_TCP_ADDR": ":9000",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.IngestTransport != IngestTransportSMUX || cfg.IngestTCPListenAddr != ":9000" {
+		t.Fatalf("edge smux ingest config = %q/%q, want smux/:9000", cfg.IngestTransport, cfg.IngestTCPListenAddr)
+	}
+	if cfg.IngestTransport.IsTCP() || cfg.IngestTransport.IsHTTP() || !cfg.IngestTransport.UsesTCPIngestAddr() {
+		t.Fatalf("edge transport predicates for %q: IsTCP=%t IsHTTP=%t UsesTCPIngestAddr=%t, want false/false/true", cfg.IngestTransport, cfg.IngestTransport.IsTCP(), cfg.IngestTransport.IsHTTP(), cfg.IngestTransport.UsesTCPIngestAddr())
+	}
+	if cfg.IngestURL != "https://localhost:8443/ingest" {
+		t.Fatalf("IngestURL = %q, want default HTTP ingest URL unchanged", cfg.IngestURL)
+	}
+}
+
+func TestLoadConnectorParsesSMUXIngestTransport(t *testing.T) {
+	env := map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":     "access",
+		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+		"AIR3_INGEST_TRANSPORT":     "smux",
+		"AIR3_INGEST_TCP_ADDR":      "edge.internal:9000",
+	}
+	cfg, err := LoadConnector(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadConnector() error = %v", err)
+	}
+	if cfg.IngestTransport != IngestTransportSMUX || cfg.IngestTCPAddr != "edge.internal:9000" {
+		t.Fatalf("connector smux ingest config = %q/%q, want smux/edge.internal:9000", cfg.IngestTransport, cfg.IngestTCPAddr)
+	}
+	if cfg.IngestTransport.IsTCP() || cfg.IngestTransport.IsHTTP() || !cfg.IngestTransport.UsesTCPIngestAddr() {
+		t.Fatalf("connector transport predicates for %q: IsTCP=%t IsHTTP=%t UsesTCPIngestAddr=%t, want false/false/true", cfg.IngestTransport, cfg.IngestTransport.IsTCP(), cfg.IngestTransport.IsHTTP(), cfg.IngestTransport.UsesTCPIngestAddr())
 	}
 	if cfg.IngestURL != "https://localhost:8443/ingest" {
 		t.Fatalf("IngestURL = %q, want default HTTP ingest URL unchanged", cfg.IngestURL)
@@ -199,7 +242,7 @@ func TestLoadIngestTransportRejectsInvalidValue(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "AIR3_INGEST_TRANSPORT") {
 				t.Fatalf("load error = %v, want invalid AIR3_INGEST_TRANSPORT allowed-values error", err)
 			}
-			for _, want := range []string{"http1", "http2", "tcp", "legacy http"} {
+			for _, want := range []string{"http1", "http2", "tcp", "smux", "legacy http"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("load error = %v, want containing %q", err, want)
 				}
@@ -208,7 +251,7 @@ func TestLoadIngestTransportRejectsInvalidValue(t *testing.T) {
 	}
 }
 
-func TestLoadTCPIngestTransportRequiresTCPAddress(t *testing.T) {
+func TestLoadTCPBasedIngestTransportsRequireTCPAddress(t *testing.T) {
 	tests := []struct {
 		name string
 		env  map[string]string
@@ -216,7 +259,7 @@ func TestLoadTCPIngestTransportRequiresTCPAddress(t *testing.T) {
 		want string
 	}{
 		{
-			name: "edge",
+			name: "edge tcp",
 			env: map[string]string{
 				"AIR3_SIGNING_DISABLED": "true",
 				"AIR3_INGEST_TRANSPORT": "tcp",
@@ -228,11 +271,36 @@ func TestLoadTCPIngestTransportRequiresTCPAddress(t *testing.T) {
 			want: "AIR3_EDGE_INGEST_TCP_ADDR",
 		},
 		{
-			name: "connector",
+			name: "edge smux",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_INGEST_TRANSPORT": "smux",
+			},
+			load: func(env map[string]string) error {
+				_, err := LoadEdge(testOptions(env, nil))
+				return err
+			},
+			want: "AIR3_EDGE_INGEST_TCP_ADDR",
+		},
+		{
+			name: "connector tcp",
 			env: map[string]string{
 				"AIR3_S3_ACCESS_KEY_ID":     "access",
 				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
 				"AIR3_INGEST_TRANSPORT":     "tcp",
+			},
+			load: func(env map[string]string) error {
+				_, err := LoadConnector(testOptions(env, nil))
+				return err
+			},
+			want: "AIR3_INGEST_TCP_ADDR",
+		},
+		{
+			name: "connector smux",
+			env: map[string]string{
+				"AIR3_S3_ACCESS_KEY_ID":     "access",
+				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+				"AIR3_INGEST_TRANSPORT":     "smux",
 			},
 			load: func(env map[string]string) error {
 				_, err := LoadConnector(testOptions(env, nil))
