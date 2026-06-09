@@ -114,7 +114,13 @@ The smoke tests (`make smoke`) automatically verify that signed `GET`/`HEAD` req
 
 ## Compose Performance Test
 
-The Compose benchmark starts the demo stack with a performance override, exposes VersityGW on localhost for direct S3 timing, seeds three Wikimedia objects into the demo bucket, and compares direct S3 downloads against signed air3 gateway-through downloads.
+The Compose benchmark starts the demo stack with a performance override, exposes perf-only public read baselines, seeds three Wikimedia objects into the demo bucket, and compares those baselines against signed air3 gateway-through downloads. The reported paths are:
+
+- `direct_s3`: unsigned public read directly from host-exposed VersityGW.
+- `caddy_s3`: unsigned public read through stock `caddy:2-alpine` reverse proxy with `cpus: 1.0`.
+- `air3_gateway`: signed Air3 gateway URL through normal edge/private-connector path.
+
+These public reads are perf/demo-only. The normal Compose security topology remains unchanged: outside the perf override, VersityGW stays private and the edge still cannot bypass the connector path.
 
 ```sh
 make perf                         # one private connector, 5 iterations per object
@@ -123,18 +129,22 @@ make perf-multi                   # AIR3_PERF_MULTI_CONNECTORS private connector
 AIR3_PERF_PARALLELISM=8 make perf # optional parallel gateway-through phase
 ```
 
-Results are written under `.air3-perf-results/` as per-request CSV plus a summary CSV with average direct/gateway latency, speed, throughput, and penalty percentages. Downloaded source files are cached under `.air3-perf-cache/` so repeat runs do not re-download them.
+Results are written under `.air3-perf-results/` as per-request CSV plus a summary CSV with average latency, speed, throughput, and penalty percentages for `direct_s3`, `caddy_s3`, and `air3_gateway`. Downloaded source files are cached under `.air3-perf-cache/` so repeat runs do not re-download them.
 
 Useful knobs:
 
 - `AIR3_PERF_ITERATIONS` (default `5`)
 - `AIR3_PERF_CONNECTORS` (default `1`)
 - `AIR3_PERF_MULTI_CONNECTORS` (default `3`, used by `make perf-multi`)
+- `AIR3_PERF_PARALLELISM` for the optional parallel gateway-through phase
 - `AIR3_PERF_SKIP_BIG=1` to skip the video object for a quick run
 - `AIR3_PERF_S3_PORT` to change the temporary localhost VersityGW port
+- `AIR3_PERF_CADDY_PORT` to change the temporary localhost Caddy baseline port
+- `AIR3_PERF_CADDY_BASE_URL` to point the `caddy_s3` baseline at a different proxy URL
+- `AIR3_PERF_PUBLIC_READ_MODE` controls how the perf script enables anonymous reads: ACL mode sets a public-read bucket ACL in VersityGW; `auto` falls back to a bucket policy if ACL-only anonymous reads are not sufficient.
 - `AIR3_PERF_CACHE_DIR` and `AIR3_PERF_RESULTS_DIR` to relocate cache/results
 
-The perf override limits each `edge-gateway` and `private-connector` container to one CPU. Direct S3 measurements use curl SigV4 against the perf-exposed VersityGW endpoint; gateway measurements use `cmd/signurl` and `curl --http1.1 --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443` for stable streaming timings.
+The perf override limits each `edge-gateway` and `private-connector` container to one CPU. It also adds the `caddy-s3` service and `deploy/Caddyfile.perf` for the Caddy baseline. Unsigned public baselines use curl against the perf-exposed endpoints; gateway measurements use `cmd/signurl` and `curl --http1.1 --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443` for stable streaming timings.
 
 ## Generating Signed URLs
 
