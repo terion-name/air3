@@ -24,7 +24,7 @@ sequenceDiagram
     Client->>Edge: Signed GET or HEAD
     Edge->>Edge: Verify edge URL and create live ticket
     Edge->>NATS: Publish ticket (control plane only)
-    NATS-->>Connector: Deliver ticket to connector queue
+    Connector->>NATS: Pull ticket from queue
     Connector->>S3: Fetch object bytes or metadata
     S3-->>Connector: Return object stream or status
     Connector->>Edge: POST ingest stream (mTLS + token)
@@ -45,11 +45,11 @@ flowchart TB
     subgraph Public["Public Internet / public network"]
         Client["Client or app"]
         PublicEdge["Edge public listener\nGET/HEAD HTTPS"]
-    end
 
-    subgraph Broker["Broker / control plane"]
-        NATS["NATS broker\nshort-lived tickets"]
-        Ingest["Edge private ingest listener\nmTLS POST /ingest"]
+        subgraph Broker["Broker / control plane"]
+            NATS["NATS broker\nshort-lived tickets"]
+            Ingest["Edge private ingest listener\nmTLS POST /ingest"]
+        end
     end
 
     subgraph Private["Private network"]
