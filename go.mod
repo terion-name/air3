@@ -1,6 +1,6 @@
 module github.com/terion-name/air3
 
-go 1.22.0
+go 1.25.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.30.1
@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.58.0
 	github.com/aws/smithy-go v1.20.3
 	github.com/nats-io/nats.go v1.39.1
+	github.com/quic-go/quic-go v0.60.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
@@ -31,6 +32,7 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/xtaci/smux v1.5.57 // indirect
-	golang.org/x/crypto v0.31.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 )
