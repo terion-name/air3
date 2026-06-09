@@ -34,7 +34,7 @@ services:
     environment:
       AIR3_EDGE_PUBLIC_ADDR: ":8443"
       AIR3_EDGE_INGEST_ADDR: ":9443"
-      # Keep legacy http as the Compose default for compatibility; override with http1, http2, or tcp for explicit transport runs.
+      # Keep legacy http as the Compose default for compatibility; override with http1, http2, tcp, or smux for explicit transport runs.
       AIR3_INGEST_TRANSPORT: "${AIR3_INGEST_TRANSPORT:-http}"
       AIR3_EDGE_INGEST_TCP_ADDR: "${AIR3_EDGE_INGEST_TCP_ADDR:-:9444}"
       AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
@@ -74,7 +74,7 @@ services:
       - ./certs/generated:/certs:ro
     environment:
       AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
-      # Keep legacy http as the Compose default for compatibility; override with http1, http2, or tcp for explicit transport runs.
+      # Keep legacy http as the Compose default for compatibility; override with http1, http2, tcp, or smux for explicit transport runs.
       AIR3_INGEST_TRANSPORT: "${AIR3_INGEST_TRANSPORT:-http}"
       AIR3_INGEST_TCP_ADDR: "${AIR3_INGEST_TCP_ADDR:-edge-gateway:9444}"
       AIR3_ALLOWED_BUCKETS: "demo"

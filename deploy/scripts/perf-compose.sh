@@ -60,26 +60,27 @@ Runs the air3 Docker Compose performance benchmark. Configuration is via env var
   AIR3_PERF_CADDY_PORT          host port for perf Caddy S3 proxy (default: $CADDY_HOST_PORT)
   AIR3_PERF_CADDY_BASE_URL      base URL for perf Caddy S3 proxy (default: $CADDY_BASE_URL)
   AIR3_PERF_PUBLIC_READ_MODE    public-read setup mode: auto|bucket-acl|bucket-policy (default: $PUBLIC_READ_MODE)
-  AIR3_INGEST_TRANSPORT         connector→edge ingest transport: http1|http2|tcp, or legacy http
-                                (default: $INGEST_TRANSPORT; tcp is experimental)
+  AIR3_INGEST_TRANSPORT         connector→edge ingest transport: http|http1|http2|tcp|smux
+                                (default: $INGEST_TRANSPORT; tcp/smux are experimental)
   AIR3_INGEST_DISABLE_HTTP2      legacy compatibility knob used only when AIR3_INGEST_TRANSPORT=http
                                 (explicit http1/http2 ignore it)
-  AIR3_EDGE_INGEST_TCP_ADDR      edge TCP ingest listener in tcp mode (Compose default: $INGEST_TCP_LISTEN_ADDR)
-  AIR3_INGEST_TCP_ADDR           connector TCP ingest dial address in tcp mode (Compose default: $INGEST_TCP_DIAL_ADDR)
+  AIR3_EDGE_INGEST_TCP_ADDR      edge TCP/smux ingest listener (Compose default: $INGEST_TCP_LISTEN_ADDR)
+  AIR3_INGEST_TCP_ADDR           connector TCP/smux ingest dial address (Compose default: $INGEST_TCP_DIAL_ADDR)
 
 Benchmark paths:
   direct_s3       anonymous direct VersityGW S3 read
   caddy_s3        anonymous read through perf Caddy S3 proxy
   air3_gateway    signed read through the Air3 gateway
 
-Transport values are: http1 (force connector HTTP/1.1), http2 (enable
-connector HTTP/2), tcp (mTLS TCP stream ingest with a MessagePack metadata
-frame), and legacy http (compatibility mode controlled by AIR3_INGEST_DISABLE_HTTP2).
+Transport values are: http (legacy compatibility mode controlled by AIR3_INGEST_DISABLE_HTTP2),
+http1 (force connector HTTP/1.1), http2 (enable connector HTTP/2), tcp (mTLS
+TCP stream ingest with a MessagePack metadata frame), and smux (MessagePack-framed
+ingest streams over persistent mTLS TCP, one smux stream per object).
 
 The per-request, parallel, and summary CSVs include an ingest_transport column so
-explicit HTTP variants, legacy HTTP, and experimental TCP ingest runs can be
-compared safely. In TCP mode, AIR3_INGEST_URL remains the HTTPS ticket/fallback
-ingest URL.
+explicit HTTP variants, legacy HTTP, and experimental TCP/smux ingest runs can
+be compared safely. In tcp/smux modes, AIR3_INGEST_URL remains the HTTPS
+ticket/fallback ingest URL.
 
 Outputs:
   per-request CSV: $RESULTS_CSV
@@ -138,9 +139,9 @@ validate_public_read_mode() {
 
 validate_ingest_transport() {
   case "$INGEST_TRANSPORT" in
-    http1|http2|tcp|http) ;;
+    http|http1|http2|tcp|smux) ;;
     *)
-      echo "error: AIR3_INGEST_TRANSPORT must be one of http1, http2, tcp, or legacy http; got '$INGEST_TRANSPORT'" >&2
+      echo "error: AIR3_INGEST_TRANSPORT must be one of http, http1, http2, tcp, or smux; got '$INGEST_TRANSPORT'" >&2
       exit 1
       ;;
   esac

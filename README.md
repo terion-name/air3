@@ -27,7 +27,7 @@ When a public user requests a file, the Edge Gateway asks the Private Connector 
 ## How It Works: Request and Stream Flow
 
 - **Control Plane (NATS):** NATS is only used to pass short-lived "fetch tickets" (instructions) from the Edge to the Connector. Object bytes never pass through NATS.
-- **Data Plane (HTTPS by default):** File bytes stream directly from your S3 storage to the Private Connector, and then securely out to the Edge Gateway over an outbound mTLS connection. An experimental TCP ingest transport is available as an opt-in benchmark/runtime tuning mode; HTTP remains the default and fallback.
+- **Data Plane (HTTPS by default):** File bytes stream directly from your S3 storage to the Private Connector, and then securely out to the Edge Gateway over an outbound mTLS connection. Experimental TCP and smux ingest transports are available as opt-in benchmark/runtime tuning modes; HTTP remains the default and fallback.
 - **No Direct S3 Access:** Users get URLs signed for the Edge Gateway, not S3. The Edge handles authorization before the private network even knows about the request.
 
 ```mermaid
@@ -45,7 +45,7 @@ sequenceDiagram
     Connector->>NATS: Pull ticket from queue
     Connector->>S3: Fetch object bytes or metadata
     S3-->>Connector: Return object stream or status
-    Connector->>Edge: Ingest stream (mTLS + token; HTTP default, TCP opt-in)
+    Connector->>Edge: Ingest stream (mTLS + token; HTTP default, TCP/smux opt-in)
     Edge-->>Client: Forward stream to held response
     Edge->>Edge: Complete pending request
 ```
@@ -62,7 +62,7 @@ flowchart TB
 
         subgraph Broker["Broker / control plane"]
             NATS["NATS broker\nshort-lived tickets"]
-            Ingest["Edge private ingest listener\nmTLS HTTP /ingest or TCP"]
+            Ingest["Edge private ingest listener\nmTLS HTTP /ingest, TCP, or smux"]
         end
     end
 
@@ -75,13 +75,13 @@ flowchart TB
     PublicEdge -->|"mTLS ticket publish"| NATS
     Connector -->|"NATS mTLS control plane connection"| NATS
     Connector -->|"S3 private API"| S3
-    Connector -->|"outbound mTLS ingest stream (HTTP or TCP)"| Ingest
+    Connector -->|"outbound mTLS ingest stream (HTTP, TCP, or smux)"| Ingest
     Ingest -->|"stream handoff inside edge"| PublicEdge
 ```
 
 ## System Components
 
-- `cmd/edge-gateway`: The public-facing server. It listens for client `GET`/`HEAD` requests and provides a private mTLS "ingest" listener to receive the file stream from the connector (HTTP by default, with experimental opt-in TCP).
+- `cmd/edge-gateway`: The public-facing server. It listens for client `GET`/`HEAD` requests and provides a private mTLS "ingest" listener to receive the file stream from the connector (HTTP by default, with experimental opt-in TCP and smux).
 - `cmd/private-connector`: The private worker. It securely holds S3 credentials, pulls tickets from NATS, fetches the files from S3, and pushes them out to the edge gateway.
 - `cmd/signurl`: A CLI utility for generating signed URLs for your Edge Gateway.
 - `internal/*`: Core logic for configuration, signing, mTLS, NATS communication, and object fetching.
@@ -130,9 +130,10 @@ AIR3_PERF_PARALLELISM=8 make perf # optional parallel gateway-through phase
 AIR3_INGEST_TRANSPORT=http1 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
 AIR3_INGEST_TRANSPORT=http2 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
 AIR3_INGEST_TRANSPORT=tcp AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
+AIR3_INGEST_TRANSPORT=smux AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
 ```
 
-Results are written under `.air3-perf-results/` as per-request CSV plus a summary CSV with average latency, speed, throughput, and penalty percentages for `direct_s3`, `caddy_s3`, and `air3_gateway`. Default result filenames include the transport label, and the CSVs include an `ingest_transport` column so explicit HTTP variants, legacy HTTP, and experimental TCP runs are distinguishable. Downloaded source files are cached under `.air3-perf-cache/` so repeat runs do not re-download them.
+Results are written under `.air3-perf-results/` as per-request CSV plus a summary CSV with average latency, speed, throughput, and penalty percentages for `direct_s3`, `caddy_s3`, and `air3_gateway`. Default result filenames include the transport label, and the CSVs include an `ingest_transport` column so explicit HTTP variants, legacy HTTP, and experimental TCP/smux runs are distinguishable. Downloaded source files are cached under `.air3-perf-cache/` so repeat runs do not re-download them.
 
 Useful knobs:
 
@@ -146,13 +147,13 @@ Useful knobs:
 - `AIR3_PERF_CADDY_BASE_URL` to point the `caddy_s3` baseline at a different proxy URL
 - `AIR3_PERF_PUBLIC_READ_MODE` controls how the perf script enables anonymous reads: ACL mode sets a public-read bucket ACL in VersityGW; `auto` falls back to a bucket policy if ACL-only anonymous reads are not sufficient.
 - `AIR3_STREAM_COPY_BUFFER_BYTES` (default `262144`) tunes the Edge streaming copy buffer size for Compose perf runs.
-- `AIR3_INGEST_TRANSPORT=http1|http2|tcp`, or legacy `http` (default `http`), selects the connector→edge ingest transport. `http1` forces connector HTTP/1.1, `http2` enables connector HTTP/2, and `tcp` uses experimental mTLS TCP stream ingest with a MessagePack metadata frame. Compose keeps the TCP ingest port internal by default.
+- `AIR3_INGEST_TRANSPORT=http|http1|http2|tcp|smux` selects the connector→edge ingest transport. Legacy `http` remains the default for compatibility; `http1` forces connector HTTP/1.1, `http2` enables connector HTTP/2, `tcp` uses experimental mTLS TCP stream ingest with a MessagePack metadata frame, and `smux` uses MessagePack-framed ingest streams over persistent mTLS TCP, one smux stream per object. Compose keeps the TCP/smux ingest port internal by default.
 - `AIR3_INGEST_DISABLE_HTTP2` (default `false`) is legacy/compatibility-only for `AIR3_INGEST_TRANSPORT=http` (`true` = HTTP/1.1, `false` = HTTP/2). Explicit `http1` and `http2` ignore it.
-- `AIR3_EDGE_INGEST_TCP_ADDR` (Compose default `:9444`) controls the edge TCP ingest listener when TCP transport is enabled.
-- `AIR3_INGEST_TCP_ADDR` (Compose default `edge-gateway:9444`) controls the connector TCP dial address when TCP transport is enabled. `AIR3_INGEST_URL` remains the HTTPS ingest fallback/ticket URL in both modes.
+- `AIR3_EDGE_INGEST_TCP_ADDR` (Compose default `:9444`) controls the edge TCP/smux ingest listener when `tcp` or `smux` transport is enabled.
+- `AIR3_INGEST_TCP_ADDR` (Compose default `edge-gateway:9444`) controls the connector TCP/smux dial address when `tcp` or `smux` transport is enabled. `smux` reuses these TCP address variables. `AIR3_INGEST_URL` remains the HTTPS ingest fallback/ticket URL in all transport modes.
 - `AIR3_PERF_CACHE_DIR` and `AIR3_PERF_RESULTS_DIR` to relocate cache/results
 
-The perf override limits each `edge-gateway` and `private-connector` container to one CPU. It also adds the `caddy-s3` service and `deploy/Caddyfile.perf` for the Caddy baseline. Unsigned public baselines use curl against the perf-exposed endpoints; gateway measurements use `cmd/signurl` and `curl --http1.1 --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443` for stable streaming timings. TCP ingest uses the same mTLS files, connector identity allowlist, and one-time ingest token semantics as HTTP ingest, with a MessagePack metadata frame before object bytes.
+The perf override limits each `edge-gateway` and `private-connector` container to one CPU. It also adds the `caddy-s3` service and `deploy/Caddyfile.perf` for the Caddy baseline. Unsigned public baselines use curl against the perf-exposed endpoints; gateway measurements use `cmd/signurl` and `curl --http1.1 --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443` for stable streaming timings. TCP and smux ingest use the same mTLS files, connector identity allowlist, and one-time ingest token semantics as HTTP ingest. TCP sends a MessagePack metadata frame before object bytes; smux uses MessagePack-framed ingest streams over persistent mTLS TCP, one smux stream per object.
 
 ## Generating Signed URLs
 
