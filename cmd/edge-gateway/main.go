@@ -31,16 +31,13 @@ type ticketPublisher interface {
 	PublishTicket(context.Context, tickets.Ticket) error
 }
 
-const defaultStreamCopyBufferBytes = 32 * 1024
-
 type edgeServer struct {
-	cfg                   config.EdgeConfig
-	registry              *pending.Registry
-	publisher             ticketPublisher
-	logger                *slog.Logger
-	now                   func() time.Time
-	newToken              func() (string, error)
-	streamCopyBufferBytes int
+	cfg       config.EdgeConfig
+	registry  *pending.Registry
+	publisher ticketPublisher
+	logger    *slog.Logger
+	now       func() time.Time
+	newToken  func() (string, error)
 }
 
 func main() {
@@ -107,11 +104,7 @@ func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, publisher ticke
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	streamCopyBufferBytes := cfg.StreamCopyBufferBytes
-	if streamCopyBufferBytes <= 0 {
-		streamCopyBufferBytes = defaultStreamCopyBufferBytes
-	}
-	return &edgeServer{cfg: cfg, registry: reg, publisher: publisher, logger: logger, now: time.Now, newToken: randomToken, streamCopyBufferBytes: streamCopyBufferBytes}
+	return &edgeServer{cfg: cfg, registry: reg, publisher: publisher, logger: logger, now: time.Now, newToken: randomToken}
 }
 
 func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -143,17 +136,13 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sink := newResponseSink(w, r.Method, r.Context())
 	pendingReq := pending.Request{ID: reqID, Deadline: deadline, IngestToken: ingestToken, Method: r.Method, Bucket: object.bucket, Key: object.key, Range: object.rangeHeader}
-	if err := s.registry.Register(pendingReq); err != nil {
+	if err := s.registry.Register(pendingReq, sink); err != nil {
 		writePublicError(w, http.StatusInternalServerError, "request setup failed")
 		return
 	}
-	published := false
-	defer func() {
-		if !published {
-			s.registry.Cancel(reqID)
-		}
-	}()
+	defer s.registry.Cancel(reqID, pending.ErrCanceled)
 
 	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: object.bucket, Key: object.key, Method: r.Method, Range: object.rangeHeader, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
 	publishCtx, cancelPublish := context.WithDeadline(r.Context(), deadline)
@@ -164,32 +153,22 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writePublicError(w, http.StatusServiceUnavailable, "backend unavailable")
 		return
 	}
-	published = true
 
 	waitCtx, cancelWait := context.WithDeadline(r.Context(), deadline)
 	defer cancelWait()
-	resp, err := s.registry.Wait(waitCtx, reqID)
-	if err != nil {
+	if err := sink.Wait(waitCtx); err != nil {
+		s.registry.Cancel(reqID, err)
 		if errors.Is(err, context.Canceled) {
 			s.logger.Info("public request canceled", "request_id", reqID)
 			return
 		}
-		writePublicError(w, statusForWaitError(err), statusText(statusForWaitError(err)))
+		if sink.Started() {
+			s.logger.Warn("public response stream failed", "request_id", reqID, "error", safeLogError(err))
+			return
+		}
+		status := statusForWaitError(err)
+		writePublicError(w, status, statusText(status))
 		return
-	}
-	defer resp.Body.Close()
-
-	copyMetadata(w.Header(), resp.Metadata.Header())
-	status := resp.Metadata.StatusCode
-	if status == 0 {
-		status = http.StatusOK
-	}
-	w.WriteHeader(status)
-	if r.Method == http.MethodHead || resp.Body == http.NoBody {
-		return
-	}
-	if _, err := io.CopyBuffer(w, resp.Body, make([]byte, s.streamCopyBufferBytes)); err != nil {
-		s.logger.Warn("public response stream failed", "request_id", reqID, "error", safeLogError(err))
 	}
 }
 
@@ -296,15 +275,6 @@ func ingestURLForRequest(base, requestID string) (string, error) {
 	u.Fragment = ""
 	return u.String(), nil
 }
-
-func copyMetadata(dst, src http.Header) {
-	for name, values := range src {
-		for _, value := range values {
-			dst.Add(name, value)
-		}
-	}
-}
-
 func statusForValidationError(err error) int {
 	switch {
 	case errors.Is(err, errForbidden):

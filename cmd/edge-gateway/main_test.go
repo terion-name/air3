@@ -48,35 +48,6 @@ func (p *fakePublisher) count() int {
 	return len(p.tickets)
 }
 
-type observingResponseWriter struct {
-	header      http.Header
-	status      int
-	body        bytes.Buffer
-	maxWriteLen int
-}
-
-func newObservingResponseWriter() *observingResponseWriter {
-	return &observingResponseWriter{header: make(http.Header)}
-}
-
-func (w *observingResponseWriter) Header() http.Header {
-	return w.header
-}
-
-func (w *observingResponseWriter) WriteHeader(status int) {
-	w.status = status
-}
-
-func (w *observingResponseWriter) Write(p []byte) (int, error) {
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
-	if len(p) > w.maxWriteLen {
-		w.maxWriteLen = len(p)
-	}
-	return w.body.Write(p)
-}
-
 func testEdge(pub *fakePublisher, ttl time.Duration) (*edgeServer, *pending.Registry) {
 	reg := pending.NewRegistry(pending.Options{})
 	cfg := config.EdgeConfig{
@@ -288,42 +259,6 @@ func TestGETStreamsIngestToPublicResponse(t *testing.T) {
 	}
 }
 
-func TestGETUsesConfiguredStreamCopyBufferSize(t *testing.T) {
-	pub := &fakePublisher{}
-	reg := pending.NewRegistry(pending.Options{})
-	edge := newEdgeServer(config.EdgeConfig{
-		IngestURL:             "https://edge.internal/_ingest",
-		AllowedBuckets:        []string{"demo-bucket"},
-		Signing:               config.SigningConfig{Disabled: true},
-		Timeouts:              config.TimeoutConfig{PendingRequestTTL: time.Second, StreamTimeout: time.Minute},
-		StreamCopyBufferBytes: 3,
-	}, reg, pub, nil)
-	pub.on = func(ticket tickets.Ticket) {
-		go func() {
-			stream, err := reg.StartIngest(ticket.RequestID, ticket.IngestToken, pending.Metadata{StatusCode: http.StatusOK, ContentType: "text/plain", ContentLength: "6"})
-			if err != nil {
-				t.Errorf("StartIngest() error = %v", err)
-				return
-			}
-			_, _ = stream.Write([]byte("abcdef"))
-			_ = stream.Close()
-		}()
-	}
-
-	resp := newObservingResponseWriter()
-	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil))
-
-	if got := resp.status; got != http.StatusOK {
-		t.Fatalf("status = %d, want %d", got, http.StatusOK)
-	}
-	if body := resp.body.String(); body != "abcdef" {
-		t.Fatalf("body = %q", body)
-	}
-	if got := resp.maxWriteLen; got > 3 {
-		t.Fatalf("max response Write len = %d, want <= 3", got)
-	}
-}
-
 func TestHEADReturnsMetadataWithoutBody(t *testing.T) {
 	pub := &fakePublisher{}
 	edge, reg := testEdge(pub, time.Second)
@@ -371,24 +306,33 @@ func TestMissingObjectMetadataMapsToPublic404(t *testing.T) {
 	if got := resp.Result().StatusCode; got != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", got, http.StatusNotFound)
 	}
+	if body := resp.Body.String(); body != "" {
+		t.Fatalf("body = %q, want empty", body)
+	}
 }
 
 func TestPublishFailureAndConnectorTimeoutMapping(t *testing.T) {
 	t.Run("publish failure", func(t *testing.T) {
-		edge, _ := testEdge(&fakePublisher{err: errors.New("nats unavailable")}, time.Second)
+		edge, reg := testEdge(&fakePublisher{err: errors.New("nats unavailable")}, time.Second)
 		resp := httptest.NewRecorder()
 		edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil))
 		if got := resp.Result().StatusCode; got != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want %d", got, http.StatusServiceUnavailable)
 		}
+		if _, err := reg.StartIngest("req-test", "ingest-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+			t.Fatalf("late StartIngest() error = %v, want ErrNotFound", err)
+		}
 	})
 
 	t.Run("connector timeout", func(t *testing.T) {
-		edge, _ := testEdge(&fakePublisher{}, 5*time.Millisecond)
+		edge, reg := testEdge(&fakePublisher{}, 5*time.Millisecond)
 		resp := httptest.NewRecorder()
 		edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil))
 		if got := resp.Result().StatusCode; got != http.StatusGatewayTimeout {
 			t.Fatalf("status = %d, want %d", got, http.StatusGatewayTimeout)
+		}
+		if _, err := reg.StartIngest("req-test", "ingest-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+			t.Fatalf("late StartIngest() error = %v, want ErrNotFound", err)
 		}
 	})
 }
