@@ -7,13 +7,14 @@ air3 is a file gateway that lets a public edge service coordinate signed object 
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 
-## Architecture constraints
+## Architecture overview
 
-- **NATS Core only:** air3 uses Core NATS publish/subscribe and queue groups; JetStream, durable streams, replay, and persistence are out of scope.
-- **No object bytes through NATS:** NATS carries tickets and control metadata only. File content moves over the private S3 path and the connector-to-edge ingest stream.
-- **Single edge gateway:** each public request is held by the edge gateway process that created it.
-- **Connector-only S3 credentials:** the edge gateway has no S3 credentials and is not attached to the private S3 network in the Compose demo.
-- **Edge signed URLs are not S3 presigned URLs:** they authorize the air3 edge gateway, not direct S3 API access.
+- **NATS control plane:** NATS carries short-lived fetch tickets and control metadata between the edge gateway and private connector.
+- **HTTPS ingest data path:** object bytes stream from S3-compatible storage to the connector, then over the connector-to-edge HTTPS ingest stream.
+- **Live public requests:** each public request is held by the edge gateway process that created its ticket; if the connector or backend is unavailable, the request times out or fails.
+- **Connector-held S3 credentials:** only the private connector needs S3 credentials; the edge gateway stays outside the private S3 network in the Compose demo.
+- **Edge signed URLs:** air3 signed URLs authorize the edge gateway, not direct S3 API access.
+- **Broker role:** the broker coordinates transfers; it is not the object data path.
 
 ## Request and stream flow
 
@@ -22,14 +23,14 @@ sequenceDiagram
     autonumber
     participant Client
     participant Edge as Edge gateway
-    participant NATS as NATS Core
+    participant NATS as NATS
     participant Connector as Private connector
     participant S3 as S3 storage
 
     Client->>Edge: Signed GET or HEAD
     Edge->>Edge: Verify edge URL and create live ticket
     Edge->>NATS: Publish ticket (control plane only)
-    NATS-->>Connector: Deliver ticket via Core queue
+    NATS-->>Connector: Deliver ticket to connector queue
     Connector->>S3: Fetch object bytes or metadata
     S3-->>Connector: Return object stream or status
     Connector->>Edge: POST ingest stream (mTLS + token)
@@ -47,7 +48,7 @@ flowchart TB
     end
 
     subgraph Broker["Broker / control plane"]
-        NATS["NATS Core\nno JetStream"]
+        NATS["NATS broker\nshort-lived tickets"]
         Ingest["Edge private ingest listener\nmTLS POST /ingest"]
     end
 
@@ -57,8 +58,8 @@ flowchart TB
     end
 
     Client -->|"public HTTPS"| PublicEdge
-    PublicEdge -->|"NATS mTLS control plane tickets"| NATS
-    NATS -->|"NATS mTLS control plane delivery"| Connector
+    PublicEdge -->|"mTLS ticket publish"| NATS
+    NATS -->|"mTLS ticket delivery"| Connector
     Connector -->|"S3 private API"| S3
     Connector -->|"outbound mTLS ingest stream"| Ingest
     Ingest -->|"stream handoff inside edge"| PublicEdge
@@ -67,13 +68,13 @@ flowchart TB
 ## Components
 
 - `cmd/edge-gateway`: public HTTPS entry point for signed `GET`/`HEAD` object requests and private mTLS ingest listener for connector responses.
-- `cmd/private-connector`: private-side worker that receives NATS Core tickets, fetches from S3-compatible storage, and posts object bytes to the edge ingest listener.
+- `cmd/private-connector`: private-side worker that receives NATS tickets, fetches from S3-compatible storage, and posts object bytes to the edge ingest listener.
 - `cmd/signurl`: CLI utility for signing public object URLs.
 - `internal/config`: environment configuration loading and validation.
 - `internal/tickets`: transfer ticket models.
 - `internal/signing`: signed URL HMAC creation and verification.
 - `internal/mtls`: TLS and mTLS support.
-- `internal/natsclient`: NATS Core client wiring.
+- `internal/natsclient`: NATS client wiring.
 - `internal/pending`: in-flight request tracking.
 - `internal/ingest`: edge-side ingest coordination.
 - `internal/s3fetch`: connector-side S3 object fetching.
@@ -92,7 +93,7 @@ The demo starts four runtime services:
 
 - `edge-gateway` on the `public` and `broker` networks, with public HTTPS exposed on <https://localhost:8443>.
 - `private-connector` on the `broker` and `private` networks, with no host-published application port.
-- `nats` on the `broker` network, using TLS/mTLS and NATS Core only.
+- `nats` on the `broker` network, using TLS/mTLS for broker connections.
 - `versitygw` on the `private` network only, with no host-published S3 port.
 
 Generated demo certificates live under `deploy/certs/generated/`, which is ignored by git.
@@ -145,7 +146,7 @@ Applications can generate and verify air3 edge signed URLs from importable packa
 - TypeScript: `packages/ts`, exporting pure functions from `src/index.ts`
 - Python: `packages/python/edgesign`
 
-These helpers create **edge gateway signed URLs**, not S3 SigV4 presigned URLs. The edge gateway verifies the HMAC signature before it publishes a NATS Core ticket for the private connector; the signed URL is never a direct S3 credential or S3 API authorization.
+These helpers create **edge gateway signed URLs**, not S3 SigV4 presigned URLs. The edge gateway verifies the HMAC signature before it publishes a NATS ticket for the private connector; the signed URL is never a direct S3 credential or S3 API authorization.
 
 The signature covers these canonical newline-delimited fields: HTTP method, bucket, key, Unix expiration seconds, optional signed byte range, optional response content type, and optional response content disposition. If a public request sends a `Range` header while signing is enabled, that exact range must be included in the signed URL.
 
