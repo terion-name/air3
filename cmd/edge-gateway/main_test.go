@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/terion-name/air3/internal/config"
+	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/pending"
 	"github.com/terion-name/air3/internal/signing"
@@ -185,6 +186,126 @@ func TestTCPIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
 	}
 	if strings.Contains(published[0].IngestURL, tcpIngest.listener.Addr().String()) {
 		t.Fatalf("ticket ingest URL %q unexpectedly contains TCP listener address", published[0].IngestURL)
+	}
+}
+
+func TestNonHTTPIngestListenerDisabledForHTTPTransports(t *testing.T) {
+	for _, transport := range []config.IngestTransport{config.IngestTransportHTTP, config.IngestTransportHTTP1, config.IngestTransportHTTP2} {
+		t.Run(string(transport), func(t *testing.T) {
+			listener, err := newNonHTTPIngestListener(config.EdgeConfig{
+				IngestTransport:     transport,
+				IngestTCPListenAddr: "not a valid listen address",
+			}, pending.NewRegistry(pending.Options{}), nil)
+			if err != nil {
+				t.Fatalf("newNonHTTPIngestListener() error = %v, want nil", err)
+			}
+			if listener != nil {
+				t.Fatalf("newNonHTTPIngestListener() = %#v, want nil for %s transport", listener, transport)
+			}
+		})
+	}
+}
+
+func TestSMUXIngestListenerRequiresTLSConfig(t *testing.T) {
+	_, err := newSMUXIngestListener(config.EdgeConfig{
+		IngestTransport:     config.IngestTransportSMUX,
+		IngestTCPListenAddr: "127.0.0.1:0",
+	}, pending.NewRegistry(pending.Options{}), nil)
+	if err == nil || !strings.Contains(err.Error(), "TLS config is required") {
+		t.Fatalf("newSMUXIngestListener() error = %v, want TLS config error", err)
+	}
+}
+
+func TestSMUXIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
+	tlsTemplate := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(tlsTemplate.Close)
+	clientTLS := tlsTemplate.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	serverTLS := &tls.Config{MinVersion: tls.VersionTLS12, Certificates: tlsTemplate.TLS.Certificates}
+
+	reg := pending.NewRegistry(pending.Options{})
+	smuxIngest, err := newSMUXIngestListener(config.EdgeConfig{
+		IngestTransport:       config.IngestTransportSMUX,
+		IngestTCPListenAddr:   "127.0.0.1:0",
+		StreamCopyBufferBytes: 1024,
+	}, reg, serverTLS)
+	if err != nil {
+		t.Fatalf("newSMUXIngestListener() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- smuxIngest.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = smuxIngest.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("smuxIngest.Serve() error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("smuxIngest.Serve() did not stop")
+		}
+	})
+
+	uploadDone := make(chan error, 1)
+	pub := &fakePublisher{}
+	pub.on = func(ticket tickets.Ticket) {
+		go func() {
+			uploadDone <- ingestsmux.DialAndSend(context.Background(), "tcp", smuxIngest.listener.Addr().String(), clientTLS, ingestsmux.ClientRequest{
+				RequestID:   ticket.RequestID,
+				IngestToken: ticket.IngestToken,
+				Metadata:    pending.Metadata{StatusCode: http.StatusOK, ContentType: "text/plain", ContentLength: "9"},
+				Body:        strings.NewReader("smux-body"),
+				BodyLength:  9,
+			})
+		}()
+	}
+	edge := newEdgeServer(config.EdgeConfig{
+		IngestURL:           "https://edge.internal/_ingest",
+		IngestTransport:     config.IngestTransportSMUX,
+		IngestTCPListenAddr: smuxIngest.listener.Addr().String(),
+		AllowedBuckets:      []string{"demo-bucket"},
+		Signing:             config.SigningConfig{Disabled: true},
+		Timeouts:            config.TimeoutConfig{PendingRequestTTL: 2 * time.Second},
+	}, reg, pub, nil)
+	tokens := []string{"req-smux", "ingest-smux-token"}
+	edge.newToken = func() (string, error) {
+		v := tokens[0]
+		tokens = tokens[1:]
+		return v, nil
+	}
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil))
+	if got := resp.Result().StatusCode; got != http.StatusOK {
+		select {
+		case err := <-uploadDone:
+			t.Fatalf("status = %d, want %d; upload error = %v", got, http.StatusOK, err)
+		default:
+			t.Fatalf("status = %d, want %d", got, http.StatusOK)
+		}
+	}
+	if body := resp.Body.String(); body != "smux-body" {
+		t.Fatalf("body = %q, want smux-body", body)
+	}
+	select {
+	case err := <-uploadDone:
+		if err != nil {
+			t.Fatalf("SMUX ingest upload error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for SMUX ingest upload")
+	}
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	if published[0].IngestURL != "https://edge.internal/_ingest/req-smux" {
+		t.Fatalf("ticket ingest URL = %q, want HTTPS ingest URL", published[0].IngestURL)
+	}
+	if strings.Contains(published[0].IngestURL, smuxIngest.listener.Addr().String()) {
+		t.Fatalf("ticket ingest URL %q unexpectedly contains SMUX listener address", published[0].IngestURL)
 	}
 }
 

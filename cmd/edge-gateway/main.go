@@ -21,6 +21,7 @@ import (
 
 	"github.com/terion-name/air3/internal/config"
 	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/mtls"
 	"github.com/terion-name/air3/internal/natsclient"
@@ -76,7 +77,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	publicServer := &http.Server{Addr: cfg.PublicListenAddr, Handler: edge}
 	ingestServer := &http.Server{Addr: cfg.IngestListenAddr, Handler: ingestHandler}
 	var tlsCfg *tls.Config
-	if tlsConfigured(cfg.MTLS) || cfg.IngestTransport.IsTCP() {
+	if tlsConfigured(cfg.MTLS) || cfg.IngestTransport.UsesTCPIngestAddr() {
 		tlsCfg, err = edgeServerTLSConfig(cfg.MTLS)
 		if err != nil {
 			return fmt.Errorf("load ingest tls config: %w", err)
@@ -86,25 +87,25 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		ingestServer.TLSConfig = tlsCfg
 		publicServer.TLSConfig = publicTLSConfig(tlsCfg)
 	}
-	tcpIngest, err := newTCPIngestListener(cfg, reg, tlsCfg)
+	ingestListener, err := newNonHTTPIngestListener(cfg, reg, tlsCfg)
 	if err != nil {
 		return err
 	}
-	if tcpIngest != nil {
-		defer tcpIngest.Close()
+	if ingestListener != nil {
+		defer ingestListener.Close()
 	}
 
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 	serverCount := 2
-	if tcpIngest != nil {
+	if ingestListener != nil {
 		serverCount++
 	}
 	errCh := make(chan error, serverCount)
 	go func() { errCh <- serveHTTP(publicServer, cfg.MTLS) }()
 	go func() { errCh <- serveHTTP(ingestServer, cfg.MTLS) }()
-	if tcpIngest != nil {
-		go func() { errCh <- tcpIngest.Serve(serveCtx) }()
+	if ingestListener != nil {
+		go func() { errCh <- ingestListener.Serve(serveCtx) }()
 	}
 
 	select {
@@ -114,16 +115,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		defer cancel()
 		_ = publicServer.Shutdown(shutdownCtx)
 		_ = ingestServer.Shutdown(shutdownCtx)
-		if tcpIngest != nil {
-			_ = tcpIngest.Close()
+		if ingestListener != nil {
+			_ = ingestListener.Close()
 		}
 		return nil
 	case err := <-errCh:
 		cancelServe()
 		_ = publicServer.Close()
 		_ = ingestServer.Close()
-		if tcpIngest != nil {
-			_ = tcpIngest.Close()
+		if ingestListener != nil {
+			_ = ingestListener.Close()
 		}
 		return err
 	}
@@ -360,9 +361,30 @@ func edgeServerTLSConfig(paths config.MTLSPaths) (*tls.Config, error) {
 	})
 }
 
+type nonHTTPIngestListener interface {
+	Serve(context.Context) error
+	Close() error
+}
+
 type tcpIngestListener struct {
 	server   *ingesttcp.Server
 	listener net.Listener
+}
+
+type smuxIngestListener struct {
+	server   *ingestsmux.Server
+	listener net.Listener
+}
+
+func newNonHTTPIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg *tls.Config) (nonHTTPIngestListener, error) {
+	switch cfg.IngestTransport {
+	case config.IngestTransportTCP:
+		return newTCPIngestListener(cfg, reg, tlsCfg)
+	case config.IngestTransportSMUX:
+		return newSMUXIngestListener(cfg, reg, tlsCfg)
+	default:
+		return nil, nil
+	}
 }
 
 func newTCPIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg *tls.Config) (*tcpIngestListener, error) {
@@ -385,11 +407,39 @@ func newTCPIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg *
 	return &tcpIngestListener{server: server, listener: ln}, nil
 }
 
+func newSMUXIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg *tls.Config) (*smuxIngestListener, error) {
+	if cfg.IngestTransport != config.IngestTransportSMUX {
+		return nil, nil
+	}
+	server, err := ingestsmux.NewServer(ingestsmux.ServerOptions{
+		Registry:                   reg,
+		TLSConfig:                  tlsCfg,
+		AllowedConnectorIdentities: cfg.AllowedConnectorIdentities,
+		CopyBufferBytes:            cfg.StreamCopyBufferBytes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create ingest smux server: %w", err)
+	}
+	ln, err := net.Listen("tcp", cfg.IngestTCPListenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("listen ingest smux: %w", err)
+	}
+	return &smuxIngestListener{server: server, listener: ln}, nil
+}
+
 func (l *tcpIngestListener) Serve(ctx context.Context) error {
 	return ignoreTCPServerClosed(l.server.Serve(ctx, l.listener))
 }
 
 func (l *tcpIngestListener) Close() error {
+	return l.listener.Close()
+}
+
+func (l *smuxIngestListener) Serve(ctx context.Context) error {
+	return ignoreTCPServerClosed(l.server.Serve(ctx, l.listener))
+}
+
+func (l *smuxIngestListener) Close() error {
 	return l.listener.Close()
 }
 
