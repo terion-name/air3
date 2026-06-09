@@ -21,6 +21,7 @@ type EdgeConfig struct {
 	PublicListenAddr           string
 	IngestListenAddr           string
 	IngestURL                  string
+	StreamCopyBufferBytes      int
 	AllowedBuckets             []string
 	AllowedConnectorIdentities []string
 	NATS                       NATSConfig
@@ -30,12 +31,13 @@ type EdgeConfig struct {
 }
 
 type ConnectorConfig struct {
-	IngestURL      string
-	AllowedBuckets []string
-	NATS           NATSConfig
-	S3             S3Config
-	MTLS           MTLSPaths
-	Timeouts       TimeoutConfig
+	IngestURL          string
+	IngestDisableHTTP2 bool
+	AllowedBuckets     []string
+	NATS               NATSConfig
+	S3                 S3Config
+	MTLS               MTLSPaths
+	Timeouts           TimeoutConfig
 }
 
 type NATSConfig struct {
@@ -88,12 +90,16 @@ func LoadConnectorFromEnv() (ConnectorConfig, error) {
 
 func LoadEdge(opts Options) (EdgeConfig, error) {
 	env := normalizedOptions(opts)
-	cfg := EdgeConfig{
-		PublicListenAddr: env.get("AIR3_EDGE_PUBLIC_ADDR", ":8080"),
-		IngestListenAddr: env.get("AIR3_EDGE_INGEST_ADDR", ":8443"),
-		IngestURL:        env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
+	streamCopyBufferBytes, err := env.intBytes("AIR3_STREAM_COPY_BUFFER_BYTES", 262144, 32768, 1048576)
+	if err != nil {
+		return EdgeConfig{}, err
 	}
-	var err error
+	cfg := EdgeConfig{
+		PublicListenAddr:      env.get("AIR3_EDGE_PUBLIC_ADDR", ":8080"),
+		IngestListenAddr:      env.get("AIR3_EDGE_INGEST_ADDR", ":8443"),
+		IngestURL:             env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
+		StreamCopyBufferBytes: streamCopyBufferBytes,
+	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
 		return EdgeConfig{}, err
@@ -126,10 +132,14 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 
 func LoadConnector(opts Options) (ConnectorConfig, error) {
 	env := normalizedOptions(opts)
-	cfg := ConnectorConfig{
-		IngestURL: env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
+	ingestDisableHTTP2, err := env.bool("AIR3_INGEST_DISABLE_HTTP2", false)
+	if err != nil {
+		return ConnectorConfig{}, err
 	}
-	var err error
+	cfg := ConnectorConfig{
+		IngestURL:          env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
+		IngestDisableHTTP2: ingestDisableHTTP2,
+	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
 		return ConnectorConfig{}, err
@@ -320,6 +330,21 @@ func (e envReader) duration(name string, fallback time.Duration) (time.Duration,
 		return 0, fmt.Errorf("%s must be positive", name)
 	}
 	return d, nil
+}
+
+func (e envReader) intBytes(name string, fallback, min, max int) (int, error) {
+	text := e.get(name, "")
+	if text == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer byte count: %w", name, err)
+	}
+	if value < min || value > max {
+		return 0, fmt.Errorf("%s must be between %d and %d bytes", name, min, max)
+	}
+	return value, nil
 }
 
 func (e envReader) bool(name string, fallback bool) (bool, error) {

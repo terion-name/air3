@@ -31,13 +31,16 @@ type ticketPublisher interface {
 	PublishTicket(context.Context, tickets.Ticket) error
 }
 
+const defaultStreamCopyBufferBytes = 32 * 1024
+
 type edgeServer struct {
-	cfg       config.EdgeConfig
-	registry  *pending.Registry
-	publisher ticketPublisher
-	logger    *slog.Logger
-	now       func() time.Time
-	newToken  func() (string, error)
+	cfg                   config.EdgeConfig
+	registry              *pending.Registry
+	publisher             ticketPublisher
+	logger                *slog.Logger
+	now                   func() time.Time
+	newToken              func() (string, error)
+	streamCopyBufferBytes int
 }
 
 func main() {
@@ -66,7 +69,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	reg := pending.NewRegistry(pending.Options{})
 	edge := newEdgeServer(cfg, reg, publisher, logger)
-	ingestHandler, err := ingest.NewHandler(ingest.Options{Registry: reg, AllowedConnectorIdentities: cfg.AllowedConnectorIdentities})
+	ingestHandler, err := ingest.NewHandler(ingest.Options{Registry: reg, AllowedConnectorIdentities: cfg.AllowedConnectorIdentities, StreamCopyBufferBytes: cfg.StreamCopyBufferBytes})
 	if err != nil {
 		return err
 	}
@@ -104,7 +107,11 @@ func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, publisher ticke
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &edgeServer{cfg: cfg, registry: reg, publisher: publisher, logger: logger, now: time.Now, newToken: randomToken}
+	streamCopyBufferBytes := cfg.StreamCopyBufferBytes
+	if streamCopyBufferBytes <= 0 {
+		streamCopyBufferBytes = defaultStreamCopyBufferBytes
+	}
+	return &edgeServer{cfg: cfg, registry: reg, publisher: publisher, logger: logger, now: time.Now, newToken: randomToken, streamCopyBufferBytes: streamCopyBufferBytes}
 }
 
 func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +188,7 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodHead || resp.Body == http.NoBody {
 		return
 	}
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	if _, err := io.CopyBuffer(w, resp.Body, make([]byte, s.streamCopyBufferBytes)); err != nil {
 		s.logger.Warn("public response stream failed", "request_id", reqID, "error", safeLogError(err))
 	}
 }

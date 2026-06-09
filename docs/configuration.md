@@ -24,6 +24,7 @@ The Private Connector is your secure worker. It has **no public inbound listener
 | --- | --- | --- |
 | `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The default fallback Edge ingest endpoint for outbound mTLS uploads. |
 | `AIR3_ALLOWED_BUCKETS` | `demo` | Defense-in-depth: the Connector also enforces this allowlist before attempting to reach S3. |
+| `AIR3_INGEST_DISABLE_HTTP2` | `false` | Disable HTTP/2 for the connector→edge ingest HTTP client only. This is a transport tuning knob and does not change auth/security behavior or introduce body buffering. |
 
 ## NATS Broker
 
@@ -89,6 +90,9 @@ We use standardized variable suffixes for configuring TLS and mutual TLS (mTLS) 
 | --- | --- | --- |
 | `AIR3_PENDING_TTL` | `30s` | Maximum time the Edge will wait for the Connector to start pushing file data before giving up. |
 | `AIR3_STREAM_TIMEOUT` | `5m` | Maximum total time allowed for the entire file stream transfer. |
+| `AIR3_STREAM_COPY_BUFFER_BYTES` | `262144` bytes | Size of each per-stream `io.CopyBuffer` buffer on edge streaming paths. Units are bytes; minimum `32768` bytes, maximum `1048576` bytes. This bounds streaming copy buffers without introducing body buffering. |
+
+*Runtime tuning note:* `AIR3_STREAM_COPY_BUFFER_BYTES` and `AIR3_INGEST_DISABLE_HTTP2` only tune streaming/transport behavior. They do not change authentication, authorization, or other security behavior, and they do not introduce request or response body buffering.
 
 *Bucket Name Rules:* Bucket names must be 3-63 characters long, containing only lowercase letters, numbers, dots, or hyphens (DNS style). They cannot start or end with a dot or hyphen, and cannot have adjacent dots.
 

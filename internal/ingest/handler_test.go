@@ -311,6 +311,51 @@ func TestHandlerStreamsWithoutReadingWholeBodyFirst(t *testing.T) {
 	}
 }
 
+func TestHandlerUsesConfiguredStreamCopyBufferSize(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	reg := pending.NewRegistry(pending.Options{Now: func() time.Time { return now }})
+	req := ingestRequest(now, "req-copy-buffer")
+	if err := reg.Register(req); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	h, err := NewHandler(Options{Registry: reg, StreamCopyBufferBytes: 3})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	body := &observingReader{data: []byte("abcdef")}
+	r := httptest.NewRequest(http.MethodPost, PathPrefix+req.ID, body)
+	r.Header.Set(TokenHeader, req.IngestToken)
+	w := httptest.NewRecorder()
+
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		h.ServeHTTP(w, r)
+	}()
+	resp, err := reg.Wait(context.Background(), req.ID)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	gotBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("Body.Close() error = %v", err)
+	}
+	<-serveDone
+
+	if string(gotBody) != "abcdef" {
+		t.Fatalf("body = %q", gotBody)
+	}
+	if got := body.maxReadLen; got > 3 {
+		t.Fatalf("max request body Read len = %d, want <= 3", got)
+	}
+	if got := w.Result().StatusCode; got != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", got, http.StatusNoContent)
+	}
+}
+
 func TestHandlerRejectsInvalidRouteAndMethod(t *testing.T) {
 	h := newTestHandler(t, pending.NewRegistry(pending.Options{}))
 	methodReq := httptest.NewRequest(http.MethodGet, PathPrefix+"req", nil)
@@ -332,6 +377,23 @@ func TestNewHandlerRequiresRegistry(t *testing.T) {
 	if _, err := NewHandler(Options{}); err == nil {
 		t.Fatal("NewHandler() error = nil, want error")
 	}
+}
+
+type observingReader struct {
+	data       []byte
+	maxReadLen int
+}
+
+func (r *observingReader) Read(p []byte) (int, error) {
+	if len(p) > r.maxReadLen {
+		r.maxReadLen = len(p)
+	}
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
 }
 
 type tlsState struct {

@@ -22,6 +22,9 @@ func TestLoadEdgeDefaultsWithDisabledSigning(t *testing.T) {
 	if !reflect.DeepEqual(cfg.AllowedBuckets, []string{"demo"}) {
 		t.Fatalf("AllowedBuckets = %#v", cfg.AllowedBuckets)
 	}
+	if cfg.StreamCopyBufferBytes != 262144 {
+		t.Fatalf("StreamCopyBufferBytes = %d, want 262144", cfg.StreamCopyBufferBytes)
+	}
 }
 
 func TestLoadEdgeRequiresSigningSecretWhenEnabled(t *testing.T) {
@@ -36,6 +39,7 @@ func TestLoadConnectorParsesS3AndDoesNotRequireSigning(t *testing.T) {
 		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
 		"AIR3_ALLOWED_BUCKETS":      "demo,logs",
 		"AIR3_S3_USE_PATH_STYLE":    "false",
+		"AIR3_INGEST_DISABLE_HTTP2": "true",
 	}
 	cfg, err := LoadConnector(testOptions(env, nil))
 	if err != nil {
@@ -47,8 +51,73 @@ func TestLoadConnectorParsesS3AndDoesNotRequireSigning(t *testing.T) {
 	if cfg.S3.UsePathStyle {
 		t.Fatal("S3 UsePathStyle = true, want false")
 	}
+	if !cfg.IngestDisableHTTP2 {
+		t.Fatal("IngestDisableHTTP2 = false, want true")
+	}
 	if !reflect.DeepEqual(cfg.S3.AllowedBuckets, []string{"demo", "logs"}) {
 		t.Fatalf("S3 buckets = %#v", cfg.S3.AllowedBuckets)
+	}
+}
+
+func TestLoadConnectorDefaultsIngestDisableHTTP2False(t *testing.T) {
+	env := map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":     "access",
+		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+	}
+	cfg, err := LoadConnector(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadConnector() error = %v", err)
+	}
+	if cfg.IngestDisableHTTP2 {
+		t.Fatal("IngestDisableHTTP2 = true, want false")
+	}
+}
+
+func TestLoadEdgeParsesStreamCopyBufferBytes(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED":         "true",
+		"AIR3_STREAM_COPY_BUFFER_BYTES": "524288",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.StreamCopyBufferBytes != 524288 {
+		t.Fatalf("StreamCopyBufferBytes = %d, want 524288", cfg.StreamCopyBufferBytes)
+	}
+}
+
+func TestLoadEdgeRejectsInvalidStreamCopyBufferBytes(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"non-number", "many", "AIR3_STREAM_COPY_BUFFER_BYTES must be an integer byte count"},
+		{"zero", "0", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576 bytes"},
+		{"negative", "-1", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576 bytes"},
+		{"below minimum", "32767", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576 bytes"},
+		{"above maximum", "1048577", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576 bytes"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"AIR3_SIGNING_DISABLED":         "true",
+				"AIR3_STREAM_COPY_BUFFER_BYTES": tc.value,
+			}
+			_, err := LoadEdge(testOptions(env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadEdge() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadConnectorRejectsInvalidIngestDisableHTTP2(t *testing.T) {
+	env := map[string]string{"AIR3_INGEST_DISABLE_HTTP2": "sometimes"}
+	_, err := LoadConnector(testOptions(env, nil))
+	if err == nil || !strings.Contains(err.Error(), "AIR3_INGEST_DISABLE_HTTP2 must be a boolean") {
+		t.Fatalf("LoadConnector() error = %v, want boolean error", err)
 	}
 }
 

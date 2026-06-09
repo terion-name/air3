@@ -70,7 +70,10 @@ func New(ctx context.Context, cfg config.S3Config) (*Fetcher, error) {
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
 		o.UsePathStyle = cfg.UsePathStyle
 		if cfg.InsecureSkipVerify {
-			o.HTTPClient = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec // Explicit local-demo compatibility option.
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // Explicit local-demo compatibility option.
+			transport.DisableCompression = true
+			o.HTTPClient = &http.Client{Transport: transport}
 		}
 	})
 	return &Fetcher{client: client}, nil

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -55,7 +56,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	httpClient, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout)
+	httpClient, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, cfg.IngestDisableHTTP2)
 	if err != nil {
 		return err
 	}
@@ -141,6 +142,9 @@ func (c *connector) postIngest(ctx context.Context, ticket tickets.Ticket, metad
 	}
 	req.Header.Set(ingest.TokenHeader, ticket.IngestToken)
 	metadata.setHeaders(req.Header)
+	if metadata.ContentLength >= 0 && body != http.NoBody {
+		req.ContentLength = metadata.ContentLength
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("post ingest: %w", err)
@@ -229,8 +233,16 @@ func validateIngestURL(raw string) error {
 	return nil
 }
 
-func ingestHTTPClient(paths config.MTLSPaths, timeout time.Duration) (*http.Client, error) {
+func ingestHTTPClient(paths config.MTLSPaths, timeout time.Duration, disableHTTP2 bool) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableCompression = true
+	if transport.MaxIdleConnsPerHost < 32 {
+		transport.MaxIdleConnsPerHost = 32
+	}
+	if disableHTTP2 {
+		transport.ForceAttemptHTTP2 = false
+		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
 	if paths.CAFile != "" || paths.CertFile != "" || paths.KeyFile != "" || paths.ServerName != "" || paths.InsecureSkipVerify {
 		tlsCfg, err := mtls.ClientConfig(mtls.ClientOptions{Files: mtls.Files{CAFile: paths.CAFile, CertFile: paths.CertFile, KeyFile: paths.KeyFile, ServerName: paths.ServerName, InsecureSkipVerify: paths.InsecureSkipVerify}})
 		if err != nil {

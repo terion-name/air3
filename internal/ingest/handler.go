@@ -13,20 +13,23 @@ import (
 )
 
 const (
-	TokenHeader               = "X-Air3-Ingest-Token"
-	StatusCodeHeader          = "X-Air3-Status-Code"
-	ObjectContentLengthHeader = "X-Air3-Content-Length"
-	PathPrefix                = "/_ingest/"
+	TokenHeader                  = "X-Air3-Ingest-Token"
+	StatusCodeHeader             = "X-Air3-Status-Code"
+	ObjectContentLengthHeader    = "X-Air3-Content-Length"
+	PathPrefix                   = "/_ingest/"
+	defaultStreamCopyBufferBytes = 32 * 1024
 )
 
 type Handler struct {
-	registry          *pending.Registry
-	allowedIdentities map[string]struct{}
+	registry              *pending.Registry
+	allowedIdentities     map[string]struct{}
+	streamCopyBufferBytes int
 }
 
 type Options struct {
 	Registry                   *pending.Registry
 	AllowedConnectorIdentities []string
+	StreamCopyBufferBytes      int
 }
 
 func NewHandler(opts Options) (*Handler, error) {
@@ -40,7 +43,11 @@ func NewHandler(opts Options) (*Handler, error) {
 			allowed[identity] = struct{}{}
 		}
 	}
-	return &Handler{registry: opts.Registry, allowedIdentities: allowed}, nil
+	streamCopyBufferBytes := opts.StreamCopyBufferBytes
+	if streamCopyBufferBytes <= 0 {
+		streamCopyBufferBytes = defaultStreamCopyBufferBytes
+	}
+	return &Handler{registry: opts.Registry, allowedIdentities: allowed, streamCopyBufferBytes: streamCopyBufferBytes}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +80,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, copyErr := io.Copy(stream, r.Body)
+	_, copyErr := io.CopyBuffer(stream, r.Body, make([]byte, h.streamCopyBufferBytes))
 	if err := stream.CloseWithError(copyErr); err != nil && copyErr == nil {
 		copyErr = err
 	}

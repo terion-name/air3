@@ -74,6 +74,54 @@ func TestFetcherHeadObjectUsesHEADAndNoBody(t *testing.T) {
 	}
 }
 
+func TestNewInsecureSkipVerifyUsesClonedDefaultTransport(t *testing.T) {
+	cfg := testConfig("https://s3.local")
+	cfg.InsecureSkipVerify = true
+
+	fetcher, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	httpClient, ok := fetcher.client.Options().HTTPClient.(*http.Client)
+	if !ok {
+		t.Fatalf("HTTPClient type = %T, want *http.Client", fetcher.client.Options().HTTPClient)
+	}
+	transport, ok := httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type = %T, want *http.Transport", httpClient.Transport)
+	}
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		t.Fatalf("http.DefaultTransport type = %T, want *http.Transport", http.DefaultTransport)
+	}
+
+	if transport == defaultTransport {
+		t.Fatal("transport uses http.DefaultTransport directly, want cloned transport")
+	}
+	if transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("TLSClientConfig = %#v, want InsecureSkipVerify", transport.TLSClientConfig)
+	}
+	if !transport.DisableCompression {
+		t.Fatal("DisableCompression = false, want true")
+	}
+	if (transport.Proxy == nil) != (defaultTransport.Proxy == nil) {
+		t.Fatalf("Proxy nilness = %v, want %v", transport.Proxy == nil, defaultTransport.Proxy == nil)
+	}
+	if (transport.DialContext == nil) != (defaultTransport.DialContext == nil) {
+		t.Fatalf("DialContext nilness = %v, want %v", transport.DialContext == nil, defaultTransport.DialContext == nil)
+	}
+	if transport.ForceAttemptHTTP2 != defaultTransport.ForceAttemptHTTP2 ||
+		transport.MaxIdleConns != defaultTransport.MaxIdleConns ||
+		transport.MaxIdleConnsPerHost != defaultTransport.MaxIdleConnsPerHost ||
+		transport.MaxConnsPerHost != defaultTransport.MaxConnsPerHost ||
+		transport.IdleConnTimeout != defaultTransport.IdleConnTimeout ||
+		transport.TLSHandshakeTimeout != defaultTransport.TLSHandshakeTimeout ||
+		transport.ExpectContinueTimeout != defaultTransport.ExpectContinueTimeout {
+		t.Fatalf("transport defaults were not preserved: got %#v want defaults from %#v", transport, defaultTransport)
+	}
+}
+
 func TestFetcherMapsMissingObject(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")

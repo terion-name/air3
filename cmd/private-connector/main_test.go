@@ -55,12 +55,76 @@ func TestConnectorSafeLogErrorRedactsDetails(t *testing.T) {
 	}
 }
 
+func TestIngestHTTPClientClonesDefaultTransportWithConnectorSettings(t *testing.T) {
+	defaultTransport := http.DefaultTransport.(*http.Transport)
+	defaultDisableCompression := defaultTransport.DisableCompression
+	defaultMaxIdleConnsPerHost := defaultTransport.MaxIdleConnsPerHost
+
+	client, err := ingestHTTPClient(config.MTLSPaths{}, 7*time.Second, false)
+	if err != nil {
+		t.Fatalf("ingestHTTPClient() error = %v", err)
+	}
+	if client.Timeout != 7*time.Second {
+		t.Fatalf("client timeout = %v, want 7s", client.Timeout)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport == defaultTransport {
+		t.Fatal("ingestHTTPClient() returned http.DefaultTransport instead of a clone")
+	}
+	if defaultTransport.DisableCompression != defaultDisableCompression || defaultTransport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
+		t.Fatal("ingestHTTPClient() mutated http.DefaultTransport")
+	}
+	if !transport.DisableCompression {
+		t.Fatal("transport.DisableCompression = false, want true")
+	}
+	wantMaxIdleConnsPerHost := defaultMaxIdleConnsPerHost
+	if wantMaxIdleConnsPerHost < 32 {
+		wantMaxIdleConnsPerHost = 32
+	}
+	if transport.MaxIdleConnsPerHost != wantMaxIdleConnsPerHost {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, wantMaxIdleConnsPerHost)
+	}
+	if transport.TLSHandshakeTimeout != defaultTransport.TLSHandshakeTimeout || transport.IdleConnTimeout != defaultTransport.IdleConnTimeout || transport.ExpectContinueTimeout != defaultTransport.ExpectContinueTimeout || transport.ResponseHeaderTimeout != defaultTransport.ResponseHeaderTimeout {
+		t.Fatalf("transport did not preserve default timeout behavior: got TLSHandshake=%v IdleConn=%v ExpectContinue=%v ResponseHeader=%v", transport.TLSHandshakeTimeout, transport.IdleConnTimeout, transport.ExpectContinueTimeout, transport.ResponseHeaderTimeout)
+	}
+	if (transport.Proxy == nil) != (defaultTransport.Proxy == nil) || (transport.DialContext == nil) != (defaultTransport.DialContext == nil) {
+		t.Fatal("transport did not preserve default proxy/dialer behavior")
+	}
+	if transport.ForceAttemptHTTP2 != defaultTransport.ForceAttemptHTTP2 {
+		t.Fatalf("ForceAttemptHTTP2 = %v, want default %v", transport.ForceAttemptHTTP2, defaultTransport.ForceAttemptHTTP2)
+	}
+
+	client, err = ingestHTTPClient(config.MTLSPaths{}, 7*time.Second, true)
+	if err != nil {
+		t.Fatalf("ingestHTTPClient(disableHTTP2) error = %v", err)
+	}
+	disabledTransport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("disabled client transport = %T, want *http.Transport", client.Transport)
+	}
+	if disabledTransport.ForceAttemptHTTP2 {
+		t.Fatal("ForceAttemptHTTP2 = true, want false when HTTP/2 is disabled")
+	}
+	if disabledTransport.TLSNextProto == nil || len(disabledTransport.TLSNextProto) != 0 {
+		t.Fatalf("TLSNextProto = %#v, want empty non-nil map when HTTP/2 is disabled", disabledTransport.TLSNextProto)
+	}
+	if defaultTransport.DisableCompression != defaultDisableCompression || defaultTransport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
+		t.Fatal("ingestHTTPClient(disableHTTP2) mutated http.DefaultTransport")
+	}
+}
+
 func TestConnectorStreamsFetchedObjectToIngest(t *testing.T) {
-	var gotToken, gotStatus, gotContentType, gotBody string
+	var gotToken, gotStatus, gotContentType, gotMetadataLength, gotBody string
+	var gotContentLength int64
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotToken = r.Header.Get(ingest.TokenHeader)
 		gotStatus = r.Header.Get(ingest.StatusCodeHeader)
 		gotContentType = r.Header.Get("Content-Type")
+		gotMetadataLength = r.Header.Get(ingest.ObjectContentLengthHeader)
+		gotContentLength = r.ContentLength
 		body, _ := io.ReadAll(r.Body)
 		gotBody = string(body)
 		w.WriteHeader(http.StatusNoContent)
@@ -72,8 +136,8 @@ func TestConnectorStreamsFetchedObjectToIngest(t *testing.T) {
 	if err := worker.handleTicket(context.Background(), validTicket(ts.URL, http.MethodGet)); err != nil {
 		t.Fatalf("handleTicket() error = %v", err)
 	}
-	if gotToken != "ingest-token" || gotStatus != "200" || gotContentType != "text/plain" || gotBody != "hello world" {
-		t.Fatalf("ingest token=%q status=%q content-type=%q body=%q", gotToken, gotStatus, gotContentType, gotBody)
+	if gotToken != "ingest-token" || gotStatus != "200" || gotContentType != "text/plain" || gotMetadataLength != "11" || gotBody != "hello world" || gotContentLength != 11 {
+		t.Fatalf("ingest token=%q status=%q content-type=%q metadata-length=%q content-length=%d body=%q", gotToken, gotStatus, gotContentType, gotMetadataLength, gotContentLength, gotBody)
 	}
 	if len(fetcher.requests) != 1 || fetcher.requests[0].Bucket != "demo-bucket" || fetcher.requests[0].Key != "objects/file.txt" {
 		t.Fatalf("fetch requests = %#v", fetcher.requests)
@@ -106,7 +170,9 @@ func TestConnectorPassesRangeToFetcherAndIngest(t *testing.T) {
 
 func TestConnectorHEADPostsMetadataWithoutBody(t *testing.T) {
 	var gotBody string
+	var gotContentLength int64
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentLength = r.ContentLength
 		body, _ := io.ReadAll(r.Body)
 		gotBody = string(body)
 		if r.Header.Get(ingest.StatusCodeHeader) != "200" || r.Header.Get(ingest.ObjectContentLengthHeader) != "5" {
@@ -121,8 +187,8 @@ func TestConnectorHEADPostsMetadataWithoutBody(t *testing.T) {
 	if err := worker.handleTicket(context.Background(), validTicket(ts.URL, http.MethodHead)); err != nil {
 		t.Fatalf("handleTicket() error = %v", err)
 	}
-	if gotBody != "" {
-		t.Fatalf("HEAD body = %q, want empty", gotBody)
+	if gotBody != "" || gotContentLength != 0 {
+		t.Fatalf("HEAD body = %q content-length = %d, want empty body and zero POST content length", gotBody, gotContentLength)
 	}
 }
 
