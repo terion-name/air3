@@ -25,11 +25,13 @@ const (
 	IngestTransportHTTP2 IngestTransport = "http2"
 	IngestTransportTCP   IngestTransport = "tcp"
 	IngestTransportSMUX  IngestTransport = "smux"
+	IngestTransportQUIC  IngestTransport = "quic"
+	IngestTransportHTTP3 IngestTransport = "http3"
 )
 
 func (t IngestTransport) IsHTTP() bool {
 	switch t {
-	case IngestTransportHTTP, IngestTransportHTTP1, IngestTransportHTTP2:
+	case IngestTransportHTTP, IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportHTTP3:
 		return true
 	default:
 		return false
@@ -49,12 +51,17 @@ func (t IngestTransport) UsesTCPIngestAddr() bool {
 	}
 }
 
+func (t IngestTransport) UsesQUICIngestAddr() bool {
+	return t == IngestTransportQUIC
+}
+
 type EdgeConfig struct {
 	PublicListenAddr           string
 	IngestListenAddr           string
 	IngestURL                  string
 	IngestTransport            IngestTransport
 	IngestTCPListenAddr        string
+	IngestQUICListenAddr       string
 	StreamCopyBufferBytes      int
 	AllowedBuckets             []string
 	AllowedConnectorIdentities []string
@@ -69,6 +76,7 @@ type ConnectorConfig struct {
 	IngestDisableHTTP2 bool
 	IngestTransport    IngestTransport
 	IngestTCPAddr      string
+	IngestQUICAddr     string
 	AllowedBuckets     []string
 	NATS               NATSConfig
 	S3                 S3Config
@@ -140,6 +148,7 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 		IngestURL:             env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
 		IngestTransport:       ingestTransport,
 		IngestTCPListenAddr:   env.get("AIR3_EDGE_INGEST_TCP_ADDR", ""),
+		IngestQUICListenAddr:  env.get("AIR3_EDGE_INGEST_QUIC_ADDR", ""),
 		StreamCopyBufferBytes: streamCopyBufferBytes,
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
@@ -172,6 +181,9 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	if cfg.IngestTransport.UsesTCPIngestAddr() && cfg.IngestTCPListenAddr == "" {
 		return EdgeConfig{}, fmt.Errorf("AIR3_EDGE_INGEST_TCP_ADDR is required when AIR3_INGEST_TRANSPORT=%s", cfg.IngestTransport)
 	}
+	if cfg.IngestTransport.UsesQUICIngestAddr() && cfg.IngestQUICListenAddr == "" {
+		return EdgeConfig{}, fmt.Errorf("AIR3_EDGE_INGEST_QUIC_ADDR is required when AIR3_INGEST_TRANSPORT=%s", cfg.IngestTransport)
+	}
 	return cfg, nil
 }
 
@@ -190,6 +202,7 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 		IngestDisableHTTP2: ingestDisableHTTP2,
 		IngestTransport:    ingestTransport,
 		IngestTCPAddr:      env.get("AIR3_INGEST_TCP_ADDR", ""),
+		IngestQUICAddr:     env.get("AIR3_INGEST_QUIC_ADDR", ""),
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
@@ -217,16 +230,19 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 	if cfg.IngestTransport.UsesTCPIngestAddr() && cfg.IngestTCPAddr == "" {
 		return ConnectorConfig{}, fmt.Errorf("AIR3_INGEST_TCP_ADDR is required when AIR3_INGEST_TRANSPORT=%s", cfg.IngestTransport)
 	}
+	if cfg.IngestTransport.UsesQUICIngestAddr() && cfg.IngestQUICAddr == "" {
+		return ConnectorConfig{}, fmt.Errorf("AIR3_INGEST_QUIC_ADDR is required when AIR3_INGEST_TRANSPORT=%s", cfg.IngestTransport)
+	}
 	return cfg, nil
 }
 
 func loadIngestTransport(env envReader) (IngestTransport, error) {
 	transport := IngestTransport(env.get("AIR3_INGEST_TRANSPORT", string(IngestTransportHTTP)))
 	switch transport {
-	case IngestTransportHTTP, IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportTCP, IngestTransportSMUX:
+	case IngestTransportHTTP, IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportTCP, IngestTransportSMUX, IngestTransportQUIC, IngestTransportHTTP3:
 		return transport, nil
 	default:
-		return "", fmt.Errorf("AIR3_INGEST_TRANSPORT must be one of %s, %s, %s, %s (or legacy %s)", IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportTCP, IngestTransportSMUX, IngestTransportHTTP)
+		return "", fmt.Errorf("AIR3_INGEST_TRANSPORT must be one of %s, %s, %s, %s, %s, %s (or legacy %s)", IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportTCP, IngestTransportSMUX, IngestTransportQUIC, IngestTransportHTTP3, IngestTransportHTTP)
 	}
 }
 

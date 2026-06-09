@@ -25,8 +25,8 @@ func TestLoadEdgeDefaultsWithDisabledSigning(t *testing.T) {
 	if cfg.StreamCopyBufferBytes != 262144 {
 		t.Fatalf("StreamCopyBufferBytes = %d, want 262144", cfg.StreamCopyBufferBytes)
 	}
-	if cfg.IngestTransport != IngestTransportHTTP || cfg.IngestTCPListenAddr != "" {
-		t.Fatalf("ingest transport defaults = %q/%q, want http with no TCP address", cfg.IngestTransport, cfg.IngestTCPListenAddr)
+	if cfg.IngestTransport != IngestTransportHTTP || cfg.IngestTCPListenAddr != "" || cfg.IngestQUICListenAddr != "" {
+		t.Fatalf("ingest transport defaults = %q/%q/%q, want http with no direct address", cfg.IngestTransport, cfg.IngestTCPListenAddr, cfg.IngestQUICListenAddr)
 	}
 }
 
@@ -74,8 +74,8 @@ func TestLoadConnectorDefaultsIngestDisableHTTP2True(t *testing.T) {
 	if !cfg.IngestDisableHTTP2 {
 		t.Fatal("IngestDisableHTTP2 = false, want true")
 	}
-	if cfg.IngestTransport != IngestTransportHTTP || cfg.IngestTCPAddr != "" {
-		t.Fatalf("ingest transport defaults = %q/%q, want http with no TCP address", cfg.IngestTransport, cfg.IngestTCPAddr)
+	if cfg.IngestTransport != IngestTransportHTTP || cfg.IngestTCPAddr != "" || cfg.IngestQUICAddr != "" {
+		t.Fatalf("ingest transport defaults = %q/%q/%q, want http with no direct address", cfg.IngestTransport, cfg.IngestTCPAddr, cfg.IngestQUICAddr)
 	}
 }
 
@@ -94,8 +94,8 @@ func TestLoadConnectorCanOptInToIngestHTTP2(t *testing.T) {
 	}
 }
 
-func TestLoadHTTPIngestTransportsDoNotRequireTCPAddress(t *testing.T) {
-	for _, transport := range []IngestTransport{IngestTransportHTTP, IngestTransportHTTP1, IngestTransportHTTP2} {
+func TestLoadHTTPIngestTransportsDoNotRequireDirectAddress(t *testing.T) {
+	for _, transport := range []IngestTransport{IngestTransportHTTP, IngestTransportHTTP1, IngestTransportHTTP2, IngestTransportHTTP3} {
 		t.Run(string(transport), func(t *testing.T) {
 			edge, err := LoadEdge(testOptions(map[string]string{
 				"AIR3_SIGNING_DISABLED": "true",
@@ -104,11 +104,11 @@ func TestLoadHTTPIngestTransportsDoNotRequireTCPAddress(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadEdge() error = %v", err)
 			}
-			if edge.IngestTransport != transport || edge.IngestTCPListenAddr != "" {
-				t.Fatalf("edge HTTP ingest config = %q/%q, want %s with no TCP address", edge.IngestTransport, edge.IngestTCPListenAddr, transport)
+			if edge.IngestTransport != transport || edge.IngestTCPListenAddr != "" || edge.IngestQUICListenAddr != "" {
+				t.Fatalf("edge HTTP ingest config = %q/%q/%q, want %s with no direct address", edge.IngestTransport, edge.IngestTCPListenAddr, edge.IngestQUICListenAddr, transport)
 			}
-			if !edge.IngestTransport.IsHTTP() || edge.IngestTransport.IsTCP() {
-				t.Fatalf("edge transport predicates for %q: IsHTTP=%t IsTCP=%t, want true/false", edge.IngestTransport, edge.IngestTransport.IsHTTP(), edge.IngestTransport.IsTCP())
+			if !edge.IngestTransport.IsHTTP() || edge.IngestTransport.IsTCP() || edge.IngestTransport.UsesTCPIngestAddr() || edge.IngestTransport.UsesQUICIngestAddr() {
+				t.Fatalf("edge transport predicates for %q: IsHTTP=%t IsTCP=%t UsesTCPIngestAddr=%t UsesQUICIngestAddr=%t, want true/false/false/false", edge.IngestTransport, edge.IngestTransport.IsHTTP(), edge.IngestTransport.IsTCP(), edge.IngestTransport.UsesTCPIngestAddr(), edge.IngestTransport.UsesQUICIngestAddr())
 			}
 
 			connector, err := LoadConnector(testOptions(map[string]string{
@@ -119,11 +119,11 @@ func TestLoadHTTPIngestTransportsDoNotRequireTCPAddress(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadConnector() error = %v", err)
 			}
-			if connector.IngestTransport != transport || connector.IngestTCPAddr != "" {
-				t.Fatalf("connector HTTP ingest config = %q/%q, want %s with no TCP address", connector.IngestTransport, connector.IngestTCPAddr, transport)
+			if connector.IngestTransport != transport || connector.IngestTCPAddr != "" || connector.IngestQUICAddr != "" {
+				t.Fatalf("connector HTTP ingest config = %q/%q/%q, want %s with no direct address", connector.IngestTransport, connector.IngestTCPAddr, connector.IngestQUICAddr, transport)
 			}
-			if !connector.IngestTransport.IsHTTP() || connector.IngestTransport.IsTCP() {
-				t.Fatalf("connector transport predicates for %q: IsHTTP=%t IsTCP=%t, want true/false", connector.IngestTransport, connector.IngestTransport.IsHTTP(), connector.IngestTransport.IsTCP())
+			if !connector.IngestTransport.IsHTTP() || connector.IngestTransport.IsTCP() || connector.IngestTransport.UsesTCPIngestAddr() || connector.IngestTransport.UsesQUICIngestAddr() {
+				t.Fatalf("connector transport predicates for %q: IsHTTP=%t IsTCP=%t UsesTCPIngestAddr=%t UsesQUICIngestAddr=%t, want true/false/false/false", connector.IngestTransport, connector.IngestTransport.IsHTTP(), connector.IngestTransport.IsTCP(), connector.IngestTransport.UsesTCPIngestAddr(), connector.IngestTransport.UsesQUICIngestAddr())
 			}
 		})
 	}
@@ -215,6 +215,49 @@ func TestLoadConnectorParsesSMUXIngestTransport(t *testing.T) {
 	}
 }
 
+func TestLoadEdgeParsesQUICIngestTransport(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED":      "true",
+		"AIR3_INGEST_TRANSPORT":      "quic",
+		"AIR3_EDGE_INGEST_QUIC_ADDR": ":9443",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.IngestTransport != IngestTransportQUIC || cfg.IngestQUICListenAddr != ":9443" || cfg.IngestTCPListenAddr != "" {
+		t.Fatalf("edge QUIC ingest config = %q/%q/%q, want quic/:9443 with no TCP address", cfg.IngestTransport, cfg.IngestQUICListenAddr, cfg.IngestTCPListenAddr)
+	}
+	if cfg.IngestTransport.IsTCP() || cfg.IngestTransport.IsHTTP() || cfg.IngestTransport.UsesTCPIngestAddr() || !cfg.IngestTransport.UsesQUICIngestAddr() {
+		t.Fatalf("edge transport predicates for %q: IsTCP=%t IsHTTP=%t UsesTCPIngestAddr=%t UsesQUICIngestAddr=%t, want false/false/false/true", cfg.IngestTransport, cfg.IngestTransport.IsTCP(), cfg.IngestTransport.IsHTTP(), cfg.IngestTransport.UsesTCPIngestAddr(), cfg.IngestTransport.UsesQUICIngestAddr())
+	}
+	if cfg.IngestURL != "https://localhost:8443/ingest" {
+		t.Fatalf("IngestURL = %q, want default HTTP ingest URL unchanged", cfg.IngestURL)
+	}
+}
+
+func TestLoadConnectorParsesQUICIngestTransport(t *testing.T) {
+	env := map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":     "access",
+		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+		"AIR3_INGEST_TRANSPORT":     "quic",
+		"AIR3_INGEST_QUIC_ADDR":     "edge.internal:9443",
+	}
+	cfg, err := LoadConnector(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadConnector() error = %v", err)
+	}
+	if cfg.IngestTransport != IngestTransportQUIC || cfg.IngestQUICAddr != "edge.internal:9443" || cfg.IngestTCPAddr != "" {
+		t.Fatalf("connector QUIC ingest config = %q/%q/%q, want quic/edge.internal:9443 with no TCP address", cfg.IngestTransport, cfg.IngestQUICAddr, cfg.IngestTCPAddr)
+	}
+	if cfg.IngestTransport.IsTCP() || cfg.IngestTransport.IsHTTP() || cfg.IngestTransport.UsesTCPIngestAddr() || !cfg.IngestTransport.UsesQUICIngestAddr() {
+		t.Fatalf("connector transport predicates for %q: IsTCP=%t IsHTTP=%t UsesTCPIngestAddr=%t UsesQUICIngestAddr=%t, want false/false/false/true", cfg.IngestTransport, cfg.IngestTransport.IsTCP(), cfg.IngestTransport.IsHTTP(), cfg.IngestTransport.UsesTCPIngestAddr(), cfg.IngestTransport.UsesQUICIngestAddr())
+	}
+	if cfg.IngestURL != "https://localhost:8443/ingest" {
+		t.Fatalf("IngestURL = %q, want default HTTP ingest URL unchanged", cfg.IngestURL)
+	}
+}
+
 func TestLoadIngestTransportRejectsInvalidValue(t *testing.T) {
 	tests := []struct {
 		name string
@@ -242,7 +285,7 @@ func TestLoadIngestTransportRejectsInvalidValue(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "AIR3_INGEST_TRANSPORT") {
 				t.Fatalf("load error = %v, want invalid AIR3_INGEST_TRANSPORT allowed-values error", err)
 			}
-			for _, want := range []string{"http1", "http2", "tcp", "smux", "legacy http"} {
+			for _, want := range []string{"http1", "http2", "tcp", "smux", "quic", "http3", "legacy http"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("load error = %v, want containing %q", err, want)
 				}
@@ -307,6 +350,51 @@ func TestLoadTCPBasedIngestTransportsRequireTCPAddress(t *testing.T) {
 				return err
 			},
 			want: "AIR3_INGEST_TCP_ADDR",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.load(tc.env)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("load error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadQUICIngestTransportRequiresQUICAddress(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		load func(map[string]string) error
+		want string
+	}{
+		{
+			name: "edge quic",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED":     "true",
+				"AIR3_INGEST_TRANSPORT":     "quic",
+				"AIR3_EDGE_INGEST_TCP_ADDR": ":9000",
+			},
+			load: func(env map[string]string) error {
+				_, err := LoadEdge(testOptions(env, nil))
+				return err
+			},
+			want: "AIR3_EDGE_INGEST_QUIC_ADDR",
+		},
+		{
+			name: "connector quic",
+			env: map[string]string{
+				"AIR3_S3_ACCESS_KEY_ID":     "access",
+				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+				"AIR3_INGEST_TRANSPORT":     "quic",
+				"AIR3_INGEST_TCP_ADDR":      "edge.internal:9000",
+			},
+			load: func(env map[string]string) error {
+				_, err := LoadConnector(testOptions(env, nil))
+				return err
+			},
+			want: "AIR3_INGEST_QUIC_ADDR",
 		},
 	}
 	for _, tc := range tests {
