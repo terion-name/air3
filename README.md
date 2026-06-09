@@ -134,7 +134,7 @@ Useful knobs:
 - `AIR3_PERF_S3_PORT` to change the temporary localhost VersityGW port
 - `AIR3_PERF_CACHE_DIR` and `AIR3_PERF_RESULTS_DIR` to relocate cache/results
 
-The perf override limits each `edge-gateway` and `private-connector` container to one CPU. Direct S3 measurements use curl SigV4 against the perf-exposed VersityGW endpoint; gateway measurements use `cmd/signurl` and `curl --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443`.
+The perf override limits each `edge-gateway` and `private-connector` container to one CPU. Direct S3 measurements use curl SigV4 against the perf-exposed VersityGW endpoint; gateway measurements use `cmd/signurl` and `curl --http1.1 --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443` for stable streaming timings.
 
 ## Generating Signed URLs
 

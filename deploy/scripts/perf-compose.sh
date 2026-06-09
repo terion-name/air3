@@ -193,6 +193,7 @@ curl_gateway() {
   local url
   url=$(sign_gateway_url "$key")
   curl --silent --show-error --fail \
+    --http1.1 \
     --output /dev/null \
     --cacert "$CERT_DIR/dev-ca.crt" \
     --write-out '%{size_download},%{time_starttransfer},%{time_total},%{speed_download}' \
@@ -295,7 +296,7 @@ run_parallel_phase() {
 
     echo "Running parallel gateway phase object=$object_name parallelism=$PARALLELISM..."
     start_ns=$(date +%s%N)
-    xargs -n 1 -P "$PARALLELISM" curl --silent --show-error --fail --output /dev/null --cacert "$CERT_DIR/dev-ca.crt" <"$urls_file"
+    xargs -n 1 -P "$PARALLELISM" curl --silent --show-error --fail --http1.1 --output /dev/null --cacert "$CERT_DIR/dev-ca.crt" <"$urls_file"
     end_ns=$(date +%s%N)
     duration=$(awk -v start="$start_ns" -v end="$end_ns" 'BEGIN { printf "%.6f", (end - start) / 1000000000 }')
     total_bytes=$(awk -v bytes="$(stat_size "$CACHE_DIR/${OBJECT_FILES[$i]}")" -v n="$PARALLELISM" 'BEGIN { printf "%.0f", bytes * n }')
