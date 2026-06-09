@@ -116,24 +116,10 @@ The smoke tests (`make smoke`) automatically verify that signed `GET`/`HEAD` req
 
 To allow users to download files, your backend application must generate an **edge signed URL**. These use a standard HMAC signature. Since the gateway verifies the signature before generating a ticket, bogus requests are dropped at the edge—saving your private network from dealing with malicious traffic.
 
-We provide drop-in packages for Go, TypeScript, and Python under the `packages/` directory. The TypeScript package is published to GitHub Packages as the public package `@terion-name/air3-edgesign`. Configure npm for the GitHub Packages scope before installing:
+We provide drop-in packages for Go, TypeScript, and Python under the `packages/` directory. The TypeScript package is published to the public npm registry as `@terion/air3-edgesign`:
 
 ```sh
-# One-time user config; alternatively put this line in your project .npmrc.
-npm config set @terion-name:registry https://npm.pkg.github.com
-
-# GitHub's npm registry may require auth for install/metadata access even
-# when package visibility is public. Use a classic PAT with read:packages.
-npm login --scope=@terion-name --registry=https://npm.pkg.github.com
-
-npm install @terion-name/air3-edgesign
-```
-
-For CI, set `NODE_AUTH_TOKEN` (for example from `${GITHUB_TOKEN}` in GitHub Actions, or another token with package read access) and add a project `.npmrc` like:
-
-```ini
-@terion-name:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+npm install @terion/air3-edgesign
 ```
 
 ### Go Example
@@ -153,7 +139,7 @@ raw, err := edgesign.SignURL(edgesign.SignInput{
 ### TypeScript Example
 
 ```ts
-import { signUrl, verifyUrl } from '@terion-name/air3-edgesign';
+import { signUrl, verifyUrl } from '@terion/air3-edgesign';
 
 const raw = signUrl({
   method: 'GET',
@@ -203,7 +189,7 @@ go test ./... -race  # run race-enabled Go tests
 
 ## Releases & Docker Images
 
-We publish multi-architecture Docker images (Linux on `amd64` and `arm64`) to the GitHub Container Registry on every release. Cross-compiled binaries for macOS, Windows, and Linux are also attached to GitHub releases. The same tag workflow publishes the public npm package `@terion-name/air3-edgesign` to GitHub Packages with the tag as the npm version. GitHub's npm registry can require a token for install and metadata requests even when a package is public; use the `@terion-name` registry and authentication setup shown above before running `npm install @terion-name/air3-edgesign`.
+We publish multi-architecture Docker images (Linux on `amd64` and `arm64`) to the GitHub Container Registry on every release. Cross-compiled binaries for macOS, Windows, and Linux are also attached to GitHub releases. The same tag workflow publishes the public npm package `@terion/air3-edgesign` to npmjs with the tag as the npm version. Publishing uses npm Trusted Publishing from `.github/workflows/release.yml`, so the GitHub Actions job authenticates to npm through OIDC instead of an npm token.
 
 - `ghcr.io/terion-name/air3/edge-gateway:<tag>`
 - `ghcr.io/terion-name/air3/private-connector:<tag>`
