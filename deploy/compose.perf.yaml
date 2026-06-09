@@ -12,5 +12,16 @@ services:
     ports:
       - "${AIR3_PERF_S3_PORT:-10000}:10000"
 
+  caddy-s3:
+    image: caddy:2-alpine
+    cpus: 1.0
+    networks:
+      - private
+      - perf-host
+    ports:
+      - "${AIR3_PERF_CADDY_PORT:-10080}:10080"
+    volumes:
+      - ./Caddyfile.perf:/etc/caddy/Caddyfile:ro
+
 networks:
   perf-host: {}

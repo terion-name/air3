@@ -1,0 +1,5 @@
+:10080 {
+	reverse_proxy http://versitygw:10000 {
+		header_up Host versitygw:10000
+	}
+}
