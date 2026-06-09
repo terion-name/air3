@@ -59,7 +59,7 @@ flowchart TB
 
     Client -->|"public HTTPS"| PublicEdge
     PublicEdge -->|"mTLS ticket publish"| NATS
-    NATS -->|"mTLS ticket delivery"| Connector
+    Connector -->|"NATS mTLS control plane connection"| NATS
     Connector -->|"S3 private API"| S3
     Connector -->|"outbound mTLS ingest stream"| Ingest
     Ingest -->|"stream handoff inside edge"| PublicEdge
