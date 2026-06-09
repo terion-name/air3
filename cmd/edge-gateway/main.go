@@ -19,8 +19,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/terion-name/air3/internal/config"
 	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/ingestquic"
 	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/mtls"
@@ -75,18 +78,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	publicServer := &http.Server{Addr: cfg.PublicListenAddr, Handler: edge}
-	ingestServer := &http.Server{Addr: cfg.IngestListenAddr, Handler: ingestHandler}
 	var tlsCfg *tls.Config
-	if tlsConfigured(cfg.MTLS) || cfg.IngestTransport.UsesTCPIngestAddr() {
+	if ingestTLSRequired(cfg) {
 		tlsCfg, err = edgeServerTLSConfig(cfg.MTLS)
 		if err != nil {
 			return fmt.Errorf("load ingest tls config: %w", err)
 		}
 	}
 	if tlsConfigured(cfg.MTLS) {
-		ingestServer.TLSConfig = tlsCfg
 		publicServer.TLSConfig = publicTLSConfig(tlsCfg)
 	}
+	ingestServer := newIngestHTTPServer(cfg, ingestHandler, tlsCfg)
 	ingestListener, err := newNonHTTPIngestListener(cfg, reg, tlsCfg)
 	if err != nil {
 		return err
@@ -103,7 +105,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	errCh := make(chan error, serverCount)
 	go func() { errCh <- serveHTTP(publicServer, cfg.MTLS) }()
-	go func() { errCh <- serveHTTP(ingestServer, cfg.MTLS) }()
+	go func() { errCh <- ingestServer.Serve() }()
 	if ingestListener != nil {
 		go func() { errCh <- ingestListener.Serve(serveCtx) }()
 	}
@@ -350,6 +352,57 @@ func randomToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
+type ingestHTTPServer interface {
+	Serve() error
+	Shutdown(context.Context) error
+	Close() error
+}
+
+type standardIngestHTTPServer struct {
+	server *http.Server
+	mtls   config.MTLSPaths
+}
+
+type http3IngestServer struct {
+	server *http3.Server
+}
+
+func newIngestHTTPServer(cfg config.EdgeConfig, handler http.Handler, tlsCfg *tls.Config) ingestHTTPServer {
+	if cfg.IngestTransport == config.IngestTransportHTTP3 {
+		return &http3IngestServer{server: &http3.Server{Addr: cfg.IngestListenAddr, Handler: handler, TLSConfig: tlsCfg}}
+	}
+
+	server := &http.Server{Addr: cfg.IngestListenAddr, Handler: handler}
+	if tlsConfigured(cfg.MTLS) {
+		server.TLSConfig = tlsCfg
+	}
+	return &standardIngestHTTPServer{server: server, mtls: cfg.MTLS}
+}
+
+func (s *standardIngestHTTPServer) Serve() error {
+	return serveHTTP(s.server, s.mtls)
+}
+
+func (s *standardIngestHTTPServer) Shutdown(ctx context.Context) error {
+	return s.server.Shutdown(ctx)
+}
+
+func (s *standardIngestHTTPServer) Close() error {
+	return s.server.Close()
+}
+
+func (s *http3IngestServer) Serve() error {
+	return ignoreServerClosed(s.server.ListenAndServe())
+}
+
+func (s *http3IngestServer) Shutdown(ctx context.Context) error {
+	return s.server.Shutdown(ctx)
+}
+
+func (s *http3IngestServer) Close() error {
+	return s.server.Close()
+}
+
 func edgeServerTLSConfig(paths config.MTLSPaths) (*tls.Config, error) {
 	return mtls.ServerConfig(mtls.ServerOptions{
 		Files: mtls.Files{
@@ -376,12 +429,19 @@ type smuxIngestListener struct {
 	listener net.Listener
 }
 
+type quicIngestListener struct {
+	server   *ingestquic.Server
+	listener *quic.Listener
+}
+
 func newNonHTTPIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg *tls.Config) (nonHTTPIngestListener, error) {
 	switch cfg.IngestTransport {
 	case config.IngestTransportTCP:
 		return newTCPIngestListener(cfg, reg, tlsCfg)
 	case config.IngestTransportSMUX:
 		return newSMUXIngestListener(cfg, reg, tlsCfg)
+	case config.IngestTransportQUIC:
+		return newQUICIngestListener(cfg, reg, tlsCfg)
 	default:
 		return nil, nil
 	}
@@ -427,6 +487,27 @@ func newSMUXIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg 
 	return &smuxIngestListener{server: server, listener: ln}, nil
 }
 
+func newQUICIngestListener(cfg config.EdgeConfig, reg *pending.Registry, tlsCfg *tls.Config) (*quicIngestListener, error) {
+	if cfg.IngestTransport != config.IngestTransportQUIC {
+		return nil, nil
+	}
+	tlsCfg = rawQUICTLSConfig(tlsCfg)
+	server, err := ingestquic.NewServer(ingestquic.ServerOptions{
+		Registry:                   reg,
+		TLSConfig:                  tlsCfg,
+		AllowedConnectorIdentities: cfg.AllowedConnectorIdentities,
+		CopyBufferBytes:            cfg.StreamCopyBufferBytes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create ingest quic server: %w", err)
+	}
+	ln, err := quic.ListenAddr(cfg.IngestQUICListenAddr, tlsCfg, nil)
+	if err != nil {
+		return nil, fmt.Errorf("listen ingest quic: %w", err)
+	}
+	return &quicIngestListener{server: server, listener: ln}, nil
+}
+
 func (l *tcpIngestListener) Serve(ctx context.Context) error {
 	return ignoreTCPServerClosed(l.server.Serve(ctx, l.listener))
 }
@@ -440,6 +521,14 @@ func (l *smuxIngestListener) Serve(ctx context.Context) error {
 }
 
 func (l *smuxIngestListener) Close() error {
+	return l.listener.Close()
+}
+
+func (l *quicIngestListener) Serve(ctx context.Context) error {
+	return ignoreTCPServerClosed(l.server.Serve(ctx, l.listener))
+}
+
+func (l *quicIngestListener) Close() error {
 	return l.listener.Close()
 }
 
@@ -465,6 +554,28 @@ func ignoreServerClosed(err error) error {
 		return nil
 	}
 	return err
+}
+
+func ingestTLSRequired(cfg config.EdgeConfig) bool {
+	return tlsConfigured(cfg.MTLS) || cfg.IngestTransport.UsesTCPIngestAddr() || cfg.IngestTransport.UsesQUICIngestAddr() || cfg.IngestTransport == config.IngestTransportHTTP3
+}
+
+// rawQUICALPN mirrors internal/ingestquic's private ALPN so the edge-owned
+// listener can be created with the protocol quic-go expects during handshake.
+const rawQUICALPN = "air3-ingest-quic/1"
+
+func rawQUICTLSConfig(config *tls.Config) *tls.Config {
+	if config == nil {
+		return nil
+	}
+	clone := config.Clone()
+	for _, proto := range clone.NextProtos {
+		if proto == rawQUICALPN {
+			return clone
+		}
+	}
+	clone.NextProtos = append([]string{rawQUICALPN}, clone.NextProtos...)
+	return clone
 }
 
 func tlsConfigured(paths config.MTLSPaths) bool {

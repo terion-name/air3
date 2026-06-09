@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/terion-name/air3/internal/config"
+	"github.com/terion-name/air3/internal/ingestquic"
 	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/pending"
@@ -70,7 +71,7 @@ func testEdge(pub *fakePublisher, ttl time.Duration) (*edgeServer, *pending.Regi
 }
 
 func TestTCPIngestListenerDisabledForHTTPTransports(t *testing.T) {
-	for _, transport := range []config.IngestTransport{config.IngestTransportHTTP, config.IngestTransportHTTP1, config.IngestTransportHTTP2} {
+	for _, transport := range []config.IngestTransport{config.IngestTransportHTTP, config.IngestTransportHTTP1, config.IngestTransportHTTP2, config.IngestTransportHTTP3} {
 		t.Run(string(transport), func(t *testing.T) {
 			tcpIngest, err := newTCPIngestListener(config.EdgeConfig{
 				IngestTransport:     transport,
@@ -190,7 +191,7 @@ func TestTCPIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
 }
 
 func TestNonHTTPIngestListenerDisabledForHTTPTransports(t *testing.T) {
-	for _, transport := range []config.IngestTransport{config.IngestTransportHTTP, config.IngestTransportHTTP1, config.IngestTransportHTTP2} {
+	for _, transport := range []config.IngestTransport{config.IngestTransportHTTP, config.IngestTransportHTTP1, config.IngestTransportHTTP2, config.IngestTransportHTTP3} {
 		t.Run(string(transport), func(t *testing.T) {
 			listener, err := newNonHTTPIngestListener(config.EdgeConfig{
 				IngestTransport:     transport,
@@ -306,6 +307,159 @@ func TestSMUXIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
 	}
 	if strings.Contains(published[0].IngestURL, smuxIngest.listener.Addr().String()) {
 		t.Fatalf("ticket ingest URL %q unexpectedly contains SMUX listener address", published[0].IngestURL)
+	}
+}
+
+func TestHTTP3IngestServerSelectedAndNonHTTPDisabled(t *testing.T) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	ingestServer := newIngestHTTPServer(config.EdgeConfig{IngestTransport: config.IngestTransportHTTP3, IngestListenAddr: "127.0.0.1:0"}, http.NotFoundHandler(), tlsCfg)
+	http3Server, ok := ingestServer.(*http3IngestServer)
+	if !ok {
+		t.Fatalf("newIngestHTTPServer() = %T, want *http3IngestServer", ingestServer)
+	}
+	if http3Server.server.TLSConfig != tlsCfg {
+		t.Fatalf("HTTP/3 ingest TLS config = %#v, want provided config", http3Server.server.TLSConfig)
+	}
+
+	listener, err := newNonHTTPIngestListener(config.EdgeConfig{
+		IngestTransport:      config.IngestTransportHTTP3,
+		IngestTCPListenAddr:  "not a valid listen address",
+		IngestQUICListenAddr: "not a valid listen address",
+	}, pending.NewRegistry(pending.Options{}), tlsCfg)
+	if err != nil {
+		t.Fatalf("newNonHTTPIngestListener() error = %v, want nil", err)
+	}
+	if listener != nil {
+		t.Fatalf("newNonHTTPIngestListener() = %#v, want nil for http3 transport", listener)
+	}
+}
+
+func TestIngestTLSRequiredForTLSDirectQUICAndHTTP3(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config.EdgeConfig
+		want bool
+	}{
+		{name: "plain http", cfg: config.EdgeConfig{IngestTransport: config.IngestTransportHTTP}, want: false},
+		{name: "explicit mtls", cfg: config.EdgeConfig{IngestTransport: config.IngestTransportHTTP, MTLS: config.MTLSPaths{CertFile: "cert.pem"}}, want: true},
+		{name: "tcp", cfg: config.EdgeConfig{IngestTransport: config.IngestTransportTCP}, want: true},
+		{name: "smux", cfg: config.EdgeConfig{IngestTransport: config.IngestTransportSMUX}, want: true},
+		{name: "quic", cfg: config.EdgeConfig{IngestTransport: config.IngestTransportQUIC}, want: true},
+		{name: "http3", cfg: config.EdgeConfig{IngestTransport: config.IngestTransportHTTP3}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ingestTLSRequired(tt.cfg); got != tt.want {
+				t.Fatalf("ingestTLSRequired() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQUICIngestListenerRequiresTLSConfig(t *testing.T) {
+	_, err := newQUICIngestListener(config.EdgeConfig{
+		IngestTransport:      config.IngestTransportQUIC,
+		IngestQUICListenAddr: "127.0.0.1:0",
+	}, pending.NewRegistry(pending.Options{}), nil)
+	if err == nil || !strings.Contains(err.Error(), "TLS config is required") {
+		t.Fatalf("newQUICIngestListener() error = %v, want TLS config error", err)
+	}
+}
+
+func TestQUICIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
+	tlsTemplate := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(tlsTemplate.Close)
+	clientTLS := tlsTemplate.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	serverTLS := &tls.Config{MinVersion: tls.VersionTLS12, Certificates: tlsTemplate.TLS.Certificates}
+
+	reg := pending.NewRegistry(pending.Options{})
+	listener, err := newNonHTTPIngestListener(config.EdgeConfig{
+		IngestTransport:       config.IngestTransportQUIC,
+		IngestQUICListenAddr:  "127.0.0.1:0",
+		StreamCopyBufferBytes: 1024,
+	}, reg, serverTLS)
+	if err != nil {
+		t.Fatalf("newNonHTTPIngestListener() error = %v", err)
+	}
+	quicIngest, ok := listener.(*quicIngestListener)
+	if !ok {
+		t.Fatalf("newNonHTTPIngestListener() = %T, want *quicIngestListener", listener)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- quicIngest.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = quicIngest.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("quicIngest.Serve() error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("quicIngest.Serve() did not stop")
+		}
+	})
+
+	uploadDone := make(chan error, 1)
+	pub := &fakePublisher{}
+	pub.on = func(ticket tickets.Ticket) {
+		go func() {
+			uploadDone <- ingestquic.DialAndSend(context.Background(), quicIngest.listener.Addr().String(), clientTLS, ingestquic.ClientRequest{
+				RequestID:   ticket.RequestID,
+				IngestToken: ticket.IngestToken,
+				Metadata:    pending.Metadata{StatusCode: http.StatusOK, ContentType: "text/plain", ContentLength: "9"},
+				Body:        strings.NewReader("quic-body"),
+				BodyLength:  9,
+			})
+		}()
+	}
+	edge := newEdgeServer(config.EdgeConfig{
+		IngestURL:            "https://edge.internal/_ingest",
+		IngestTransport:      config.IngestTransportQUIC,
+		IngestQUICListenAddr: quicIngest.listener.Addr().String(),
+		AllowedBuckets:       []string{"demo-bucket"},
+		Signing:              config.SigningConfig{Disabled: true},
+		Timeouts:             config.TimeoutConfig{PendingRequestTTL: 2 * time.Second},
+	}, reg, pub, nil)
+	tokens := []string{"req-quic", "ingest-quic-token"}
+	edge.newToken = func() (string, error) {
+		v := tokens[0]
+		tokens = tokens[1:]
+		return v, nil
+	}
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt", nil))
+	if got := resp.Result().StatusCode; got != http.StatusOK {
+		select {
+		case err := <-uploadDone:
+			t.Fatalf("status = %d, want %d; upload error = %v", got, http.StatusOK, err)
+		default:
+			t.Fatalf("status = %d, want %d", got, http.StatusOK)
+		}
+	}
+	if body := resp.Body.String(); body != "quic-body" {
+		t.Fatalf("body = %q, want quic-body", body)
+	}
+	select {
+	case err := <-uploadDone:
+		if err != nil {
+			t.Fatalf("QUIC ingest upload error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for QUIC ingest upload")
+	}
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	if published[0].IngestURL != "https://edge.internal/_ingest/req-quic" {
+		t.Fatalf("ticket ingest URL = %q, want HTTPS ingest URL", published[0].IngestURL)
+	}
+	if strings.Contains(published[0].IngestURL, quicIngest.listener.Addr().String()) {
+		t.Fatalf("ticket ingest URL %q unexpectedly contains QUIC listener address", published[0].IngestURL)
 	}
 }
 
