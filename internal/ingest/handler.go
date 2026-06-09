@@ -1,7 +1,6 @@
 package ingest
 
 import (
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +21,7 @@ const (
 
 type Handler struct {
 	registry              *pending.Registry
-	allowedIdentities     map[string]struct{}
+	authorizer            ConnectorAuthorizer
 	streamCopyBufferBytes int
 }
 
@@ -36,18 +35,15 @@ func NewHandler(opts Options) (*Handler, error) {
 	if opts.Registry == nil {
 		return nil, errors.New("pending registry is required")
 	}
-	allowed := make(map[string]struct{}, len(opts.AllowedConnectorIdentities))
-	for _, identity := range opts.AllowedConnectorIdentities {
-		identity = strings.TrimSpace(identity)
-		if identity != "" {
-			allowed[identity] = struct{}{}
-		}
-	}
 	streamCopyBufferBytes := opts.StreamCopyBufferBytes
 	if streamCopyBufferBytes <= 0 {
 		streamCopyBufferBytes = defaultStreamCopyBufferBytes
 	}
-	return &Handler{registry: opts.Registry, allowedIdentities: allowed, streamCopyBufferBytes: streamCopyBufferBytes}, nil
+	return &Handler{
+		registry:              opts.Registry,
+		authorizer:            NewConnectorAuthorizer(opts.AllowedConnectorIdentities),
+		streamCopyBufferBytes: streamCopyBufferBytes,
+	}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +69,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if metadata.ContentLength == "" && r.ContentLength >= 0 {
 		metadata.ContentLength = strconv.FormatInt(r.ContentLength, 10)
+	}
+	metadata, err = ValidateMetadata(metadata)
+	if err != nil {
+		http.Error(w, "invalid ingest metadata", http.StatusBadRequest)
+		return
 	}
 	stream, err := h.registry.StartIngest(requestID, r.Header.Get(TokenHeader), metadata)
 	if err != nil {
@@ -107,92 +108,45 @@ func requestIDFromPath(path string) (string, bool) {
 }
 
 func (h *Handler) authorizePeer(r *http.Request) error {
-	if len(h.allowedIdentities) == 0 {
-		return nil
+	if r.TLS == nil {
+		return h.authorizer.AuthorizePeerCertificates(nil)
 	}
-	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		return errors.New("missing connector client certificate")
-	}
-	cert := r.TLS.PeerCertificates[0]
-	for _, identity := range certificateIdentities(cert) {
-		if _, ok := h.allowedIdentities[identity]; ok {
-			return nil
-		}
-	}
-	return errors.New("connector client certificate identity is not allowed")
-}
-
-func certificateIdentities(cert *x509.Certificate) []string {
-	identities := make([]string, 0, 1+len(cert.DNSNames)+len(cert.EmailAddresses)+len(cert.URIs))
-	if cert.Subject.CommonName != "" {
-		identities = append(identities, cert.Subject.CommonName)
-	}
-	identities = append(identities, cert.DNSNames...)
-	identities = append(identities, cert.EmailAddresses...)
-	for _, uri := range cert.URIs {
-		identities = append(identities, uri.String())
-	}
-	return identities
+	return h.authorizer.AuthorizePeerCertificates(r.TLS.PeerCertificates)
 }
 
 func metadataFromHeaders(h http.Header) (pending.Metadata, error) {
-	contentLength := safeHeaderValue(h.Get(ObjectContentLengthHeader))
-	if contentLength == "" {
-		contentLength = safeHeaderValue(h.Get("Content-Length"))
+	contentLength := h.Get(ObjectContentLengthHeader)
+	if strings.ContainsAny(contentLength, "\r\n") {
+		return pending.Metadata{}, fmt.Errorf("unsafe content length")
+	}
+	if strings.TrimSpace(contentLength) == "" {
+		contentLength = h.Get("Content-Length")
 	}
 	metadata := pending.Metadata{
-		ContentType:   safeHeaderValue(h.Get("Content-Type")),
+		ContentType:   h.Get("Content-Type"),
 		ContentLength: contentLength,
-		ContentRange:  safeHeaderValue(h.Get("Content-Range")),
-		ETag:          safeHeaderValue(h.Get("ETag")),
-		LastModified:  safeHeaderValue(h.Get("Last-Modified")),
-		AcceptRanges:  safeHeaderValue(h.Get("Accept-Ranges")),
-	}
-	if metadata.ContentLength != "" {
-		length, err := strconv.ParseInt(metadata.ContentLength, 10, 64)
-		if err != nil || length < 0 {
-			return pending.Metadata{}, fmt.Errorf("invalid content length")
-		}
-	}
-	if h.Get("Content-Type") != "" && metadata.ContentType == "" {
-		return pending.Metadata{}, fmt.Errorf("unsafe content type")
-	}
-	if h.Get("Content-Range") != "" && metadata.ContentRange == "" {
-		return pending.Metadata{}, fmt.Errorf("unsafe content range")
-	}
-	if h.Get("ETag") != "" && metadata.ETag == "" {
-		return pending.Metadata{}, fmt.Errorf("unsafe etag")
-	}
-	if h.Get("Last-Modified") != "" && metadata.LastModified == "" {
-		return pending.Metadata{}, fmt.Errorf("unsafe last modified")
-	}
-	if h.Get("Accept-Ranges") != "" && metadata.AcceptRanges == "" {
-		return pending.Metadata{}, fmt.Errorf("unsafe accept ranges")
+		ContentRange:  h.Get("Content-Range"),
+		ETag:          h.Get("ETag"),
+		LastModified:  h.Get("Last-Modified"),
+		AcceptRanges:  h.Get("Accept-Ranges"),
 	}
 
-	statusText := safeHeaderValue(h.Get(StatusCodeHeader))
-	if h.Get(StatusCodeHeader) != "" && statusText == "" {
-		return pending.Metadata{}, fmt.Errorf("unsafe status code")
-	}
+	statusText := h.Get(StatusCodeHeader)
 	if statusText != "" {
+		if strings.ContainsAny(statusText, "\r\n") {
+			return pending.Metadata{}, fmt.Errorf("unsafe status code")
+		}
+		statusText = strings.TrimSpace(statusText)
+		if statusText == "" {
+			return pending.Metadata{}, fmt.Errorf("invalid status code")
+		}
 		status, err := strconv.Atoi(statusText)
-		if err != nil || status < 100 || status > 599 {
+		if err != nil {
 			return pending.Metadata{}, fmt.Errorf("invalid status code")
 		}
 		metadata.StatusCode = status
 	}
 	return metadata, nil
-}
-
-func safeHeaderValue(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	if strings.ContainsAny(value, "\r\n") {
-		return ""
-	}
-	return value
 }
 
 func isPendingRejection(err error) bool {

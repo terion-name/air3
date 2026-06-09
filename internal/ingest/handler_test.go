@@ -245,10 +245,22 @@ func TestHeaderAllowlistIgnoresUnsafeMetadata(t *testing.T) {
 }
 
 func TestHandlerRejectsUnsafeAllowedHeaderValue(t *testing.T) {
-	hdr := http.Header{}
-	hdr.Set("ETag", "ok\r\nbad")
-	if _, err := metadataFromHeaders(hdr); err == nil {
-		t.Fatal("metadataFromHeaders() error = nil, want error")
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	reg := pending.NewRegistry(pending.Options{Now: func() time.Time { return now }})
+	req := ingestRequest(now, "req-unsafe-header")
+	target := registerPending(t, reg, req, nil)
+	h := newTestHandler(t, reg)
+
+	r := httptest.NewRequest(http.MethodPost, PathPrefix+req.ID, strings.NewReader("body"))
+	r.Header.Set(TokenHeader, req.IngestToken)
+	r.Header.Set("ETag", "ok\r\nbad")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if got := w.Result().StatusCode; got != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+	}
+	if snap := target.snapshot(); snap.startCount != 0 || snap.finishCount != 0 || snap.cancelCount != 0 {
+		t.Fatalf("target lifecycle starts=%d finishes=%d cancels=%d, want 0/0/0", snap.startCount, snap.finishCount, snap.cancelCount)
 	}
 }
 
