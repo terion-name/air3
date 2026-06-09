@@ -20,6 +20,8 @@ PUBLIC_READ_MODE=${AIR3_PERF_PUBLIC_READ_MODE:-auto}
 INGEST_TRANSPORT=${AIR3_INGEST_TRANSPORT:-http}
 INGEST_TCP_LISTEN_ADDR=${AIR3_EDGE_INGEST_TCP_ADDR:-:9444}
 INGEST_TCP_DIAL_ADDR=${AIR3_INGEST_TCP_ADDR:-edge-gateway:9444}
+INGEST_QUIC_LISTEN_ADDR=${AIR3_EDGE_INGEST_QUIC_ADDR:-:9445}
+INGEST_QUIC_DIAL_ADDR=${AIR3_INGEST_QUIC_ADDR:-edge-gateway:9445}
 BUCKET=${AIR3_PERF_BUCKET:-demo}
 BASE_URL=${AIR3_PERF_BASE_URL:-https://localhost:8443}
 SECRET=${AIR3_SIGNING_SECRET:-dev-signing-secret-change-me}
@@ -60,12 +62,14 @@ Runs the air3 Docker Compose performance benchmark. Configuration is via env var
   AIR3_PERF_CADDY_PORT          host port for perf Caddy S3 proxy (default: $CADDY_HOST_PORT)
   AIR3_PERF_CADDY_BASE_URL      base URL for perf Caddy S3 proxy (default: $CADDY_BASE_URL)
   AIR3_PERF_PUBLIC_READ_MODE    public-read setup mode: auto|bucket-acl|bucket-policy (default: $PUBLIC_READ_MODE)
-  AIR3_INGEST_TRANSPORT         connector→edge ingest transport: http|http1|http2|tcp|smux
-                                (default: $INGEST_TRANSPORT; tcp/smux are experimental)
+  AIR3_INGEST_TRANSPORT         connector→edge ingest transport: http|http1|http2|http3|tcp|smux|quic
+                                (default: $INGEST_TRANSPORT; tcp/smux/quic are experimental)
   AIR3_INGEST_DISABLE_HTTP2      legacy compatibility knob used only when AIR3_INGEST_TRANSPORT=http
-                                (explicit http1/http2 ignore it)
+                                (explicit http1/http2/http3 ignore it)
   AIR3_EDGE_INGEST_TCP_ADDR      edge TCP/smux ingest listener (Compose default: $INGEST_TCP_LISTEN_ADDR)
   AIR3_INGEST_TCP_ADDR           connector TCP/smux ingest dial address (Compose default: $INGEST_TCP_DIAL_ADDR)
+  AIR3_EDGE_INGEST_QUIC_ADDR     edge QUIC ingest listener (Compose default: $INGEST_QUIC_LISTEN_ADDR)
+  AIR3_INGEST_QUIC_ADDR          connector QUIC ingest dial address (Compose default: $INGEST_QUIC_DIAL_ADDR)
 
 Benchmark paths:
   direct_s3       anonymous direct VersityGW S3 read
@@ -73,14 +77,18 @@ Benchmark paths:
   air3_gateway    signed read through the Air3 gateway
 
 Transport values are: http (legacy compatibility mode controlled by AIR3_INGEST_DISABLE_HTTP2),
-http1 (force connector HTTP/1.1), http2 (enable connector HTTP/2), tcp (mTLS
-TCP stream ingest with a MessagePack metadata frame), and smux (MessagePack-framed
-ingest streams over persistent mTLS TCP, one smux stream per object).
+http1 (force connector HTTP/1.1), http2 (enable connector HTTP/2), http3
+(use HTTP/3 ingest), tcp (mTLS TCP stream ingest), smux (MessagePack-framed
+ingest streams over persistent mTLS TCP, one smux stream per object), and quic
+(custom QUIC ingest). HTTP-family transports use AIR3_INGEST_URL, headers, and
+body. Custom stream transports (tcp, smux, quic) use the shared MessagePack
+metadata frame, raw object body, and ack semantics; quic uses the QUIC address
+variables.
 
 The per-request, parallel, and summary CSVs include an ingest_transport column so
-explicit HTTP variants, legacy HTTP, and experimental TCP/smux ingest runs can
-be compared safely. In tcp/smux modes, AIR3_INGEST_URL remains the HTTPS
-ticket/fallback ingest URL.
+explicit HTTP variants, legacy HTTP, and experimental TCP/smux/quic/http3 ingest
+runs can be compared safely. AIR3_INGEST_URL remains the HTTPS ticket/fallback
+ingest URL and is used directly by the HTTP-family transports.
 
 Outputs:
   per-request CSV: $RESULTS_CSV
@@ -139,9 +147,9 @@ validate_public_read_mode() {
 
 validate_ingest_transport() {
   case "$INGEST_TRANSPORT" in
-    http|http1|http2|tcp|smux) ;;
+    http|http1|http2|http3|tcp|smux|quic) ;;
     *)
-      echo "error: AIR3_INGEST_TRANSPORT must be one of http, http1, http2, tcp, or smux; got '$INGEST_TRANSPORT'" >&2
+      echo "error: AIR3_INGEST_TRANSPORT must be one of http, http1, http2, http3, tcp, smux, or quic; got '$INGEST_TRANSPORT'" >&2
       exit 1
       ;;
   esac

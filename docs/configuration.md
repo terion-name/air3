@@ -12,9 +12,10 @@ The Edge Gateway is your public-facing entry point. It has **no** S3 settings an
 | --- | --- | --- |
 | `AIR3_EDGE_PUBLIC_ADDR` | `:8080` | The host and port for public HTTP `GET`/`HEAD` traffic. |
 | `AIR3_EDGE_INGEST_ADDR` | `:8443` | The host and port for the private Connector's default HTTP ingest stream. |
-| `AIR3_INGEST_TRANSPORT` | `http` | Connector→edge ingest transport. Accepted values are `http`, `http1`, `http2`, `tcp`, and `smux`. Use explicit `http1`, `http2`, `tcp`, or `smux` for new runs; legacy `http` remains the default for compatibility and uses `AIR3_INGEST_DISABLE_HTTP2` to choose the HTTP version. |
+| `AIR3_INGEST_TRANSPORT` | `http` | Connector→edge ingest transport. Accepted values are `http`, `http1`, `http2`, `http3`, `tcp`, `smux`, and `quic`. Use explicit `http1`, `http2`, `http3`, `tcp`, `smux`, or `quic` for new runs; legacy `http` remains the default for compatibility and uses `AIR3_INGEST_DISABLE_HTTP2` to choose the HTTP version. |
 | `AIR3_EDGE_INGEST_TCP_ADDR` | unset (Compose: `:9444`) | Edge TCP/smux ingest listener address. Required only when `AIR3_INGEST_TRANSPORT=tcp` or `smux`; Compose keeps this port on the internal network and does not publish it to the host by default. `smux` reuses this TCP listener address. |
-| `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The HTTPS ingest URL the Edge embeds in tickets and uses as the HTTP fallback. In `tcp` and `smux` modes this remains the fallback/ticket URL. In the Compose demo, this is `https://edge-gateway:9443/ingest`. |
+| `AIR3_EDGE_INGEST_QUIC_ADDR` | unset (Compose: `:9445`) | Edge QUIC ingest listener address. Required only when `AIR3_INGEST_TRANSPORT=quic`; Compose keeps this UDP listener on the internal network and does not publish it to the host by default. If you expose it on a host, use an explicit `/udp` port mapping. |
+| `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The HTTPS ingest URL the Edge embeds in tickets and uses as the HTTP ingest endpoint/fallback. The HTTP family (`http`, `http1`, `http2`, `http3`) uses this URL with the existing headers and body semantics. In custom stream modes (`tcp`, `smux`, `quic`) this remains the fallback/ticket URL. In the Compose demo, this is `https://edge-gateway:9443/ingest`. |
 | `AIR3_ALLOWED_BUCKETS` | `demo` | A strict comma-separated allowlist of bucket names. The Edge drops requests for unlisted buckets before even making a NATS ticket. |
 | `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` | unset | (Optional) Comma-separated list of allowed Connector certificate identities for mTLS ingest connections. |
 
@@ -24,11 +25,12 @@ The Private Connector is your secure worker. It has **no public inbound listener
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The default/fallback HTTPS Edge ingest endpoint for outbound mTLS uploads. It remains the ticket URL and HTTP fallback even when `tcp` or `smux` ingest is enabled. |
-| `AIR3_INGEST_TRANSPORT` | `http` | Connector→edge ingest transport. Accepted values are `http`, `http1`, `http2`, `tcp`, and `smux`. Use explicit `http1`, `http2`, `tcp`, or `smux` for new runs; legacy `http` remains the default for compatibility and uses `AIR3_INGEST_DISABLE_HTTP2` to choose the HTTP version. |
+| `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The default/fallback HTTPS Edge ingest endpoint for outbound mTLS uploads. The HTTP family (`http`, `http1`, `http2`, `http3`) uses this URL with the existing headers and body semantics; custom stream transports (`tcp`, `smux`, `quic`) keep it as the ticket/fallback URL. |
+| `AIR3_INGEST_TRANSPORT` | `http` | Connector→edge ingest transport. Accepted values are `http`, `http1`, `http2`, `http3`, `tcp`, `smux`, and `quic`. Use explicit `http1`, `http2`, `http3`, `tcp`, `smux`, or `quic` for new runs; legacy `http` remains the default for compatibility and uses `AIR3_INGEST_DISABLE_HTTP2` to choose the HTTP version. |
 | `AIR3_INGEST_TCP_ADDR` | unset (Compose: `edge-gateway:9444`) | Connector TCP/smux dial address for the Edge TCP/smux ingest listener. Required only when `AIR3_INGEST_TRANSPORT=tcp` or `smux`. `smux` reuses this TCP dial address. |
+| `AIR3_INGEST_QUIC_ADDR` | unset (Compose: `edge-gateway:9445`) | Connector QUIC dial address for the Edge QUIC ingest listener. Required only when `AIR3_INGEST_TRANSPORT=quic`. |
 | `AIR3_ALLOWED_BUCKETS` | `demo` | Defense-in-depth: the Connector also enforces this allowlist before attempting to reach S3. |
-| `AIR3_INGEST_DISABLE_HTTP2` | `false` | Legacy compatibility knob used only when `AIR3_INGEST_TRANSPORT=http`: `true` forces HTTP/1.1 and `false` enables HTTP/2. Explicit `AIR3_INGEST_TRANSPORT=http1` or `http2` ignores this setting. |
+| `AIR3_INGEST_DISABLE_HTTP2` | `false` | Legacy compatibility knob used only when `AIR3_INGEST_TRANSPORT=http`: `true` forces HTTP/1.1 and `false` enables HTTP/2. Explicit `AIR3_INGEST_TRANSPORT=http1`, `http2`, or `http3` ignores this setting. |
 
 ## NATS Broker
 
@@ -86,7 +88,7 @@ We use standardized variable suffixes for configuring TLS and mutual TLS (mTLS) 
 | `_SERVER_NAME` | (Optional) TLS server name override for outbound connections. |
 | `_INSECURE_SKIP_VERIFY` | Skip TLS verification. **(Testing only!)** |
 
-*Example:* To secure the ingest port, the Edge uses `AIR3_EDGE_MTLS_CA_FILE`, `AIR3_EDGE_MTLS_CERT_FILE`, and `AIR3_EDGE_MTLS_KEY_FILE`. The Connector then uses `AIR3_CONNECTOR_MTLS_*` to securely connect to it. HTTP ingest (explicit `http1`/`http2` or legacy `http`), experimental TCP ingest, and experimental `smux` ingest all use these same mTLS files, the same optional `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` identity allowlist, and the same one-time ingest token semantics. TCP ingest is an mTLS TCP stream with a MessagePack metadata frame before object bytes. `smux` uses MessagePack-framed ingest streams over persistent mTLS TCP, with one smux stream per object.
+*Example:* To secure the ingest port, the Edge uses `AIR3_EDGE_MTLS_CA_FILE`, `AIR3_EDGE_MTLS_CERT_FILE`, and `AIR3_EDGE_MTLS_KEY_FILE`. The Connector then uses `AIR3_CONNECTOR_MTLS_*` to securely connect to it. HTTP ingest (explicit `http1`/`http2`/`http3` or legacy `http`), experimental TCP ingest, experimental `smux` ingest, and experimental custom QUIC ingest all use these same mTLS files, the same optional `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` identity allowlist, and the same one-time ingest token semantics. HTTP-family transports use the existing ingest URL, headers, and body. Custom stream transports (`tcp`, `smux`, `quic`) use a shared MessagePack metadata frame, raw object body, and ack semantics; `smux` multiplexes these streams over persistent mTLS TCP, one smux stream per object.
 
 ## Timeouts and Limits
 
@@ -96,17 +98,19 @@ We use standardized variable suffixes for configuring TLS and mutual TLS (mTLS) 
 | `AIR3_STREAM_TIMEOUT` | `5m` | Maximum total time allowed for the entire file stream transfer. |
 | `AIR3_STREAM_COPY_BUFFER_BYTES` | `262144` bytes | Size of each per-stream `io.CopyBuffer` buffer on edge streaming paths. Units are bytes; minimum `32768` bytes, maximum `1048576` bytes. This bounds streaming copy buffers without introducing body buffering. |
 
-*Runtime tuning note:* `AIR3_STREAM_COPY_BUFFER_BYTES`, `AIR3_INGEST_DISABLE_HTTP2`, and `AIR3_INGEST_TRANSPORT` only tune streaming/transport behavior. They do not change authentication, authorization, or other security behavior, and they do not introduce request or response body buffering. `AIR3_INGEST_DISABLE_HTTP2` is legacy/compatibility-only for `AIR3_INGEST_TRANSPORT=http`; explicit `http1` and `http2` ignore it.
+*Runtime tuning note:* `AIR3_STREAM_COPY_BUFFER_BYTES`, `AIR3_INGEST_DISABLE_HTTP2`, and `AIR3_INGEST_TRANSPORT` only tune streaming/transport behavior. They do not change authentication, authorization, or other security behavior, and they do not introduce request or response body buffering. `AIR3_INGEST_DISABLE_HTTP2` is legacy/compatibility-only for `AIR3_INGEST_TRANSPORT=http`; explicit `http1`, `http2`, and `http3` ignore it.
 
 ### Ingest transport variants
 
 Accepted `AIR3_INGEST_TRANSPORT` values are:
 
+- `http`: legacy compatibility mode. This remains the Compose default and uses `AIR3_INGEST_DISABLE_HTTP2` (`true` = HTTP/1.1, `false` = HTTP/2).
 - `http1`: force connector HTTP/1.1 ingest.
 - `http2`: enable connector HTTP/2 ingest.
-- `tcp`: use experimental mTLS TCP stream ingest with a MessagePack metadata frame.
-- `smux`: use MessagePack-framed ingest streams over persistent mTLS TCP, one smux stream per object. It reuses `AIR3_EDGE_INGEST_TCP_ADDR` and `AIR3_INGEST_TCP_ADDR`.
-- `http`: legacy compatibility mode. This remains the Compose default and uses `AIR3_INGEST_DISABLE_HTTP2` (`true` = HTTP/1.1, `false` = HTTP/2).
+- `http3`: use HTTP/3 ingest. Like the other HTTP-family transports, it uses `AIR3_INGEST_URL`, existing ingest headers, and the object body.
+- `tcp`: use experimental mTLS TCP stream ingest with the shared MessagePack metadata frame, raw object body, and ack semantics.
+- `smux`: use the shared MessagePack-framed ingest stream over persistent mTLS TCP, one smux stream per object. It reuses `AIR3_EDGE_INGEST_TCP_ADDR` and `AIR3_INGEST_TCP_ADDR`.
+- `quic`: use experimental custom QUIC ingest with the shared MessagePack metadata frame, raw object body, and ack semantics. It uses `AIR3_EDGE_INGEST_QUIC_ADDR` and `AIR3_INGEST_QUIC_ADDR`.
 
 For new benchmarking runs, prefer explicit transport values so result filenames and CSV labels show the intended connector ingest behavior:
 
@@ -115,6 +119,8 @@ AIR3_INGEST_TRANSPORT=http1 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PER
 AIR3_INGEST_TRANSPORT=http2 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
 AIR3_INGEST_TRANSPORT=tcp AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
 AIR3_INGEST_TRANSPORT=smux AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
+AIR3_INGEST_TRANSPORT=quic AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
+AIR3_INGEST_TRANSPORT=http3 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
 ```
 
 *Bucket Name Rules:* Bucket names must be 3-63 characters long, containing only lowercase letters, numbers, dots, or hyphens (DNS style). They cannot start or end with a dot or hyphen, and cannot have adjacent dots.
