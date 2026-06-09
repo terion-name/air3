@@ -142,6 +142,8 @@ Useful knobs:
 - `AIR3_PERF_CADDY_PORT` to change the temporary localhost Caddy baseline port
 - `AIR3_PERF_CADDY_BASE_URL` to point the `caddy_s3` baseline at a different proxy URL
 - `AIR3_PERF_PUBLIC_READ_MODE` controls how the perf script enables anonymous reads: ACL mode sets a public-read bucket ACL in VersityGW; `auto` falls back to a bucket policy if ACL-only anonymous reads are not sufficient.
+- `AIR3_STREAM_COPY_BUFFER_BYTES` (default `262144`) tunes the Edge streaming copy buffer size for Compose perf runs.
+- `AIR3_INGEST_DISABLE_HTTP2` (default `false`) can disable HTTP/2 for the connector→edge ingest client during Compose perf runs.
 - `AIR3_PERF_CACHE_DIR` and `AIR3_PERF_RESULTS_DIR` to relocate cache/results
 
 The perf override limits each `edge-gateway` and `private-connector` container to one CPU. It also adds the `caddy-s3` service and `deploy/Caddyfile.perf` for the Caddy baseline. Unsigned public baselines use curl against the perf-exposed endpoints; gateway measurements use `cmd/signurl` and `curl --http1.1 --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443` for stable streaming timings.
