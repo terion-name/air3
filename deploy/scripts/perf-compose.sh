@@ -14,6 +14,9 @@ MULTI_CONNECTORS=${AIR3_PERF_MULTI_CONNECTORS:-3}
 PARALLELISM=${AIR3_PERF_PARALLELISM:-0}
 SKIP_BIG=${AIR3_PERF_SKIP_BIG:-0}
 S3_HOST_PORT=${AIR3_PERF_S3_PORT:-10000}
+CADDY_HOST_PORT=${AIR3_PERF_CADDY_PORT:-10080}
+CADDY_BASE_URL=${AIR3_PERF_CADDY_BASE_URL:-http://localhost:$CADDY_HOST_PORT}
+PUBLIC_READ_MODE=${AIR3_PERF_PUBLIC_READ_MODE:-auto}
 BUCKET=${AIR3_PERF_BUCKET:-demo}
 BASE_URL=${AIR3_PERF_BASE_URL:-https://localhost:8443}
 SECRET=${AIR3_SIGNING_SECRET:-dev-signing-secret-change-me}
@@ -35,6 +38,7 @@ OBJECT_NAMES=(small medium big)
 OBJECT_FILES=(small.jpg medium.jpg big.webm)
 OBJECT_KEYS=(perf/small.jpg perf/medium.jpg perf/big.webm)
 OBJECT_URLS=("$SMALL_URL" "$MEDIUM_URL" "$BIG_URL")
+PATH_NAMES=(direct_s3 caddy_s3 air3_gateway)
 
 usage() {
   cat <<EOFUSAGE
@@ -45,11 +49,19 @@ Runs the air3 Docker Compose performance benchmark. Configuration is via env var
   AIR3_PERF_ITERATIONS          measured requests per object/path (default: $ITERATIONS)
   AIR3_PERF_CONNECTORS          private connector replicas to run (default: $CONNECTORS)
   AIR3_PERF_MULTI_CONNECTORS    multi-connector count used by make perf-multi (default: $MULTI_CONNECTORS)
-  AIR3_PERF_PARALLELISM         optional parallel gateway requests per object (default: $PARALLELISM, disabled when 0/1)
+  AIR3_PERF_PARALLELISM         optional parallel Air3 gateway requests per object (default: $PARALLELISM, disabled when 0/1)
   AIR3_PERF_SKIP_BIG            set to 1 to skip the big webm object (default: $SKIP_BIG)
   AIR3_PERF_CACHE_DIR           downloaded Wikimedia cache (default: $CACHE_DIR)
   AIR3_PERF_RESULTS_DIR         CSV output directory (default: $RESULTS_DIR)
   AIR3_PERF_S3_PORT             host port for direct VersityGW access (default: $S3_HOST_PORT)
+  AIR3_PERF_CADDY_PORT          host port for perf Caddy S3 proxy (default: $CADDY_HOST_PORT)
+  AIR3_PERF_CADDY_BASE_URL      base URL for perf Caddy S3 proxy (default: $CADDY_BASE_URL)
+  AIR3_PERF_PUBLIC_READ_MODE    public-read setup mode: auto|bucket-acl|bucket-policy (default: $PUBLIC_READ_MODE)
+
+Benchmark paths:
+  direct_s3       anonymous direct VersityGW S3 read
+  caddy_s3        anonymous read through perf Caddy S3 proxy
+  air3_gateway    signed read through the Air3 gateway
 
 Outputs:
   per-request CSV: $RESULTS_CSV
@@ -96,6 +108,16 @@ require_non_negative_int() {
   fi
 }
 
+validate_public_read_mode() {
+  case "$PUBLIC_READ_MODE" in
+    auto|bucket-acl|bucket-policy) ;;
+    *)
+      echo "error: AIR3_PERF_PUBLIC_READ_MODE must be one of auto, bucket-acl, bucket-policy; got '$PUBLIC_READ_MODE'" >&2
+      exit 1
+      ;;
+  esac
+}
+
 sql_quote() {
   printf "%s" "$1" | sed "s/'/'\\''/g"
 }
@@ -108,6 +130,11 @@ s3_uri_for_key() {
 host_s3_url_for_key() {
   local key=$1
   printf '%s/%s/%s' "$S3_ENDPOINT_ON_HOST" "$BUCKET" "$key"
+}
+
+host_caddy_url_for_key() {
+  local key=$1
+  printf '%s/%s/%s' "$CADDY_BASE_URL" "$BUCKET" "$key"
 }
 
 sign_gateway_url() {
@@ -178,17 +205,93 @@ seed_objects() {
   done
 }
 
-curl_direct() {
+verify_anonymous_direct_read() {
+  local key=$1
+  local mechanism=$2
+  local url
+  url=$(host_s3_url_for_key "$key")
+  if curl --silent --show-error --fail --output /dev/null "$url"; then
+    return 0
+  fi
+  echo "public-read verification failed for $mechanism with anonymous direct curl: $url" >&2
+  return 1
+}
+
+enable_bucket_acl_public_read() {
+  local sample_key=$1
+  echo "Configuring public reads with bucket ACL public-read..."
+  if ! run_compose run --rm --no-deps aws-cli "aws --endpoint-url '$(sql_quote "$S3_ENDPOINT_IN_COMPOSE")' s3api put-bucket-acl --acl public-read --bucket '$(sql_quote "$BUCKET")' >/dev/null"; then
+    echo "bucket ACL public-read setup failed for s3://$BUCKET" >&2
+    return 1
+  fi
+  verify_anonymous_direct_read "$sample_key" bucket-acl
+}
+
+enable_bucket_policy_public_read() {
+  local sample_key=$1
+  local policy
+  policy=$(printf '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}' "$BUCKET")
+  echo "Configuring public reads with bucket policy..."
+  if ! run_compose run --rm --no-deps aws-cli "aws --endpoint-url '$(sql_quote "$S3_ENDPOINT_IN_COMPOSE")' s3api put-bucket-policy --bucket '$(sql_quote "$BUCKET")' --policy '$(sql_quote "$policy")' >/dev/null"; then
+    echo "bucket policy public-read setup failed for s3://$BUCKET" >&2
+    return 1
+  fi
+  verify_anonymous_direct_read "$sample_key" bucket-policy
+}
+
+configure_public_read() {
+  local sample_key=$1
+  case "$PUBLIC_READ_MODE" in
+    bucket-acl)
+      if enable_bucket_acl_public_read "$sample_key"; then
+        echo "Public-read mechanism: bucket-acl"
+      else
+        echo "error: AIR3_PERF_PUBLIC_READ_MODE=bucket-acl failed" >&2
+        exit 1
+      fi
+      ;;
+    bucket-policy)
+      if enable_bucket_policy_public_read "$sample_key"; then
+        echo "Public-read mechanism: bucket-policy"
+      else
+        echo "error: AIR3_PERF_PUBLIC_READ_MODE=bucket-policy failed" >&2
+        exit 1
+      fi
+      ;;
+    auto)
+      if enable_bucket_acl_public_read "$sample_key"; then
+        echo "Public-read mechanism: bucket-acl"
+      else
+        echo "bucket ACL public-read setup failed; trying bucket policy..." >&2
+        if enable_bucket_policy_public_read "$sample_key"; then
+          echo "Public-read mechanism: bucket-policy"
+        else
+          echo "error: automatic public-read setup failed with both bucket ACL and bucket policy" >&2
+          exit 1
+        fi
+      fi
+      ;;
+  esac
+}
+
+curl_direct_s3() {
   local key=$1
   curl --silent --show-error --fail \
     --output /dev/null \
-    --aws-sigv4 "aws:amz:$S3_REGION:s3" \
-    --user "$S3_ACCESS_KEY_ID:$S3_SECRET_ACCESS_KEY" \
     --write-out '%{size_download},%{time_starttransfer},%{time_total},%{speed_download}' \
     "$(host_s3_url_for_key "$key")"
 }
 
-curl_gateway() {
+curl_caddy_s3() {
+  local key=$1
+  curl --silent --show-error --fail \
+    --http1.1 \
+    --output /dev/null \
+    --write-out '%{size_download},%{time_starttransfer},%{time_total},%{speed_download}' \
+    "$(host_caddy_url_for_key "$key")"
+}
+
+curl_air3_gateway() {
   local key=$1
   local url
   url=$(sign_gateway_url "$key")
@@ -198,6 +301,20 @@ curl_gateway() {
     --cacert "$CERT_DIR/dev-ca.crt" \
     --write-out '%{size_download},%{time_starttransfer},%{time_total},%{speed_download}' \
     "$url"
+}
+
+curl_path() {
+  local path=$1
+  local key=$2
+  case "$path" in
+    direct_s3) curl_direct_s3 "$key" ;;
+    caddy_s3) curl_caddy_s3 "$key" ;;
+    air3_gateway) curl_air3_gateway "$key" ;;
+    *)
+      echo "error: unknown benchmark path '$path'" >&2
+      exit 1
+      ;;
+  esac
 }
 
 throughput_mib_from_speed() {
@@ -221,38 +338,53 @@ append_measurement() {
 warmup_object() {
   local object_name=$1
   local key=$2
-  echo "Warming $object_name direct S3..."
-  curl_direct "$key" >/dev/null
-  echo "Warming $object_name gateway-through..."
-  curl_gateway "$key" >/dev/null
+  local path
+  for path in "${PATH_NAMES[@]}"; do
+    echo "Warming $object_name path=$path..."
+    curl_path "$path" "$key" >/dev/null
+  done
 }
 
 measure_object() {
   local connector_count=$1
   local object_name=$2
   local key=$3
-  local iteration metrics
+  local iteration path metrics
   for iteration in $(seq 1 "$ITERATIONS"); do
-    echo "Measuring connector_count=$connector_count object=$object_name path=direct iteration=$iteration/$ITERATIONS"
-    metrics=$(curl_direct "$key")
-    append_measurement "$connector_count" "$object_name" direct "$iteration" "$metrics"
-
-    echo "Measuring connector_count=$connector_count object=$object_name path=gateway iteration=$iteration/$ITERATIONS"
-    metrics=$(curl_gateway "$key")
-    append_measurement "$connector_count" "$object_name" gateway "$iteration" "$metrics"
+    for path in "${PATH_NAMES[@]}"; do
+      echo "Measuring connector_count=$connector_count object=$object_name path=$path iteration=$iteration/$ITERATIONS"
+      metrics=$(curl_path "$path" "$key")
+      append_measurement "$connector_count" "$object_name" "$path" "$iteration" "$metrics"
+    done
   done
 }
 
 wait_for_direct_s3() {
   local key=$1
-  echo "Waiting for direct S3 endpoint at $S3_ENDPOINT_ON_HOST..."
+  echo "Waiting for anonymous direct S3 endpoint at $S3_ENDPOINT_ON_HOST..."
   for i in $(seq 1 60); do
-    if curl_direct "$key" >/dev/null 2>&1; then
+    if curl_direct_s3 "$key" >/dev/null 2>&1; then
       return 0
     fi
     if [ "$i" -eq 60 ]; then
-      echo "error: direct S3 endpoint did not become reachable at $S3_ENDPOINT_ON_HOST" >&2
+      echo "error: anonymous direct S3 endpoint did not become reachable at $S3_ENDPOINT_ON_HOST" >&2
       echo "hint: change AIR3_PERF_S3_PORT if the port is busy, or AIR3_PERF_S3_ENDPOINT_ON_HOST if Docker publishes ports somewhere other than localhost" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+wait_for_caddy_s3() {
+  local key=$1
+  echo "Waiting for anonymous Caddy S3 endpoint at $CADDY_BASE_URL..."
+  for i in $(seq 1 60); do
+    if curl --silent --show-error --http1.1 --fail --output /dev/null "$(host_caddy_url_for_key "$key")" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [ "$i" -eq 60 ]; then
+      echo "error: perf Caddy S3 endpoint did not become reachable at $CADDY_BASE_URL" >&2
+      echo "hint: change AIR3_PERF_CADDY_PORT if the port is busy, or AIR3_PERF_CADDY_BASE_URL if Docker publishes ports somewhere other than localhost" >&2
       exit 1
     fi
     sleep 1
@@ -261,13 +393,13 @@ wait_for_direct_s3() {
 
 wait_for_gateway() {
   local key=$1
-  echo "Waiting for gateway at $BASE_URL..."
+  echo "Waiting for Air3 gateway at $BASE_URL..."
   for i in $(seq 1 60); do
-    if curl_gateway "$key" >/dev/null 2>&1; then
+    if curl_air3_gateway "$key" >/dev/null 2>&1; then
       return 0
     fi
     if [ "$i" -eq 60 ]; then
-      echo "error: edge gateway did not become ready at $BASE_URL" >&2
+      echo "error: Air3 gateway did not become ready at $BASE_URL" >&2
       exit 1
     fi
     sleep 1
@@ -294,7 +426,7 @@ run_parallel_phase() {
       sign_gateway_url "$key" >>"$urls_file"
     done
 
-    echo "Running parallel gateway phase object=$object_name parallelism=$PARALLELISM..."
+    echo "Running parallel Air3 gateway phase object=$object_name path=air3_gateway parallelism=$PARALLELISM..."
     start_ns=$(date +%s%N)
     xargs -n 1 -P "$PARALLELISM" curl --silent --show-error --fail --http1.1 --output /dev/null --cacert "$CERT_DIR/dev-ca.crt" <"$urls_file"
     end_ns=$(date +%s%N)
@@ -302,7 +434,7 @@ run_parallel_phase() {
     total_bytes=$(awk -v bytes="$(stat_size "$CACHE_DIR/${OBJECT_FILES[$i]}")" -v n="$PARALLELISM" 'BEGIN { printf "%.0f", bytes * n }')
     speed=$(awk -v bytes="$total_bytes" -v total="$duration" 'BEGIN { if (total > 0) printf "%.6f", bytes / total; else print "0" }')
     throughput=$(throughput_mib_from_speed "$speed")
-    printf '%s,%s,gateway,%s,%s,%s,%s,%s\n' "$connector_count" "$object_name" "$PARALLELISM" "$total_bytes" "$duration" "$speed" "$throughput" >>"$PARALLEL_CSV"
+    printf '%s,%s,air3_gateway,%s,%s,%s,%s,%s\n' "$connector_count" "$object_name" "$PARALLELISM" "$total_bytes" "$duration" "$speed" "$throughput" >>"$PARALLEL_CSV"
     rm -f "$urls_file"
     trap - RETURN
   done
@@ -319,55 +451,63 @@ stat_size() {
 }
 
 write_summary() {
-  awk -F, '
-    NR == 1 { next }
-    {
-      key = $1 "," $2 "," $3
-      count[key]++
-      bytes[key] += $5
-      ttfb[key] += $6
-      total[key] += $7
-      speed[key] += $8
-      throughput[key] += $9
-      pairs[$1 "," $2] = 1
-    }
-    function avg(sum, n) { return n > 0 ? sum / n : 0 }
-    BEGIN {
-      print "connector_count,object,direct_avg_bytes,gateway_avg_bytes,direct_avg_ttfb,gateway_avg_ttfb,ttfb_penalty_pct,direct_avg_total_time,gateway_avg_total_time,total_time_penalty_pct,direct_avg_speed_bytes_per_sec,gateway_avg_speed_bytes_per_sec,speed_penalty_pct,direct_avg_throughput_mib_per_sec,gateway_avg_throughput_mib_per_sec,throughput_penalty_pct"
-    }
-    END {
-      for (pair in pairs) {
-        direct = pair ",direct"
-        gateway = pair ",gateway"
-        split(pair, fields, ",")
-        direct_bytes = avg(bytes[direct], count[direct])
-        gateway_bytes = avg(bytes[gateway], count[gateway])
-        direct_ttfb = avg(ttfb[direct], count[direct])
-        gateway_ttfb = avg(ttfb[gateway], count[gateway])
-        direct_total = avg(total[direct], count[direct])
-        gateway_total = avg(total[gateway], count[gateway])
-        direct_speed = avg(speed[direct], count[direct])
-        gateway_speed = avg(speed[gateway], count[gateway])
-        direct_throughput = avg(throughput[direct], count[direct])
-        gateway_throughput = avg(throughput[gateway], count[gateway])
-        ttfb_penalty = direct_ttfb > 0 ? ((gateway_ttfb - direct_ttfb) / direct_ttfb) * 100 : 0
-        total_penalty = direct_total > 0 ? ((gateway_total - direct_total) / direct_total) * 100 : 0
-        speed_penalty = direct_speed > 0 ? ((direct_speed - gateway_speed) / direct_speed) * 100 : 0
-        throughput_penalty = direct_throughput > 0 ? ((direct_throughput - gateway_throughput) / direct_throughput) * 100 : 0
-        printf "%s,%s,%.0f,%.0f,%.6f,%.6f,%.2f,%.6f,%.6f,%.2f,%.6f,%.6f,%.2f,%.6f,%.6f,%.2f\n", fields[1], fields[2], direct_bytes, gateway_bytes, direct_ttfb, gateway_ttfb, ttfb_penalty, direct_total, gateway_total, total_penalty, direct_speed, gateway_speed, speed_penalty, direct_throughput, gateway_throughput, throughput_penalty
+  {
+    echo "connector_count,object,path,samples,avg_bytes,avg_ttfb_seconds,avg_total_time_seconds,avg_speed_bytes_per_sec,avg_throughput_mib_per_sec,air3_over_direct_total_ratio,air3_over_caddy_total_ratio"
+    awk -F, '
+      NR == 1 { next }
+      {
+        key = $1 "," $2 "," $3
+        count[key]++
+        bytes[key] += $5
+        ttfb[key] += $6
+        total[key] += $7
+        speed[key] += $8
+        throughput[key] += $9
+        keys[key] = 1
       }
-    }
-  ' "$RESULTS_CSV" | sort -t, -k1,1n -k2,2 >"$SUMMARY_CSV"
+      function avg(sum, n) { return n > 0 ? sum / n : 0 }
+      END {
+        for (key in keys) {
+          split(key, fields, ",")
+          connector = fields[1]
+          object = fields[2]
+          path = fields[3]
+          avg_bytes = avg(bytes[key], count[key])
+          avg_ttfb = avg(ttfb[key], count[key])
+          avg_total = avg(total[key], count[key])
+          avg_speed = avg(speed[key], count[key])
+          avg_throughput = avg(throughput[key], count[key])
+          direct_ratio = ""
+          caddy_ratio = ""
+          if (path == "air3_gateway") {
+            direct_key = connector "," object ",direct_s3"
+            caddy_key = connector "," object ",caddy_s3"
+            direct_total = avg(total[direct_key], count[direct_key])
+            caddy_total = avg(total[caddy_key], count[caddy_key])
+            if (direct_total > 0) {
+              direct_ratio = sprintf("%.6f", avg_total / direct_total)
+            }
+            if (caddy_total > 0) {
+              caddy_ratio = sprintf("%.6f", avg_total / caddy_total)
+            }
+          }
+          printf "%s,%s,%s,%d,%.0f,%.6f,%.6f,%.6f,%.6f,%s,%s\n", connector, object, path, count[key], avg_bytes, avg_ttfb, avg_total, avg_speed, avg_throughput, direct_ratio, caddy_ratio
+        }
+      }
+    ' "$RESULTS_CSV" | sort -t, -k1,1n -k2,2 -k3,3
+  } >"$SUMMARY_CSV"
 }
 
 print_summary_table() {
   echo
   echo "Summary (averages):"
   awk -F, '
+    BEGIN { printf "%10s  %-7s  %-13s  %7s  %12s  %12s  %12s  %12s\n", "connectors", "object", "path", "samples", "total_s", "MiB/s", "air3/direct", "air3/caddy" }
     NR == 1 { next }
-    BEGIN { printf "%10s  %-7s  %12s  %12s  %12s  %12s  %10s\n", "connectors", "object", "direct_s", "gateway_s", "direct_MiB/s", "gateway_MiB/s", "penalty%" }
     {
-      printf "%10s  %-7s  %12.6f  %12.6f  %12.3f  %12.3f  %10.2f\n", $1, $2, $8, $9, $14, $15, $10
+      direct_ratio = $10 == "" ? "-" : $10
+      caddy_ratio = $11 == "" ? "-" : $11
+      printf "%10s  %-7s  %-13s  %7d  %12.6f  %12.3f  %12s  %12s\n", $1, $2, $3, $4, $7, $9, direct_ratio, caddy_ratio
     }
   ' "$SUMMARY_CSV"
 }
@@ -380,6 +520,7 @@ require_cmd xargs
 require_positive_int AIR3_PERF_ITERATIONS "$ITERATIONS"
 require_positive_int AIR3_PERF_CONNECTORS "$CONNECTORS"
 require_non_negative_int AIR3_PERF_PARALLELISM "$PARALLELISM"
+validate_public_read_mode
 
 if [ ! -f "$CERT_DIR/dev-ca.crt" ]; then
   echo "Generating development certificates..."
@@ -392,9 +533,11 @@ echo "connector_count,object,path,iteration,bytes,ttfb_seconds,total_time_second
 download_objects
 
 echo "Starting Compose services with $CONNECTORS private connector(s)..."
-run_compose up -d --build --scale "private-connector=$CONNECTORS" nats edge-gateway versitygw private-connector >/dev/null
+run_compose up -d --build --scale "private-connector=$CONNECTORS" nats edge-gateway versitygw caddy-s3 private-connector >/dev/null
 seed_objects
+configure_public_read "${OBJECT_KEYS[0]}"
 wait_for_direct_s3 "${OBJECT_KEYS[0]}"
+wait_for_caddy_s3 "${OBJECT_KEYS[0]}"
 wait_for_gateway "${OBJECT_KEYS[0]}"
 
 for i in "${!OBJECT_NAMES[@]}"; do
