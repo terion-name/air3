@@ -1,13 +1,10 @@
 package pending
 
 import (
-	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -48,25 +45,12 @@ type Metadata struct {
 	AcceptRanges  string
 }
 
-// Header returns Metadata encoded as safe HTTP response headers. It only emits
-// the object metadata fields this package knows how to carry.
-func (m Metadata) Header() http.Header {
-	h := make(http.Header)
-	setHeader(h, "Content-Type", m.ContentType)
-	setHeader(h, "Content-Length", m.ContentLength)
-	setHeader(h, "Content-Range", m.ContentRange)
-	setHeader(h, "ETag", m.ETag)
-	setHeader(h, "Last-Modified", m.LastModified)
-	setHeader(h, "Accept-Ranges", m.AcceptRanges)
-	return h
-}
-
-// Response is delivered to the held public request once connector ingest starts.
-// The caller owns Body and must close it when the public response is done.
-type Response struct {
-	Request  Request
-	Metadata Metadata
-	Body     io.ReadCloser
+// Target is the public response sink for a pending request. Start commits the
+// response metadata and returns the body writer used by connector ingest.
+type Target interface {
+	Start(Metadata) (io.Writer, error)
+	Finish(error) error
+	Cancel(error)
 }
 
 // Registry tracks pending requests in memory for one edge gateway process.
@@ -81,23 +65,24 @@ type Options struct {
 }
 
 type entry struct {
-	req  Request
-	ch   chan result
-	done bool
-	err  error
-}
-
-type result struct {
-	resp Response
-	err  error
+	req     Request
+	target  Target
+	claimed bool
+	stream  *IngestStream
+	err     error
 }
 
 // IngestStream is the connector-side writer for an accepted ingest body.
 type IngestStream struct {
 	requestID string
 	registry  *Registry
-	writer    *io.PipeWriter
-	once      sync.Once
+	target    Target
+	writer    io.Writer
+
+	once sync.Once
+	mu   sync.Mutex
+	done bool
+	err  error
 }
 
 func NewRegistry(opts Options) *Registry {
@@ -110,7 +95,10 @@ func NewRegistry(opts Options) *Registry {
 
 // Register creates or replaces no state outside this process. Request IDs must
 // be unique until the request expires, is canceled, or its ingest stream closes.
-func (r *Registry) Register(req Request) error {
+func (r *Registry) Register(req Request, target Target) error {
+	if target == nil {
+		return fmt.Errorf("%w: target is required", ErrInvalidRequest)
+	}
 	if err := validateRequest(req, r.now()); err != nil {
 		return err
 	}
@@ -120,33 +108,17 @@ func (r *Registry) Register(req Request) error {
 	if _, exists := r.entries[req.ID]; exists {
 		return ErrAlreadyExists
 	}
-	r.entries[req.ID] = &entry{req: req, ch: make(chan result, 1)}
+	r.entries[req.ID] = &entry{req: req, target: target}
 	return nil
 }
 
-// Wait blocks until ingest metadata/body is available, the pending request is
-// canceled or expired, or ctx is canceled. If ctx is canceled before ingest
-// starts, the pending request is canceled so a late connector POST cannot win.
-func (r *Registry) Wait(ctx context.Context, requestID string) (Response, error) {
-	e, err := r.lookupWaiting(requestID)
-	if err != nil {
-		return Response{}, err
-	}
-
-	select {
-	case res := <-e.ch:
-		return res.resp, res.err
-	case <-ctx.Done():
-		r.Cancel(requestID)
-		return Response{}, ctx.Err()
-	}
-}
-
-// StartIngest validates request state and one-time token, then hands a streaming
-// body reader to Wait callers. The returned stream must be closed to release the
+// StartIngest validates request state and one-time token, then claims the target
+// writer. The returned stream must be closed to finish the target and release the
 // registry entry.
 func (r *Registry) StartIngest(requestID, token string, metadata Metadata) (*IngestStream, error) {
 	now := r.now()
+	var cancelTarget Target
+	var cancelErr error
 
 	r.mu.Lock()
 	e, ok := r.entries[requestID]
@@ -155,11 +127,14 @@ func (r *Registry) StartIngest(requestID, token string, metadata Metadata) (*Ing
 		return nil, ErrNotFound
 	}
 	if err := e.currentError(now); err != nil {
-		r.finishLocked(requestID, e, err, true)
+		delete(r.entries, requestID)
+		cancelTarget = e.target
+		cancelErr = err
 		r.mu.Unlock()
+		cancelTarget.Cancel(cancelErr)
 		return nil, err
 	}
-	if e.done {
+	if e.claimed {
 		r.mu.Unlock()
 		return nil, ErrReplayed
 	}
@@ -168,16 +143,45 @@ func (r *Registry) StartIngest(requestID, token string, metadata Metadata) (*Ing
 		return nil, ErrInvalidToken
 	}
 
-	reader, writer := io.Pipe()
-	stream := &IngestStream{requestID: requestID, registry: r, writer: writer}
-	e.done = true
-	e.ch <- result{resp: Response{Request: e.req, Metadata: metadata, Body: reader}}
+	e.claimed = true
+	writer, err := e.target.Start(metadata)
+	if err != nil {
+		delete(r.entries, requestID)
+		r.mu.Unlock()
+		e.target.Cancel(err)
+		return nil, err
+	}
+	stream := &IngestStream{requestID: requestID, registry: r, target: e.target, writer: writer}
+	e.stream = stream
 	r.mu.Unlock()
 	return stream, nil
 }
 
 func (s *IngestStream) Write(p []byte) (int, error) {
-	return s.writer.Write(p)
+	s.mu.Lock()
+	if s.err != nil {
+		err := s.err
+		s.mu.Unlock()
+		return 0, err
+	}
+	if s.done {
+		s.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	s.mu.Unlock()
+
+	n, err := s.writer.Write(p)
+	if err != nil {
+		return n, err
+	}
+
+	s.mu.Lock()
+	cancelErr := s.err
+	s.mu.Unlock()
+	if cancelErr != nil {
+		return n, cancelErr
+	}
+	return n, nil
 }
 
 func (s *IngestStream) Close() error {
@@ -187,83 +191,86 @@ func (s *IngestStream) Close() error {
 func (s *IngestStream) CloseWithError(err error) error {
 	var closeErr error
 	s.once.Do(func() {
-		if err != nil {
-			closeErr = s.writer.CloseWithError(err)
-		} else {
-			closeErr = s.writer.Close()
-		}
+		s.mu.Lock()
+		s.done = true
+		s.mu.Unlock()
+
+		closeErr = s.target.Finish(err)
 		s.registry.remove(s.requestID)
 	})
 	return closeErr
 }
 
-// Cancel makes a pending request unavailable to future ingest attempts and wakes
-// any waiter. It returns false when the request is already unknown.
-func (r *Registry) Cancel(requestID string) bool {
+// Cancel makes a pending request unavailable to future ingest attempts and
+// notifies its target. It returns false when the request is already unknown.
+func (r *Registry) Cancel(requestID string, err error) bool {
+	if err == nil {
+		err = ErrCanceled
+	}
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	e, ok := r.entries[requestID]
 	if !ok {
+		r.mu.Unlock()
 		return false
 	}
-	if e.done {
-		delete(r.entries, requestID)
-		return true
+	delete(r.entries, requestID)
+	e.err = err
+	stream := e.stream
+	target := e.target
+	r.mu.Unlock()
+
+	if stream != nil {
+		stream.cancel(err)
 	}
-	r.finishLocked(requestID, e, ErrCanceled, true)
+	target.Cancel(err)
 	return true
 }
 
 // Expire cancels all pending entries whose deadlines are not after now and
 // returns the number of entries expired.
 func (r *Registry) Expire(now time.Time) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	type expiredEntry struct {
+		target Target
+		stream *IngestStream
+	}
 
-	expired := 0
+	r.mu.Lock()
+	expired := make([]expiredEntry, 0)
 	for id, e := range r.entries {
 		if e.req.Deadline.After(now) {
 			continue
 		}
-		if e.done {
-			delete(r.entries, id)
-		} else {
-			r.finishLocked(id, e, ErrExpired, true)
+		delete(r.entries, id)
+		e.err = ErrExpired
+		expired = append(expired, expiredEntry{target: e.target, stream: e.stream})
+	}
+	r.mu.Unlock()
+
+	for _, e := range expired {
+		if e.stream != nil {
+			e.stream.cancel(ErrExpired)
 		}
-		expired++
+		e.target.Cancel(ErrExpired)
 	}
-	return expired
-}
-
-func (r *Registry) lookupWaiting(requestID string) (*entry, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	e, ok := r.entries[requestID]
-	if !ok {
-		return nil, ErrNotFound
-	}
-	if err := e.currentError(r.now()); err != nil {
-		r.finishLocked(requestID, e, err, true)
-		return nil, err
-	}
-	return e, nil
-}
-
-func (r *Registry) finishLocked(requestID string, e *entry, err error, remove bool) {
-	if !e.done {
-		e.done = true
-		e.err = err
-		e.ch <- result{err: err}
-	}
-	if remove {
-		delete(r.entries, requestID)
-	}
+	return len(expired)
 }
 
 func (r *Registry) remove(requestID string) {
 	r.mu.Lock()
 	delete(r.entries, requestID)
 	r.mu.Unlock()
+}
+
+func (s *IngestStream) cancel(err error) {
+	if err == nil {
+		err = ErrCanceled
+	}
+	s.mu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.mu.Unlock()
 }
 
 func (e *entry) currentError(now time.Time) error {
@@ -315,12 +322,4 @@ func safeToken(s string) bool {
 		return false
 	}
 	return true
-}
-
-func setHeader(h http.Header, name, value string) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return
-	}
-	h.Set(name, value)
 }
