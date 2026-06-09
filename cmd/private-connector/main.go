@@ -18,6 +18,7 @@ import (
 
 	"github.com/terion-name/air3/internal/config"
 	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/mtls"
 	"github.com/terion-name/air3/internal/natsclient"
@@ -180,15 +181,7 @@ type tcpIngestSender struct {
 }
 
 func (s tcpIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metadata ingestMetadata, body io.Reader) error {
-	bodyLength := int64(0)
-	if body == nil {
-		body = http.NoBody
-	} else if body != http.NoBody {
-		bodyLength = ingesttcp.UnknownBodyLength
-		if metadata.ContentLength >= 0 {
-			bodyLength = metadata.ContentLength
-		}
-	}
+	body, bodyLength := ingestRequestBody(body, metadata, ingesttcp.UnknownBodyLength)
 
 	dialAndSend := s.dialAndSend
 	if dialAndSend == nil {
@@ -205,6 +198,44 @@ func (s tcpIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metada
 		return fmt.Errorf("send ingest tcp: %w", err)
 	}
 	return nil
+}
+
+type smuxClientSender interface {
+	Send(context.Context, ingestsmux.ClientRequest) error
+}
+
+type smuxIngestSender struct {
+	address   string
+	tlsConfig *tls.Config
+	sender    smuxClientSender
+}
+
+func (s smuxIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metadata ingestMetadata, body io.Reader) error {
+	body, bodyLength := ingestRequestBody(body, metadata, ingestsmux.UnknownBodyLength)
+	req := ingestsmux.ClientRequest{
+		RequestID:   ticket.RequestID,
+		IngestToken: ticket.IngestToken,
+		Metadata:    metadata.pendingMetadata(),
+		Body:        body,
+		BodyLength:  bodyLength,
+	}
+	if err := s.sender.Send(ctx, req); err != nil {
+		return fmt.Errorf("send ingest smux: %w", err)
+	}
+	return nil
+}
+
+func ingestRequestBody(body io.Reader, metadata ingestMetadata, unknownBodyLength int64) (io.Reader, int64) {
+	if body == nil {
+		return http.NoBody, 0
+	}
+	if body == http.NoBody {
+		return body, 0
+	}
+	if metadata.ContentLength >= 0 {
+		return body, metadata.ContentLength
+	}
+	return body, unknownBodyLength
 }
 
 func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
@@ -228,11 +259,21 @@ func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
 		}
 		return httpIngestSender{client: client}, nil
 	case config.IngestTransportTCP:
-		tlsCfg, err := mtls.ClientConfig(mtls.ClientOptions{Files: mtls.Files{CAFile: cfg.MTLS.CAFile, CertFile: cfg.MTLS.CertFile, KeyFile: cfg.MTLS.KeyFile, ServerName: cfg.MTLS.ServerName, InsecureSkipVerify: cfg.MTLS.InsecureSkipVerify}})
+		tlsCfg, err := ingestClientTLSConfig(cfg.MTLS)
 		if err != nil {
 			return nil, fmt.Errorf("load ingest tcp client tls config: %w", err)
 		}
 		return tcpIngestSender{address: cfg.IngestTCPAddr, tlsConfig: tlsCfg}, nil
+	case config.IngestTransportSMUX:
+		tlsCfg, err := ingestClientTLSConfig(cfg.MTLS)
+		if err != nil {
+			return nil, fmt.Errorf("load ingest smux client tls config: %w", err)
+		}
+		sender, err := ingestsmux.NewSender("tcp", cfg.IngestTCPAddr, tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("create ingest smux sender: %w", err)
+		}
+		return smuxIngestSender{address: cfg.IngestTCPAddr, tlsConfig: tlsCfg, sender: sender}, nil
 	default:
 		return nil, fmt.Errorf("unsupported ingest transport %q", cfg.IngestTransport)
 	}
@@ -333,6 +374,10 @@ func validateIngestURL(raw string) error {
 		return errors.New("ticket ingest url must be an absolute https url without credentials")
 	}
 	return nil
+}
+
+func ingestClientTLSConfig(paths config.MTLSPaths) (*tls.Config, error) {
+	return mtls.ClientConfig(mtls.ClientOptions{Files: mtls.Files{CAFile: paths.CAFile, CertFile: paths.CertFile, KeyFile: paths.KeyFile, ServerName: paths.ServerName, InsecureSkipVerify: paths.InsecureSkipVerify}})
 }
 
 func ingestHTTPClient(paths config.MTLSPaths, timeout time.Duration, disableHTTP2 bool) (*http.Client, error) {

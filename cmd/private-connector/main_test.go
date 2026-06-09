@@ -13,6 +13,7 @@ import (
 
 	"github.com/terion-name/air3/internal/config"
 	"github.com/terion-name/air3/internal/ingest"
+	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
 	"github.com/terion-name/air3/internal/pending"
 	"github.com/terion-name/air3/internal/s3fetch"
@@ -51,6 +52,16 @@ func (s *fakeIngestSender) Send(ctx context.Context, ticket tickets.Ticket, meta
 		payload = string(data)
 	}
 	s.sends = append(s.sends, sentIngest{ticket: ticket, metadata: metadata, body: payload})
+	return s.err
+}
+
+type fakeSmuxSender struct {
+	requests []ingestsmux.ClientRequest
+	err      error
+}
+
+func (s *fakeSmuxSender) Send(ctx context.Context, req ingestsmux.ClientRequest) error {
+	s.requests = append(s.requests, req)
 	return s.err
 }
 
@@ -495,6 +506,78 @@ func TestTCPIngestSenderPropagatesDialAndSendError(t *testing.T) {
 	}
 }
 
+func TestSMUXIngestSenderBuildsKnownLengthRequestAndSanitizesMetadata(t *testing.T) {
+	fakeSender := &fakeSmuxSender{}
+	sender := smuxIngestSender{sender: fakeSender}
+	metadata := ingestMetadata{
+		StatusCode:    http.StatusOK,
+		ContentType:   " text/plain ",
+		ContentLength: 12,
+		ContentRange:  " bytes 0-11/12 ",
+		ETag:          "\"abc\"\r\nSet-Cookie: leak",
+		LastModified:  " Mon, 08 Jun 2026 12:00:00 GMT ",
+		AcceptRanges:  " bytes ",
+	}
+
+	if err := sender.Send(context.Background(), validTicket("https://edge.internal/_ingest/req-1", http.MethodGet), metadata, strings.NewReader("hello world!")); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if len(fakeSender.requests) != 1 {
+		t.Fatalf("smux requests = %#v, want one request", fakeSender.requests)
+	}
+	gotReq := fakeSender.requests[0]
+	if gotReq.RequestID != "req-1" || gotReq.IngestToken != "ingest-token" || gotReq.BodyLength != 12 {
+		t.Fatalf("request id/token/bodyLength = %q/%q/%d", gotReq.RequestID, gotReq.IngestToken, gotReq.BodyLength)
+	}
+	wantMetadata := pending.Metadata{StatusCode: http.StatusOK, ContentType: "text/plain", ContentLength: "12", ContentRange: "bytes 0-11/12", LastModified: "Mon, 08 Jun 2026 12:00:00 GMT", AcceptRanges: "bytes"}
+	if gotReq.Metadata != wantMetadata {
+		t.Fatalf("metadata = %#v, want %#v", gotReq.Metadata, wantMetadata)
+	}
+	body, _ := io.ReadAll(gotReq.Body)
+	if string(body) != "hello world!" {
+		t.Fatalf("body = %q, want hello world!", body)
+	}
+}
+
+func TestSMUXIngestSenderBodyLengthRules(t *testing.T) {
+	tests := []struct {
+		name       string
+		metadata   ingestMetadata
+		body       io.Reader
+		wantLength int64
+	}{
+		{name: "no body", metadata: ingestMetadata{StatusCode: http.StatusNotFound, ContentLength: 42}, body: http.NoBody, wantLength: 0},
+		{name: "nil body", metadata: ingestMetadata{StatusCode: http.StatusNotFound, ContentLength: 42}, body: nil, wantLength: 0},
+		{name: "unknown body", metadata: ingestMetadata{StatusCode: http.StatusOK, ContentLength: -1}, body: strings.NewReader("stream"), wantLength: ingestsmux.UnknownBodyLength},
+		{name: "known body", metadata: ingestMetadata{StatusCode: http.StatusOK, ContentLength: 6}, body: strings.NewReader("stream"), wantLength: 6},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeSender := &fakeSmuxSender{}
+			sender := smuxIngestSender{sender: fakeSender}
+			if err := sender.Send(context.Background(), validTicket("https://edge.internal/_ingest/req-1", http.MethodGet), tc.metadata, tc.body); err != nil {
+				t.Fatalf("Send() error = %v", err)
+			}
+			if len(fakeSender.requests) != 1 {
+				t.Fatalf("smux requests = %#v, want one request", fakeSender.requests)
+			}
+			if fakeSender.requests[0].BodyLength != tc.wantLength {
+				t.Fatalf("BodyLength = %d, want %d", fakeSender.requests[0].BodyLength, tc.wantLength)
+			}
+		})
+	}
+}
+
+func TestSMUXIngestSenderPropagatesSendError(t *testing.T) {
+	wantErr := errors.New("session failed")
+	sender := smuxIngestSender{sender: &fakeSmuxSender{err: wantErr}}
+
+	err := sender.Send(context.Background(), validTicket("https://edge.internal/_ingest/req-1", http.MethodGet), ingestMetadata{StatusCode: http.StatusOK, ContentLength: 4}, strings.NewReader("body"))
+	if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "send ingest smux") {
+		t.Fatalf("Send() error = %v, want wrapped smux error", err)
+	}
+}
+
 func TestNewIngestSenderSelectsTransport(t *testing.T) {
 	t.Run("http protocols", func(t *testing.T) {
 		tests := []struct {
@@ -550,6 +633,28 @@ func TestNewIngestSenderSelectsTransport(t *testing.T) {
 		}
 		if tcpSender.address != "edge.internal:9000" || tcpSender.tlsConfig == nil {
 			t.Fatalf("tcp sender address=%q tls=%p, want configured address and TLS config", tcpSender.address, tcpSender.tlsConfig)
+		}
+	})
+
+	t.Run("smux", func(t *testing.T) {
+		cfg := connectorConfig()
+		cfg.IngestTransport = config.IngestTransportSMUX
+		cfg.IngestTCPAddr = "edge.internal:9000"
+		cfg.MTLS.ServerName = "edge.internal"
+		cfg.MTLS.InsecureSkipVerify = true
+		sender, err := newIngestSender(cfg)
+		if err != nil {
+			t.Fatalf("newIngestSender() error = %v", err)
+		}
+		smuxSender, ok := sender.(smuxIngestSender)
+		if !ok {
+			t.Fatalf("sender = %T, want smuxIngestSender", sender)
+		}
+		if smuxSender.address != "edge.internal:9000" || smuxSender.tlsConfig == nil || smuxSender.sender == nil {
+			t.Fatalf("smux sender address=%q tls=%p sender=%T, want configured address, TLS config, and sender", smuxSender.address, smuxSender.tlsConfig, smuxSender.sender)
+		}
+		if smuxSender.tlsConfig.ServerName != "edge.internal" || !smuxSender.tlsConfig.InsecureSkipVerify {
+			t.Fatalf("smux sender TLS config ServerName=%q InsecureSkipVerify=%t, want connector mTLS settings", smuxSender.tlsConfig.ServerName, smuxSender.tlsConfig.InsecureSkipVerify)
 		}
 	})
 
