@@ -59,7 +59,7 @@ func TestLoadConnectorParsesS3AndDoesNotRequireSigning(t *testing.T) {
 	}
 }
 
-func TestLoadConnectorDefaultsIngestDisableHTTP2False(t *testing.T) {
+func TestLoadConnectorDefaultsIngestDisableHTTP2True(t *testing.T) {
 	env := map[string]string{
 		"AIR3_S3_ACCESS_KEY_ID":     "access",
 		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
@@ -68,8 +68,23 @@ func TestLoadConnectorDefaultsIngestDisableHTTP2False(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConnector() error = %v", err)
 	}
+	if !cfg.IngestDisableHTTP2 {
+		t.Fatal("IngestDisableHTTP2 = false, want true")
+	}
+}
+
+func TestLoadConnectorCanOptInToIngestHTTP2(t *testing.T) {
+	env := map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":     "access",
+		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+		"AIR3_INGEST_DISABLE_HTTP2": "false",
+	}
+	cfg, err := LoadConnector(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadConnector() error = %v", err)
+	}
 	if cfg.IngestDisableHTTP2 {
-		t.Fatal("IngestDisableHTTP2 = true, want false")
+		t.Fatal("IngestDisableHTTP2 = true, want false from explicit opt-in")
 	}
 }
 

@@ -132,7 +132,7 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 
 func LoadConnector(opts Options) (ConnectorConfig, error) {
 	env := normalizedOptions(opts)
-	ingestDisableHTTP2, err := env.bool("AIR3_INGEST_DISABLE_HTTP2", false)
+	ingestDisableHTTP2, err := env.bool("AIR3_INGEST_DISABLE_HTTP2", true)
 	if err != nil {
 		return ConnectorConfig{}, err
 	}

@@ -93,8 +93,14 @@ func TestIngestHTTPClientClonesDefaultTransportWithConnectorSettings(t *testing.
 	if (transport.Proxy == nil) != (defaultTransport.Proxy == nil) || (transport.DialContext == nil) != (defaultTransport.DialContext == nil) {
 		t.Fatal("transport did not preserve default proxy/dialer behavior")
 	}
-	if transport.ForceAttemptHTTP2 != defaultTransport.ForceAttemptHTTP2 {
-		t.Fatalf("ForceAttemptHTTP2 = %v, want default %v", transport.ForceAttemptHTTP2, defaultTransport.ForceAttemptHTTP2)
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatal("ForceAttemptHTTP2 = false, want true when HTTP/2 is enabled")
+	}
+	if transport.TLSNextProto != nil {
+		t.Fatalf("TLSNextProto = %#v, want nil when HTTP/2 is enabled", transport.TLSNextProto)
+	}
+	if transport.ReadBufferSize != ingestTransportBufferBytes || transport.WriteBufferSize != ingestTransportBufferBytes {
+		t.Fatalf("buffer sizes read=%d write=%d, want %d", transport.ReadBufferSize, transport.WriteBufferSize, ingestTransportBufferBytes)
 	}
 
 	client, err = ingestHTTPClient(config.MTLSPaths{}, 7*time.Second, true)
@@ -110,6 +116,9 @@ func TestIngestHTTPClientClonesDefaultTransportWithConnectorSettings(t *testing.
 	}
 	if disabledTransport.TLSNextProto == nil || len(disabledTransport.TLSNextProto) != 0 {
 		t.Fatalf("TLSNextProto = %#v, want empty non-nil map when HTTP/2 is disabled", disabledTransport.TLSNextProto)
+	}
+	if disabledTransport.ReadBufferSize != ingestTransportBufferBytes || disabledTransport.WriteBufferSize != ingestTransportBufferBytes {
+		t.Fatalf("disabled buffer sizes read=%d write=%d, want %d", disabledTransport.ReadBufferSize, disabledTransport.WriteBufferSize, ingestTransportBufferBytes)
 	}
 	if defaultTransport.DisableCompression != defaultDisableCompression || defaultTransport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
 		t.Fatal("ingestHTTPClient(disableHTTP2) mutated http.DefaultTransport")
@@ -141,6 +150,28 @@ func TestConnectorStreamsFetchedObjectToIngest(t *testing.T) {
 	}
 	if len(fetcher.requests) != 1 || fetcher.requests[0].Bucket != "demo-bucket" || fetcher.requests[0].Key != "objects/file.txt" {
 		t.Fatalf("fetch requests = %#v", fetcher.requests)
+	}
+}
+
+func TestConnectorStreamsUnknownLengthObjectWithChunkedIngest(t *testing.T) {
+	var gotMetadataLength, gotBody string
+	var gotContentLength int64
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMetadataLength = r.Header.Get(ingest.ObjectContentLengthHeader)
+		gotContentLength = r.ContentLength
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, ContentType: "text/plain", ContentLength: -1, Body: io.NopCloser(strings.NewReader("streamed body"))}}
+	worker := newConnector(connectorConfig(), fetcher, ts.Client(), nil)
+	if err := worker.handleTicket(context.Background(), validTicket(ts.URL, http.MethodGet)); err != nil {
+		t.Fatalf("handleTicket() error = %v", err)
+	}
+	if gotMetadataLength != "" || gotContentLength != -1 || gotBody != "streamed body" {
+		t.Fatalf("metadata-length=%q content-length=%d body=%q, want absent metadata length, chunked POST, and streamed body", gotMetadataLength, gotContentLength, gotBody)
 	}
 }
 
@@ -189,6 +220,29 @@ func TestConnectorHEADPostsMetadataWithoutBody(t *testing.T) {
 	}
 	if gotBody != "" || gotContentLength != 0 {
 		t.Fatalf("HEAD body = %q content-length = %d, want empty body and zero POST content length", gotBody, gotContentLength)
+	}
+}
+
+func TestPostIngestStatusOnlyKeepsMetadataLengthWithoutBody(t *testing.T) {
+	var gotMetadataLength, gotBody string
+	var gotContentLength int64
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMetadataLength = r.Header.Get(ingest.ObjectContentLengthHeader)
+		gotContentLength = r.ContentLength
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	worker := newConnector(connectorConfig(), nil, ts.Client(), nil)
+	ticket := validTicket(ts.URL, http.MethodHead)
+	metadata := ingestMetadata{StatusCode: http.StatusNotModified, ContentLength: 42}
+	if err := worker.postIngest(context.Background(), ticket, metadata, http.NoBody); err != nil {
+		t.Fatalf("postIngest() error = %v", err)
+	}
+	if gotMetadataLength != "42" || gotContentLength != 0 || gotBody != "" {
+		t.Fatalf("metadata-length=%q content-length=%d body=%q, want metadata length with empty fixed POST", gotMetadataLength, gotContentLength, gotBody)
 	}
 }
 

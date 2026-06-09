@@ -24,6 +24,8 @@ import (
 	"github.com/terion-name/air3/internal/tickets"
 )
 
+const ingestTransportBufferBytes = 256 * 1024
+
 type objectFetcher interface {
 	Fetch(context.Context, s3fetch.Request) (*s3fetch.Object, error)
 }
@@ -236,12 +238,17 @@ func validateIngestURL(raw string) error {
 func ingestHTTPClient(paths config.MTLSPaths, timeout time.Duration, disableHTTP2 bool) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DisableCompression = true
+	transport.ReadBufferSize = ingestTransportBufferBytes
+	transport.WriteBufferSize = ingestTransportBufferBytes
 	if transport.MaxIdleConnsPerHost < 32 {
 		transport.MaxIdleConnsPerHost = 32
 	}
 	if disableHTTP2 {
 		transport.ForceAttemptHTTP2 = false
 		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	} else {
+		transport.ForceAttemptHTTP2 = true
+		transport.TLSNextProto = nil
 	}
 	if paths.CAFile != "" || paths.CertFile != "" || paths.KeyFile != "" || paths.ServerName != "" || paths.InsecureSkipVerify {
 		tlsCfg, err := mtls.ClientConfig(mtls.ClientOptions{Files: mtls.Files{CAFile: paths.CAFile, CertFile: paths.CertFile, KeyFile: paths.KeyFile, ServerName: paths.ServerName, InsecureSkipVerify: paths.InsecureSkipVerify}})
