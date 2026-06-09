@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/terion-name/air3/internal/pending"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func TestHeaderRoundTrip(t *testing.T) {
@@ -39,7 +40,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 }
 
 func TestDecodeHeaderRejectsBadMagic(t *testing.T) {
-	data := append(prefixWithLength(2), []byte("{}")...)
+	data := frame(mustMsgpack(t, func(enc *msgpack.Encoder) { encodeHeaderMap(t, enc, validHeaderFields()...) }))
 	data[0] = 'X'
 	if _, err := DecodeHeader(bytes.NewReader(data), DefaultMaxHeaderBytes); err == nil {
 		t.Fatal("DecodeHeader() error = nil, want bad magic error")
@@ -47,7 +48,7 @@ func TestDecodeHeaderRejectsBadMagic(t *testing.T) {
 }
 
 func TestDecodeHeaderRejectsBadVersion(t *testing.T) {
-	data := append(prefixWithLength(2), []byte("{}")...)
+	data := frame(mustMsgpack(t, func(enc *msgpack.Encoder) { encodeHeaderMap(t, enc, validHeaderFields()...) }))
 	data[4] = 99
 	if _, err := DecodeHeader(bytes.NewReader(data), DefaultMaxHeaderBytes); err == nil {
 		t.Fatal("DecodeHeader() error = nil, want bad version error")
@@ -61,46 +62,97 @@ func TestDecodeHeaderRejectsOversizedHeader(t *testing.T) {
 	}
 }
 
-func TestDecodeHeaderRejectsUnknownJSONFields(t *testing.T) {
-	tests := map[string]string{
-		"top level": `{"request_id":"req","ingest_token":"tok","body_length":0,"metadata":{},"extra":"nope"}`,
-		"metadata":  `{"request_id":"req","ingest_token":"tok","body_length":0,"metadata":{"x_amz_request_id":"secret"}}`,
+func TestDecodeHeaderRejectsTruncatedHeader(t *testing.T) {
+	payload := mustMsgpack(t, func(enc *msgpack.Encoder) { encodeHeaderMap(t, enc, validHeaderFields()...) })
+	data := append(prefixWithLength(uint32(len(payload)+1)), payload...)
+	if _, err := DecodeHeader(bytes.NewReader(data), DefaultMaxHeaderBytes); err == nil {
+		t.Fatal("DecodeHeader() error = nil, want truncated header error")
 	}
-	for name, payload := range tests {
+}
+
+func TestDecodeHeaderRejectsUnknownMessagePackFields(t *testing.T) {
+	tests := map[string][]msgpackField{
+		"top level": append(validHeaderFields(), rawField("extra", "nope")),
+		"metadata": validHeaderFieldsWithMetadata(
+			rawField("x_amz_request_id", "secret"),
+		),
+	}
+	for name, fields := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := DecodeHeader(bytes.NewReader(frame(payload)), DefaultMaxHeaderBytes); err == nil {
+			if _, err := DecodeHeader(bytes.NewReader(headerFrame(t, fields...)), DefaultMaxHeaderBytes); err == nil {
 				t.Fatal("DecodeHeader() error = nil, want unknown field error")
 			}
 		})
 	}
 }
 
-func TestDecodeHeaderRejectsEmptyIdentityFields(t *testing.T) {
-	tests := map[string]string{
-		"request id":   `{"ingest_token":"tok","body_length":0,"metadata":{}}`,
-		"ingest token": `{"request_id":"req","body_length":0,"metadata":{}}`,
+func TestDecodeHeaderRejectsDuplicateMessagePackFields(t *testing.T) {
+	tests := map[string][]msgpackField{
+		"top level": append(validHeaderFields(), stringField("request_id", "req-2")),
+		"metadata": validHeaderFieldsWithMetadata(
+			stringField("content_type", "text/plain"),
+			stringField("content_type", "application/json"),
+		),
 	}
-	for name, payload := range tests {
+	for name, fields := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := DecodeHeader(bytes.NewReader(frame(payload)), DefaultMaxHeaderBytes); err == nil {
-				t.Fatal("DecodeHeader() error = nil, want validation error")
+			if _, err := DecodeHeader(bytes.NewReader(headerFrame(t, fields...)), DefaultMaxHeaderBytes); err == nil {
+				t.Fatal("DecodeHeader() error = nil, want duplicate field error")
+			}
+		})
+	}
+}
+
+func TestDecodeHeaderRejectsMissingRequiredFields(t *testing.T) {
+	tests := map[string][]msgpackField{
+		"request_id":   {stringField("ingest_token", "tok"), intField("body_length", 0), metadataField()},
+		"ingest_token": {stringField("request_id", "req"), intField("body_length", 0), metadataField()},
+		"body_length":  {stringField("request_id", "req"), stringField("ingest_token", "tok"), metadataField()},
+		"metadata":     {stringField("request_id", "req"), stringField("ingest_token", "tok"), intField("body_length", 0)},
+	}
+	for name, fields := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeHeader(bytes.NewReader(headerFrame(t, fields...)), DefaultMaxHeaderBytes); err == nil {
+				t.Fatal("DecodeHeader() error = nil, want missing field error")
 			}
 		})
 	}
 }
 
 func TestDecodeHeaderRejectsInvalidLengths(t *testing.T) {
-	tests := map[string]string{
-		"status low":       `{"request_id":"req","ingest_token":"tok","body_length":0,"metadata":{"status_code":99}}`,
-		"status high":      `{"request_id":"req","ingest_token":"tok","body_length":0,"metadata":{"status_code":600}}`,
-		"content negative": `{"request_id":"req","ingest_token":"tok","body_length":0,"metadata":{"content_length":"-1"}}`,
-		"content invalid":  `{"request_id":"req","ingest_token":"tok","body_length":0,"metadata":{"content_length":"abc"}}`,
-		"body invalid":     `{"request_id":"req","ingest_token":"tok","body_length":-2,"metadata":{}}`,
+	tests := map[string][]msgpackField{
+		"status low":       validHeaderFieldsWithMetadata(intField("status_code", 99)),
+		"status high":      validHeaderFieldsWithMetadata(intField("status_code", 600)),
+		"content negative": validHeaderFieldsWithMetadata(stringField("content_length", "-1")),
+		"content invalid":  validHeaderFieldsWithMetadata(stringField("content_length", "abc")),
+		"body invalid":     validHeaderFieldsWithBodyLength(-2),
+		"body out of range": validHeaderFieldsWithBodyLength(
+			uint64(1) << 63,
+		),
 	}
-	for name, payload := range tests {
+	for name, fields := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := DecodeHeader(bytes.NewReader(frame(payload)), DefaultMaxHeaderBytes); err == nil {
+			if _, err := DecodeHeader(bytes.NewReader(headerFrame(t, fields...)), DefaultMaxHeaderBytes); err == nil {
 				t.Fatal("DecodeHeader() error = nil, want validation error")
+			}
+		})
+	}
+}
+
+func TestDecodeHeaderRejectsInvalidValueTypes(t *testing.T) {
+	tests := map[string][]msgpackField{
+		"request id":   {rawField("request_id", 123), stringField("ingest_token", "tok"), intField("body_length", 0), metadataField()},
+		"ingest token": {stringField("request_id", "req"), rawField("ingest_token", 123), intField("body_length", 0), metadataField()},
+		"body length":  {stringField("request_id", "req"), stringField("ingest_token", "tok"), rawField("body_length", "0"), metadataField()},
+		"metadata":     {stringField("request_id", "req"), stringField("ingest_token", "tok"), intField("body_length", 0), rawField("metadata", "nope")},
+		"status code":  validHeaderFieldsWithMetadata(rawField("status_code", "200")),
+		"metadata bin": validHeaderFieldsWithMetadata(rawField("content_type", []byte("text/plain"))),
+		"metadata str": validHeaderFieldsWithMetadata(rawField("content_type", 123)),
+	}
+	for name, fields := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeHeader(bytes.NewReader(headerFrame(t, fields...)), DefaultMaxHeaderBytes); err == nil {
+				t.Fatal("DecodeHeader() error = nil, want type error")
 			}
 		})
 	}
@@ -108,21 +160,110 @@ func TestDecodeHeaderRejectsInvalidLengths(t *testing.T) {
 
 func TestDecodeHeaderRejectsUnsafeMetadata(t *testing.T) {
 	oversized := strings.Repeat("a", 8*1024+1)
-	tests := map[string]string{
-		"crlf":      `{"request_id":"req","ingest_token":"tok","body_length":0,"metadata":{"etag":"ok\r\nbad"}}`,
-		"oversized": `{"request_id":"req","ingest_token":"tok","body_length":0,"metadata":{"content_type":"` + oversized + `"}}`,
+	tests := map[string][]msgpackField{
+		"crlf":      validHeaderFieldsWithMetadata(stringField("etag", "ok\r\nbad")),
+		"oversized": validHeaderFieldsWithMetadata(stringField("content_type", oversized)),
 	}
-	for name, payload := range tests {
+	for name, fields := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := DecodeHeader(bytes.NewReader(frame(payload)), DefaultMaxHeaderBytes); err == nil {
+			if _, err := DecodeHeader(bytes.NewReader(headerFrame(t, fields...)), DefaultMaxHeaderBytes); err == nil {
 				t.Fatal("DecodeHeader() error = nil, want metadata validation error")
 			}
 		})
 	}
 }
 
-func frame(payload string) []byte {
-	return append(prefixWithLength(uint32(len(payload))), []byte(payload)...)
+type msgpackField struct {
+	key    string
+	encode func(*msgpack.Encoder) error
+}
+
+func headerFrame(t *testing.T, fields ...msgpackField) []byte {
+	t.Helper()
+	payload := mustMsgpack(t, func(enc *msgpack.Encoder) { encodeHeaderMap(t, enc, fields...) })
+	return frame(payload)
+}
+
+func mustMsgpack(t *testing.T, encode func(*msgpack.Encoder)) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	encode(msgpack.NewEncoder(&buf))
+	return buf.Bytes()
+}
+
+func encodeHeaderMap(t *testing.T, enc *msgpack.Encoder, fields ...msgpackField) {
+	t.Helper()
+	if err := enc.EncodeMapLen(len(fields)); err != nil {
+		t.Fatalf("EncodeMapLen() error = %v", err)
+	}
+	for _, field := range fields {
+		if err := enc.EncodeString(field.key); err != nil {
+			t.Fatalf("EncodeString(%q) error = %v", field.key, err)
+		}
+		if err := field.encode(enc); err != nil {
+			t.Fatalf("encode %q error = %v", field.key, err)
+		}
+	}
+}
+
+func stringField(key, value string) msgpackField {
+	return msgpackField{key: key, encode: func(enc *msgpack.Encoder) error { return enc.EncodeString(value) }}
+}
+
+func intField(key string, value int64) msgpackField {
+	return msgpackField{key: key, encode: func(enc *msgpack.Encoder) error { return enc.EncodeInt(value) }}
+}
+
+func rawField(key string, value any) msgpackField {
+	return msgpackField{key: key, encode: func(enc *msgpack.Encoder) error { return enc.Encode(value) }}
+}
+
+func metadataField(fields ...msgpackField) msgpackField {
+	return msgpackField{key: "metadata", encode: func(enc *msgpack.Encoder) error {
+		if err := enc.EncodeMapLen(len(fields)); err != nil {
+			return err
+		}
+		for _, field := range fields {
+			if err := enc.EncodeString(field.key); err != nil {
+				return err
+			}
+			if err := field.encode(enc); err != nil {
+				return err
+			}
+		}
+		return nil
+	}}
+}
+
+func validHeaderFields() []msgpackField {
+	return []msgpackField{
+		stringField("request_id", "req"),
+		stringField("ingest_token", "tok"),
+		intField("body_length", 0),
+		metadataField(),
+	}
+}
+
+func validHeaderFieldsWithMetadata(fields ...msgpackField) []msgpackField {
+	return []msgpackField{
+		stringField("request_id", "req"),
+		stringField("ingest_token", "tok"),
+		intField("body_length", 0),
+		metadataField(fields...),
+	}
+}
+
+func validHeaderFieldsWithBodyLength(value any) []msgpackField {
+	return []msgpackField{
+		stringField("request_id", "req"),
+		stringField("ingest_token", "tok"),
+		rawField("body_length", value),
+		metadataField(),
+	}
+}
+
+func frame(payload []byte) []byte {
+	return append(prefixWithLength(uint32(len(payload))), payload...)
 }
 
 func prefixWithLength(length uint32) []byte {

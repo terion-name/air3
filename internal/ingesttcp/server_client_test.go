@@ -10,7 +10,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/terion-name/air3/internal/pending"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func TestClientServerStreamsBodyAndMetadata(t *testing.T) {
@@ -123,18 +123,33 @@ func TestUnauthorizedClientCertFailsBeforeClaim(t *testing.T) {
 }
 
 func TestInvalidHeadersFailBeforeClaim(t *testing.T) {
-	tests := map[string]string{
-		"metadata crlf":      `{"request_id":"%s","ingest_token":"%s","body_length":0,"metadata":{"etag":"ok\r\nbad"}}`,
-		"invalid status":     `{"request_id":"%s","ingest_token":"%s","body_length":0,"metadata":{"status_code":99}}`,
-		"invalid content":    `{"request_id":"%s","ingest_token":"%s","body_length":0,"metadata":{"content_length":"abc"}}`,
-		"invalid body len":   `{"request_id":"%s","ingest_token":"%s","body_length":-2,"metadata":{}}`,
-		"oversized metadata": `{"request_id":"%s","ingest_token":"%s","body_length":0,"metadata":{"content_type":"` + strings.Repeat("a", 8*1024+1) + `"}}`,
+	tests := map[string]func(pending.Request) []msgpackField{
+		"metadata crlf": func(req pending.Request) []msgpackField {
+			return rawTCPHeaderFields(req, metadataField(stringField("etag", "ok\r\nbad")))
+		},
+		"invalid status": func(req pending.Request) []msgpackField {
+			return rawTCPHeaderFields(req, metadataField(intField("status_code", 99)))
+		},
+		"invalid content": func(req pending.Request) []msgpackField {
+			return rawTCPHeaderFields(req, metadataField(stringField("content_length", "abc")))
+		},
+		"invalid body len": func(req pending.Request) []msgpackField {
+			return []msgpackField{
+				stringField("request_id", req.ID),
+				stringField("ingest_token", req.IngestToken),
+				intField("body_length", -2),
+				metadataField(),
+			}
+		},
+		"oversized metadata": func(req pending.Request) []msgpackField {
+			return rawTCPHeaderFields(req, metadataField(stringField("content_type", strings.Repeat("a", 8*1024+1))))
+		},
 	}
-	for name, tmpl := range tests {
+	for name, buildFields := range tests {
 		t.Run(name, func(t *testing.T) {
 			fixture := newTCPFixture(t, "connector.local")
 			req, target := fixture.register("req-invalid", nil)
-			payload := fmt.Sprintf(tmpl, req.ID, req.IngestToken)
+			payload := mustMsgpack(t, func(enc *msgpack.Encoder) { encodeHeaderMap(t, enc, buildFields(req)...) })
 			err := fixture.sendRaw(payload, "")
 			if err == nil {
 				t.Fatal("sendRaw() error = nil, want rejection")
@@ -149,7 +164,9 @@ func TestInvalidHeadersFailBeforeClaim(t *testing.T) {
 func TestOversizedHeaderFailsBeforeClaim(t *testing.T) {
 	fixture := newTCPFixture(t, "connector.local", func(opts *ServerOptions) { opts.MaxHeaderBytes = 32 })
 	req, target := fixture.register("req-oversized", nil)
-	payload := fmt.Sprintf(`{"request_id":"%s","ingest_token":"%s","body_length":0,"metadata":{}}`, req.ID, req.IngestToken)
+	payload := mustMsgpack(t, func(enc *msgpack.Encoder) {
+		encodeHeaderMap(t, enc, rawTCPHeaderFields(req, metadataField())...)
+	})
 	if len(payload) <= 32 {
 		t.Fatalf("test payload length = %d, want > 32", len(payload))
 	}
@@ -387,7 +404,16 @@ func (f *tcpFixture) clientTLS(identity string) *tls.Config {
 	}
 }
 
-func (f *tcpFixture) sendRaw(payload, body string) error {
+func rawTCPHeaderFields(req pending.Request, metadata msgpackField) []msgpackField {
+	return []msgpackField{
+		stringField("request_id", req.ID),
+		stringField("ingest_token", req.IngestToken),
+		intField("body_length", 0),
+		metadata,
+	}
+}
+
+func (f *tcpFixture) sendRaw(payload []byte, body string) error {
 	conn, err := tls.Dial("tcp", f.address, f.clientTLS("connector.local"))
 	if err != nil {
 		return err
