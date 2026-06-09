@@ -34,6 +34,8 @@ services:
     environment:
       AIR3_EDGE_PUBLIC_ADDR: ":8443"
       AIR3_EDGE_INGEST_ADDR: ":9443"
+      AIR3_INGEST_TRANSPORT: "${AIR3_INGEST_TRANSPORT:-http}"
+      AIR3_EDGE_INGEST_TCP_ADDR: "${AIR3_EDGE_INGEST_TCP_ADDR:-:9444}"
       AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
       AIR3_ALLOWED_BUCKETS: "demo"
       AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES: "connector-ingest-client"
@@ -71,6 +73,8 @@ services:
       - ./certs/generated:/certs:ro
     environment:
       AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
+      AIR3_INGEST_TRANSPORT: "${AIR3_INGEST_TRANSPORT:-http}"
+      AIR3_INGEST_TCP_ADDR: "${AIR3_INGEST_TCP_ADDR:-edge-gateway:9444}"
       AIR3_ALLOWED_BUCKETS: "demo"
       AIR3_PENDING_TTL: "5s"
       AIR3_STREAM_TIMEOUT: "30s"
