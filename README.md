@@ -2,11 +2,13 @@
 
 [![npm](https://img.shields.io/npm/v/@terion/air3-edgesign.svg)](https://www.npmjs.com/package/@terion/air3-edgesign)
 
-**air3** is a secure file gateway that lets you serve files from a strictly private S3-compatible storage to the public internet—without ever exposing your S3 credentials to public-facing servers or opening any inbound firewall ports to your private network.
+**air3** is a secure file gateway that lets you serve files from a strictly private S3-compatible storage to the public internet—or across segmented internal networks—without ever exposing your S3 credentials to edge services or opening any inbound firewall ports to your private storage zone.
 
-It acts as a bridge between the wild public internet and your highly secure private network, relying on a NATS message broker to coordinate transfers and strict zone separation to keep your data safe.
+It acts as a secure bridge across network boundaries (like DMZs or zero-trust environments), relying on a NATS message broker to coordinate transfers and strict zone separation to keep your data safe.
 
-## The Usecase: Securely Serving Private Files
+## Core Use Cases
+
+### 1. Securely Serving Private Files to the Public Internet
 
 Imagine you have sensitive S3 storage hosted deep within your private infrastructure. You need to let specific public users download certain files via signed URLs.
 
@@ -20,6 +22,12 @@ Normally, you'd have to:
 3. A **NATS Broker** acts as a middleman (control plane) passing messages between them.
 
 When a public user requests a file, the Edge Gateway asks the Private Connector (via NATS) to fetch it. The Connector grabs the file from S3 and securely streams it back out to the Edge, which directly delivers it to the user.
+
+### 2. Zero-Trust Internal File Access (Service Mesh / Kubernetes)
+
+air3 isn't just for public-facing traffic. It is equally powerful as an internal bridge in strict zero-trust environments.
+
+If you have isolated Kubernetes clusters, locked-down microservices, or a heavily segmented service mesh, you can deploy the Edge Gateway in the less-trusted zones and the Private Connector in the highly-trusted data zone. This allows your internal services to securely stream objects using short-lived signed URLs without distributing raw S3 credentials to every microservice or punching holes in your storage backbone's network policies.
 
 ## Documentation
 
