@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -61,6 +62,108 @@ type connector struct {
 	now     func() time.Time
 }
 
+var errTicketWorkerPoolClosed = errors.New("ticket worker pool is closed")
+
+type ticketJob struct {
+	ctx    context.Context
+	ticket tickets.Ticket
+}
+
+type ticketWorkerPool struct {
+	jobs    chan ticketJob
+	closing chan struct{}
+	done    chan struct{}
+
+	handle  natsclient.TicketHandler
+	onError natsclient.ErrorHandler
+
+	mu        sync.Mutex
+	closed    bool
+	closeOnce sync.Once
+	enqueueWG sync.WaitGroup
+	workerWG  sync.WaitGroup
+}
+
+func newTicketWorkerPool(workers int, handle natsclient.TicketHandler, onError natsclient.ErrorHandler) (*ticketWorkerPool, error) {
+	if workers < 1 {
+		return nil, fmt.Errorf("ticket worker pool size must be at least 1: %d", workers)
+	}
+	if handle == nil {
+		return nil, errors.New("ticket worker pool handler is required")
+	}
+
+	pool := &ticketWorkerPool{
+		jobs:    make(chan ticketJob, workers),
+		closing: make(chan struct{}),
+		done:    make(chan struct{}),
+		handle:  handle,
+		onError: onError,
+	}
+	pool.workerWG.Add(workers)
+	for i := 0; i < workers; i++ {
+		go pool.work()
+	}
+	return pool, nil
+}
+
+func (p *ticketWorkerPool) Handle(ctx context.Context, ticket tickets.Ticket) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errTicketWorkerPoolClosed
+	}
+	p.enqueueWG.Add(1)
+	p.mu.Unlock()
+	defer p.enqueueWG.Done()
+
+	select {
+	case p.jobs <- ticketJob{ctx: ctx, ticket: ticket}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.closing:
+		return errTicketWorkerPoolClosed
+	}
+}
+
+func (p *ticketWorkerPool) CloseAndWait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		close(p.closing)
+		p.mu.Unlock()
+
+		go func() {
+			p.enqueueWG.Wait()
+			close(p.jobs)
+			p.workerWG.Wait()
+			close(p.done)
+		}()
+	})
+
+	select {
+	case <-p.done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("close ticket worker pool: %w", ctx.Err())
+	}
+}
+
+func (p *ticketWorkerPool) work() {
+	defer p.workerWG.Done()
+	for job := range p.jobs {
+		if err := p.handle(job.ctx, job.ticket); err != nil && p.onError != nil {
+			p.onError(fmt.Errorf("handle ticket %s: %w", job.ticket.RequestID, err))
+		}
+	}
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if err := run(context.Background(), logger); err != nil {
@@ -100,16 +203,27 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	defer nats.Close()
 
-	sub, err := nats.QueueSubscribeTickets(ctx, worker.handleTicket, func(err error) {
+	onError := func(err error) {
 		logger.Warn("ticket handling failed", "error", safeLogError(err))
-	})
+	}
+	ticketPool, err := newTicketWorkerPool(cfg.TicketWorkers, worker.handleTicket, onError)
 	if err != nil {
+		return err
+	}
+	sub, err := nats.QueueSubscribeTickets(ctx, ticketPool.Handle, onError)
+	if err != nil {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelShutdown()
+		_ = ticketPool.CloseAndWait(shutdownCtx)
 		return err
 	}
 	<-ctx.Done()
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelDrain()
 	_ = sub.Drain(drainCtx)
+	if err := ticketPool.CloseAndWait(drainCtx); err != nil {
+		logger.Warn("ticket worker pool drain failed", "error", safeLogError(err))
+	}
 	return nats.Drain(drainCtx)
 }
 

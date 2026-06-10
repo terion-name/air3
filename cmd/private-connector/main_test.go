@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,6 +119,7 @@ func connectorConfig() config.ConnectorConfig {
 	return config.ConnectorConfig{
 		AllowedBuckets: []string{"demo-bucket"},
 		IngestPoolSize: 32,
+		TicketWorkers:  1,
 		S3: config.S3Config{
 			AllowedBuckets:  []string{"demo-bucket"},
 			AccessKeyID:     "access",
@@ -127,6 +130,232 @@ func connectorConfig() config.ConnectorConfig {
 
 func validTicket(url, method string) tickets.Ticket {
 	return tickets.Ticket{Version: tickets.Version, RequestID: "req-1", Bucket: "demo-bucket", Key: "objects/file.txt", Method: method, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli(), IngestURL: url, IngestToken: "ingest-token"}
+}
+
+func mustTicketWorkerPool(t *testing.T, workers int, handle func(context.Context, tickets.Ticket) error, onError func(error)) *ticketWorkerPool {
+	t.Helper()
+	pool, err := newTicketWorkerPool(workers, handle, onError)
+	if err != nil {
+		t.Fatalf("newTicketWorkerPool() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = pool.CloseAndWait(ctx)
+	})
+	return pool
+}
+
+func TestTicketWorkerPoolSerialWithOneWorker(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseAll)
+
+	var mu sync.Mutex
+	var order []string
+	pool := mustTicketWorkerPool(t, 1, func(ctx context.Context, ticket tickets.Ticket) error {
+		started <- ticket.RequestID
+		<-release
+		mu.Lock()
+		order = append(order, ticket.RequestID)
+		mu.Unlock()
+		return nil
+	}, nil)
+	if cap(pool.jobs) != 1 {
+		t.Fatalf("ticket worker pool job capacity = %d, want 1", cap(pool.jobs))
+	}
+
+	ticketOne := validTicket("https://edge.internal/_ingest/req-1", http.MethodGet)
+	ticketOne.RequestID = "req-1"
+	ticketTwo := validTicket("https://edge.internal/_ingest/req-2", http.MethodGet)
+	ticketTwo.RequestID = "req-2"
+	if err := pool.Handle(context.Background(), ticketOne); err != nil {
+		t.Fatalf("Handle(ticketOne) error = %v", err)
+	}
+	if got := <-started; got != "req-1" {
+		t.Fatalf("first started ticket = %q, want req-1", got)
+	}
+	if err := pool.Handle(context.Background(), ticketTwo); err != nil {
+		t.Fatalf("Handle(ticketTwo) error = %v", err)
+	}
+	select {
+	case got := <-started:
+		t.Fatalf("second ticket started before first completed: %q", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	releaseAll()
+	if err := pool.CloseAndWait(context.Background()); err != nil {
+		t.Fatalf("CloseAndWait() error = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "req-1" || order[1] != "req-2" {
+		t.Fatalf("completion order = %#v, want serial req-1 then req-2", order)
+	}
+}
+
+func TestTicketWorkerPoolBoundsParallelWorkers(t *testing.T) {
+	const workers = 3
+	started := make(chan struct{}, workers)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseAll)
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var parallelObserved atomic.Bool
+	pool := mustTicketWorkerPool(t, workers, func(ctx context.Context, ticket tickets.Ticket) error {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			max := maxActive.Load()
+			if current <= max || maxActive.CompareAndSwap(max, current) {
+				break
+			}
+		}
+		if current > 1 {
+			parallelObserved.Store(true)
+		}
+		started <- struct{}{}
+		<-release
+		return nil
+	}, nil)
+	if cap(pool.jobs) != workers {
+		t.Fatalf("ticket worker pool job capacity = %d, want %d", cap(pool.jobs), workers)
+	}
+
+	requestIDs := []string{"req-1", "req-2", "req-3"}
+	for i, requestID := range requestIDs {
+		ticket := validTicket("https://edge.internal/_ingest/req", http.MethodGet)
+		ticket.RequestID = requestID
+		if err := pool.Handle(context.Background(), ticket); err != nil {
+			t.Fatalf("Handle(%d) error = %v", i, err)
+		}
+	}
+	for i := 0; i < workers; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for ticket %d to start", i)
+		}
+	}
+	if got := maxActive.Load(); got > workers {
+		t.Fatalf("max active workers = %d, want <= %d", got, workers)
+	}
+	if !parallelObserved.Load() {
+		t.Fatal("parallelism was not observed with multiple workers")
+	}
+
+	releaseAll()
+	if err := pool.CloseAndWait(context.Background()); err != nil {
+		t.Fatalf("CloseAndWait() error = %v", err)
+	}
+}
+
+func TestTicketWorkerPoolBackpressureHonorsContextCancellation(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseAll)
+
+	pool := mustTicketWorkerPool(t, 1, func(ctx context.Context, ticket tickets.Ticket) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	}, nil)
+	ticketOne := validTicket("https://edge.internal/_ingest/req-1", http.MethodGet)
+	ticketOne.RequestID = "req-1"
+	ticketTwo := validTicket("https://edge.internal/_ingest/req-2", http.MethodGet)
+	ticketTwo.RequestID = "req-2"
+	ticketThree := validTicket("https://edge.internal/_ingest/req-3", http.MethodGet)
+	ticketThree.RequestID = "req-3"
+	if err := pool.Handle(context.Background(), ticketOne); err != nil {
+		t.Fatalf("Handle(ticketOne) error = %v", err)
+	}
+	<-started
+	if err := pool.Handle(context.Background(), ticketTwo); err != nil {
+		t.Fatalf("Handle(ticketTwo) error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- pool.Handle(ctx, ticketThree) }()
+	select {
+	case err := <-errCh:
+		t.Fatalf("Handle(ticketThree) returned before queue space was available: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Handle(ticketThree) error = %v, want context canceled", err)
+	}
+
+	releaseAll()
+	if err := pool.CloseAndWait(context.Background()); err != nil {
+		t.Fatalf("CloseAndWait() error = %v", err)
+	}
+}
+
+func TestTicketWorkerPoolReportsAsyncHandlerErrors(t *testing.T) {
+	sentinel := errors.New("sentinel failure")
+	reported := make(chan error, 1)
+	pool := mustTicketWorkerPool(t, 1, func(ctx context.Context, ticket tickets.Ticket) error {
+		return sentinel
+	}, func(err error) { reported <- err })
+	ticket := validTicket("https://edge.internal/_ingest/req-42", http.MethodGet)
+	ticket.RequestID = "req-42"
+
+	if err := pool.Handle(context.Background(), ticket); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	select {
+	case err := <-reported:
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("reported error = %v, want sentinel wrapping", err)
+		}
+		if !strings.Contains(err.Error(), "handle ticket req-42") {
+			t.Fatalf("reported error = %v, want request ID context", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for async handler error")
+	}
+	if err := pool.CloseAndWait(context.Background()); err != nil {
+		t.Fatalf("CloseAndWait() error = %v", err)
+	}
+}
+
+func TestTicketWorkerPoolCloseAndWaitReturnsContextError(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseAll)
+
+	pool := mustTicketWorkerPool(t, 1, func(ctx context.Context, ticket tickets.Ticket) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	}, nil)
+	ticket := validTicket("https://edge.internal/_ingest/req-1", http.MethodGet)
+	if err := pool.Handle(context.Background(), ticket); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pool.CloseAndWait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CloseAndWait(canceled) error = %v, want context canceled", err)
+	}
+	releaseAll()
+	if err := pool.CloseAndWait(context.Background()); err != nil {
+		t.Fatalf("CloseAndWait(background) error = %v", err)
+	}
 }
 
 func TestConnectorSafeLogErrorRedactsDetails(t *testing.T) {

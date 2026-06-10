@@ -80,6 +80,9 @@ func TestLoadConnectorDefaultsIngestDisableHTTP2True(t *testing.T) {
 	if cfg.IngestPoolSize != 32 {
 		t.Fatalf("IngestPoolSize = %d, want 32", cfg.IngestPoolSize)
 	}
+	if cfg.TicketWorkers != 1 {
+		t.Fatalf("TicketWorkers = %d, want 1", cfg.TicketWorkers)
+	}
 }
 
 func TestLoadConnectorParsesIngestPoolSize(t *testing.T) {
@@ -114,6 +117,47 @@ func TestLoadConnectorRejectsInvalidIngestPoolSize(t *testing.T) {
 				"AIR3_S3_ACCESS_KEY_ID":     "access",
 				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
 				"AIR3_INGEST_POOL_SIZE":     tc.value,
+			}
+			_, err := LoadConnector(testOptions(env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadConnector() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadConnectorParsesTicketWorkers(t *testing.T) {
+	env := map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":     "access",
+		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+		"AIR3_CONNECTOR_WORKERS":    "1024",
+	}
+	cfg, err := LoadConnector(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadConnector() error = %v", err)
+	}
+	if cfg.TicketWorkers != 1024 {
+		t.Fatalf("TicketWorkers = %d, want 1024", cfg.TicketWorkers)
+	}
+}
+
+func TestLoadConnectorRejectsInvalidTicketWorkers(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"non-number", "many", "AIR3_CONNECTOR_WORKERS must be an integer"},
+		{"zero", "0", "AIR3_CONNECTOR_WORKERS must be between 1 and 4096"},
+		{"negative", "-1", "AIR3_CONNECTOR_WORKERS must be between 1 and 4096"},
+		{"above maximum", "4097", "AIR3_CONNECTOR_WORKERS must be between 1 and 4096"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"AIR3_S3_ACCESS_KEY_ID":     "access",
+				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+				"AIR3_CONNECTOR_WORKERS":    tc.value,
 			}
 			_, err := LoadConnector(testOptions(env, nil))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {

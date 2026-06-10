@@ -22,6 +22,8 @@ type IngestTransport string
 const (
 	defaultConnectorIngestPoolSize = 32
 	maxConnectorIngestPoolSize     = 4096
+	defaultConnectorTicketWorkers  = 1
+	maxConnectorTicketWorkers      = 4096
 
 	IngestTransportHTTP  IngestTransport = "http"
 	IngestTransportHTTP1 IngestTransport = "http1"
@@ -81,6 +83,7 @@ type ConnectorConfig struct {
 	IngestTCPAddr      string
 	IngestQUICAddr     string
 	IngestPoolSize     int
+	TicketWorkers      int
 	AllowedBuckets     []string
 	NATS               NATSConfig
 	S3                 S3Config
@@ -205,6 +208,10 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 	if err != nil {
 		return ConnectorConfig{}, err
 	}
+	ticketWorkers, err := env.intInRange("AIR3_CONNECTOR_WORKERS", defaultConnectorTicketWorkers, 1, maxConnectorTicketWorkers)
+	if err != nil {
+		return ConnectorConfig{}, err
+	}
 	cfg := ConnectorConfig{
 		IngestURL:          env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
 		IngestDisableHTTP2: ingestDisableHTTP2,
@@ -212,6 +219,7 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 		IngestTCPAddr:      env.get("AIR3_INGEST_TCP_ADDR", ""),
 		IngestQUICAddr:     env.get("AIR3_INGEST_QUIC_ADDR", ""),
 		IngestPoolSize:     ingestPoolSize,
+		TicketWorkers:      ticketWorkers,
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
