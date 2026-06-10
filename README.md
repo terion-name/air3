@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/@terion/air3-edgesign.svg)](https://www.npmjs.com/package/@terion/air3-edgesign)
 
-**air3** is a secure file gateway that lets you serve files from a strictly private S3-compatible storage to the public internet—or across segmented internal networks—without ever exposing your S3 credentials to edge services or opening any inbound firewall ports to your private storage zone.
+**air3** is a secure file gateway that lets you serve files from a strictly private S3-compatible storage to the public internet — or across segmented internal networks — without ever exposing your S3 credentials and server to edge services or opening any inbound firewall ports to your private storage zone. S3 backend can be hidden behind firewall, NAT or even VPN, with no inbound whatsoever, and still can serve public clients without them and edge applications even know of it's existance.
 
 It acts as a secure bridge across network boundaries (like DMZs or zero-trust environments), relying on a NATS message broker to coordinate transfers and strict zone separation to keep your data safe.
 
