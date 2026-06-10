@@ -141,6 +141,7 @@ The results below show average Time To First Byte (TTFB in ms) / Requests Per Se
 3. **For high-concurrency small files:** **`quic`** and **`http2`** handle many small requests very efficiently.
 
 #### Single Node (1 Gateway, 1 Connector)
+*Test environment resource limits:* Caddy `2 CPU`, Edge Gateway `2 CPU`, Private Connector `2 CPU` (1 instance).
 
 *Sequential Requests*
 | Target | Small (100KB) | Medium (5MB) | Big (100MB) | Mixed |
@@ -165,6 +166,7 @@ The results below show average Time To First Byte (TTFB in ms) / Requests Per Se
 | **Air3 (http3)** | 29.6 / 58.1 / 6 | 42.3 / 26.0 / 130 | 47.4 / 8.6 / 391 | 24.7 / 21.9 / 348 |
 
 #### Scaled (1 Gateway, 3 Connectors)
+*Test environment resource limits:* Caddy `4 CPU`, Edge Gateway `4 CPU`, Private Connector `2 CPU` (3 instances, 6 CPU total).
 
 *Sequential Requests*
 | Target | Small (100KB) | Medium (5MB) | Big (100MB) | Mixed |
