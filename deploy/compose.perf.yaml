@@ -6,6 +6,7 @@ services:
     cpus: 1.0
     environment:
       AIR3_INGEST_POOL_SIZE: "${AIR3_INGEST_POOL_SIZE:-1024}"
+      AIR3_CONNECTOR_WORKERS: "${AIR3_CONNECTOR_WORKERS:-1024}"
 
   versitygw:
     networks:

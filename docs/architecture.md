@@ -88,7 +88,8 @@ flowchart TB
 
 ## Operational behavior
 
-- NATS exclusively carries short-lived fetch tickets and control messages. `AIR3_INGEST_URL` remains the HTTPS ingest fallback/ticket URL in all modes and is used directly by the HTTP-family transports (`http`, `http1`, `http2`, `http3`) with the existing headers and body.
+- NATS exclusively carries short-lived fetch tickets and control messages. Queue-group semantics are unchanged: a ticket is delivered to one connector replica, and each connector uses a bounded local worker pool (`AIR3_CONNECTOR_WORKERS`) for concurrent ticket handling.
+- `AIR3_INGEST_URL` remains the HTTPS ingest fallback/ticket URL in all modes and is used directly by the HTTP-family transports (`http`, `http1`, `http2`, `http3`) with the existing headers and body.
 - Custom stream transports (`tcp`, `smux`, `quic`) use the shared MessagePack metadata frame, raw object body, and ack semantics. `smux` multiplexes those streams over persistent mTLS TCP, with one smux stream per object; direct `quic` uses `AIR3_EDGE_INGEST_QUIC_ADDR`/`AIR3_INGEST_QUIC_ADDR`.
 - The Edge Gateway holds the pending client response until the Connector finishes fetching the object.
 - If any internal piece (Connector, NATS, S3) goes down, the Edge cleanly returns a standard HTTP error to the client (`503 Service Unavailable` or `504 Gateway Timeout`).
