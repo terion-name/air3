@@ -29,6 +29,7 @@ The Private Connector is your secure worker. It has **no public inbound listener
 | `AIR3_INGEST_TRANSPORT` | `http` | Connector→edge ingest transport. Accepted values are `http`, `http1`, `http2`, `http3`, `tcp`, `smux`, and `quic`. Use explicit `http1`, `http2`, `http3`, `tcp`, `smux`, or `quic` for new runs; legacy `http` remains the default for compatibility and uses `AIR3_INGEST_DISABLE_HTTP2` to choose the HTTP version. |
 | `AIR3_INGEST_TCP_ADDR` | unset (Compose: `edge-gateway:9444`) | Connector TCP/smux dial address for the Edge TCP/smux ingest listener. Required only when `AIR3_INGEST_TRANSPORT=tcp` or `smux`. `smux` reuses this TCP dial address. |
 | `AIR3_INGEST_QUIC_ADDR` | unset (Compose: `edge-gateway:9445`) | Connector QUIC dial address for the Edge QUIC ingest listener. Required only when `AIR3_INGEST_TRANSPORT=quic`. |
+| `AIR3_INGEST_POOL_SIZE` | `32` (perf: `1024`) | Connector-side reusable ingest pool cap for HTTP-family, smux, QUIC, and HTTP/3 transports. Raw TCP remains one connection per object. Must be `1`-`4096`. |
 | `AIR3_ALLOWED_BUCKETS` | `demo` | Defense-in-depth: the Connector also enforces this allowlist before attempting to reach S3. |
 | `AIR3_INGEST_DISABLE_HTTP2` | `false` | Legacy compatibility knob used only when `AIR3_INGEST_TRANSPORT=http`: `true` forces HTTP/1.1 and `false` enables HTTP/2. Explicit `AIR3_INGEST_TRANSPORT=http1`, `http2`, or `http3` ignores this setting. |
 
@@ -98,7 +99,7 @@ We use standardized variable suffixes for configuring TLS and mutual TLS (mTLS) 
 | `AIR3_STREAM_TIMEOUT` | `5m` | Maximum total time allowed for the entire file stream transfer. |
 | `AIR3_STREAM_COPY_BUFFER_BYTES` | `262144` bytes | Size of each per-stream `io.CopyBuffer` buffer on edge streaming paths. Units are bytes; minimum `32768` bytes, maximum `1048576` bytes. This bounds streaming copy buffers without introducing body buffering. |
 
-*Runtime tuning note:* `AIR3_STREAM_COPY_BUFFER_BYTES`, `AIR3_INGEST_DISABLE_HTTP2`, and `AIR3_INGEST_TRANSPORT` only tune streaming/transport behavior. They do not change authentication, authorization, or other security behavior, and they do not introduce request or response body buffering. `AIR3_INGEST_DISABLE_HTTP2` is legacy/compatibility-only for `AIR3_INGEST_TRANSPORT=http`; explicit `http1`, `http2`, and `http3` ignore it.
+*Runtime tuning note:* `AIR3_STREAM_COPY_BUFFER_BYTES`, `AIR3_INGEST_DISABLE_HTTP2`, `AIR3_INGEST_TRANSPORT`, and `AIR3_INGEST_POOL_SIZE` only tune streaming/transport behavior. They do not change authentication, authorization, or other security behavior, and they do not introduce request or response body buffering. `AIR3_INGEST_DISABLE_HTTP2` is legacy/compatibility-only for `AIR3_INGEST_TRANSPORT=http`; explicit `http1`, `http2`, and `http3` ignore it.
 
 ### Ingest transport variants
 
@@ -111,6 +112,8 @@ Accepted `AIR3_INGEST_TRANSPORT` values are:
 - `tcp`: use experimental mTLS TCP stream ingest with the shared MessagePack metadata frame, raw object body, and ack semantics.
 - `smux`: use the shared MessagePack-framed ingest stream over persistent mTLS TCP, one smux stream per object. It reuses `AIR3_EDGE_INGEST_TCP_ADDR` and `AIR3_INGEST_TCP_ADDR`.
 - `quic`: use experimental custom QUIC ingest with the shared MessagePack metadata frame, raw object body, and ack semantics. It uses `AIR3_EDGE_INGEST_QUIC_ADDR` and `AIR3_INGEST_QUIC_ADDR`.
+
+`AIR3_INGEST_POOL_SIZE` caps reusable connector-side connection, session, or client pools for HTTP-family, smux, QUIC, and HTTP/3 ingest transports. Raw TCP remains one connection per object. The normal default is `32`; the perf Compose harness defaults to `1024` for high-concurrency runs.
 
 For new benchmarking runs, prefer explicit transport values so result filenames and CSV labels show the intended connector ingest behavior:
 

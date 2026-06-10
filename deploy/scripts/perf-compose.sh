@@ -22,6 +22,7 @@ INGEST_TCP_LISTEN_ADDR=${AIR3_EDGE_INGEST_TCP_ADDR:-:9444}
 INGEST_TCP_DIAL_ADDR=${AIR3_INGEST_TCP_ADDR:-edge-gateway:9444}
 INGEST_QUIC_LISTEN_ADDR=${AIR3_EDGE_INGEST_QUIC_ADDR:-:9445}
 INGEST_QUIC_DIAL_ADDR=${AIR3_INGEST_QUIC_ADDR:-edge-gateway:9445}
+INGEST_POOL_SIZE=${AIR3_INGEST_POOL_SIZE:-1024}
 BUCKET=${AIR3_PERF_BUCKET:-demo}
 BASE_URL=${AIR3_PERF_BASE_URL:-https://localhost:8443}
 SECRET=${AIR3_SIGNING_SECRET:-dev-signing-secret-change-me}
@@ -70,6 +71,7 @@ Runs the air3 Docker Compose performance benchmark. Configuration is via env var
   AIR3_INGEST_TCP_ADDR           connector TCP/smux ingest dial address (Compose default: $INGEST_TCP_DIAL_ADDR)
   AIR3_EDGE_INGEST_QUIC_ADDR     edge QUIC ingest listener (Compose default: $INGEST_QUIC_LISTEN_ADDR)
   AIR3_INGEST_QUIC_ADDR          connector QUIC ingest dial address (Compose default: $INGEST_QUIC_DIAL_ADDR)
+  AIR3_INGEST_POOL_SIZE          reusable connector ingest pool cap (perf default: $INGEST_POOL_SIZE)
 
 Benchmark paths:
   direct_s3       anonymous direct VersityGW S3 read
@@ -88,7 +90,9 @@ variables.
 The per-request, parallel, and summary CSVs include an ingest_transport column so
 explicit HTTP variants, legacy HTTP, and experimental TCP/smux/quic/http3 ingest
 runs can be compared safely. AIR3_INGEST_URL remains the HTTPS ticket/fallback
-ingest URL and is used directly by the HTTP-family transports.
+ingest URL and is used directly by the HTTP-family transports. AIR3_INGEST_POOL_SIZE
+controls reusable HTTP-family, smux, QUIC, and HTTP/3 connection/session/client
+pools; raw TCP remains one connection per object.
 
 Outputs:
   per-request CSV: $RESULTS_CSV
@@ -557,6 +561,7 @@ require_cmd awk
 require_cmd xargs
 require_positive_int AIR3_PERF_ITERATIONS "$ITERATIONS"
 require_positive_int AIR3_PERF_CONNECTORS "$CONNECTORS"
+require_positive_int AIR3_INGEST_POOL_SIZE "$INGEST_POOL_SIZE"
 require_non_negative_int AIR3_PERF_PARALLELISM "$PARALLELISM"
 validate_public_read_mode
 validate_ingest_transport

@@ -20,6 +20,9 @@ type Options struct {
 type IngestTransport string
 
 const (
+	defaultConnectorIngestPoolSize = 32
+	maxConnectorIngestPoolSize     = 4096
+
 	IngestTransportHTTP  IngestTransport = "http"
 	IngestTransportHTTP1 IngestTransport = "http1"
 	IngestTransportHTTP2 IngestTransport = "http2"
@@ -77,6 +80,7 @@ type ConnectorConfig struct {
 	IngestTransport    IngestTransport
 	IngestTCPAddr      string
 	IngestQUICAddr     string
+	IngestPoolSize     int
 	AllowedBuckets     []string
 	NATS               NATSConfig
 	S3                 S3Config
@@ -134,7 +138,7 @@ func LoadConnectorFromEnv() (ConnectorConfig, error) {
 
 func LoadEdge(opts Options) (EdgeConfig, error) {
 	env := normalizedOptions(opts)
-	streamCopyBufferBytes, err := env.intBytes("AIR3_STREAM_COPY_BUFFER_BYTES", 262144, 32768, 1048576)
+	streamCopyBufferBytes, err := env.intInRange("AIR3_STREAM_COPY_BUFFER_BYTES", 262144, 32768, 1048576)
 	if err != nil {
 		return EdgeConfig{}, err
 	}
@@ -197,12 +201,17 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 	if err != nil {
 		return ConnectorConfig{}, err
 	}
+	ingestPoolSize, err := env.intInRange("AIR3_INGEST_POOL_SIZE", defaultConnectorIngestPoolSize, 1, maxConnectorIngestPoolSize)
+	if err != nil {
+		return ConnectorConfig{}, err
+	}
 	cfg := ConnectorConfig{
 		IngestURL:          env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
 		IngestDisableHTTP2: ingestDisableHTTP2,
 		IngestTransport:    ingestTransport,
 		IngestTCPAddr:      env.get("AIR3_INGEST_TCP_ADDR", ""),
 		IngestQUICAddr:     env.get("AIR3_INGEST_QUIC_ADDR", ""),
+		IngestPoolSize:     ingestPoolSize,
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
@@ -412,17 +421,17 @@ func (e envReader) duration(name string, fallback time.Duration) (time.Duration,
 	return d, nil
 }
 
-func (e envReader) intBytes(name string, fallback, min, max int) (int, error) {
+func (e envReader) intInRange(name string, fallback, min, max int) (int, error) {
 	text := e.get(name, "")
 	if text == "" {
 		return fallback, nil
 	}
 	value, err := strconv.Atoi(text)
 	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer byte count: %w", name, err)
+		return 0, fmt.Errorf("%s must be an integer: %w", name, err)
 	}
 	if value < min || value > max {
-		return 0, fmt.Errorf("%s must be between %d and %d bytes", name, min, max)
+		return 0, fmt.Errorf("%s must be between %d and %d", name, min, max)
 	}
 	return value, nil
 }

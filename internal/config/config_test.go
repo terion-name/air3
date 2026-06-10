@@ -77,6 +77,50 @@ func TestLoadConnectorDefaultsIngestDisableHTTP2True(t *testing.T) {
 	if cfg.IngestTransport != IngestTransportHTTP || cfg.IngestTCPAddr != "" || cfg.IngestQUICAddr != "" {
 		t.Fatalf("ingest transport defaults = %q/%q/%q, want http with no direct address", cfg.IngestTransport, cfg.IngestTCPAddr, cfg.IngestQUICAddr)
 	}
+	if cfg.IngestPoolSize != 32 {
+		t.Fatalf("IngestPoolSize = %d, want 32", cfg.IngestPoolSize)
+	}
+}
+
+func TestLoadConnectorParsesIngestPoolSize(t *testing.T) {
+	env := map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":     "access",
+		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+		"AIR3_INGEST_POOL_SIZE":     "1024",
+	}
+	cfg, err := LoadConnector(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadConnector() error = %v", err)
+	}
+	if cfg.IngestPoolSize != 1024 {
+		t.Fatalf("IngestPoolSize = %d, want 1024", cfg.IngestPoolSize)
+	}
+}
+
+func TestLoadConnectorRejectsInvalidIngestPoolSize(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"non-number", "many", "AIR3_INGEST_POOL_SIZE must be an integer"},
+		{"zero", "0", "AIR3_INGEST_POOL_SIZE must be between 1 and 4096"},
+		{"negative", "-1", "AIR3_INGEST_POOL_SIZE must be between 1 and 4096"},
+		{"above maximum", "4097", "AIR3_INGEST_POOL_SIZE must be between 1 and 4096"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"AIR3_S3_ACCESS_KEY_ID":     "access",
+				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+				"AIR3_INGEST_POOL_SIZE":     tc.value,
+			}
+			_, err := LoadConnector(testOptions(env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadConnector() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
 }
 
 func TestLoadConnectorCanOptInToIngestHTTP2(t *testing.T) {
@@ -427,11 +471,11 @@ func TestLoadEdgeRejectsInvalidStreamCopyBufferBytes(t *testing.T) {
 		value string
 		want  string
 	}{
-		{"non-number", "many", "AIR3_STREAM_COPY_BUFFER_BYTES must be an integer byte count"},
-		{"zero", "0", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576 bytes"},
-		{"negative", "-1", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576 bytes"},
-		{"below minimum", "32767", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576 bytes"},
-		{"above maximum", "1048577", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576 bytes"},
+		{"non-number", "many", "AIR3_STREAM_COPY_BUFFER_BYTES must be an integer"},
+		{"zero", "0", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576"},
+		{"negative", "-1", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576"},
+		{"below minimum", "32767", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576"},
+		{"above maximum", "1048577", "AIR3_STREAM_COPY_BUFFER_BYTES must be between 32768 and 1048576"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

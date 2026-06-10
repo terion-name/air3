@@ -4,6 +4,8 @@ services:
 
   private-connector:
     cpus: 1.0
+    environment:
+      AIR3_INGEST_POOL_SIZE: "${AIR3_INGEST_POOL_SIZE:-1024}"
 
   versitygw:
     networks:
