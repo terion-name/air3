@@ -47,7 +47,7 @@ sequenceDiagram
     Connector->>NATS: Pull ticket from queue
     Connector->>S3: Fetch object bytes or metadata
     S3-->>Connector: Return object stream or status
-    Connector->>Edge: Ingest stream (mTLS + token; HTTP default, TCP/smux/QUIC/HTTP/3 opt-in)
+    Connector->>Edge: Ingest stream (mTLS + token, HTTP default, TCP/smux/QUIC/HTTP/3 opt-in)
     Edge-->>Client: Forward stream to held response
     Edge->>Edge: Complete pending request
 ```
