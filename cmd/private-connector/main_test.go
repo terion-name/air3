@@ -58,8 +58,10 @@ func (s *fakeIngestSender) Send(ctx context.Context, ticket tickets.Ticket, meta
 }
 
 type fakeQuicSender struct {
-	requests []ingestquic.ClientRequest
-	err      error
+	requests   []ingestquic.ClientRequest
+	err        error
+	closeErr   error
+	closeCount int
 }
 
 func (s *fakeQuicSender) Send(ctx context.Context, req ingestquic.ClientRequest) error {
@@ -67,9 +69,16 @@ func (s *fakeQuicSender) Send(ctx context.Context, req ingestquic.ClientRequest)
 	return s.err
 }
 
+func (s *fakeQuicSender) Close() error {
+	s.closeCount++
+	return s.closeErr
+}
+
 type fakeSmuxSender struct {
-	requests []ingestsmux.ClientRequest
-	err      error
+	requests   []ingestsmux.ClientRequest
+	err        error
+	closeErr   error
+	closeCount int
 }
 
 func (s *fakeSmuxSender) Send(ctx context.Context, req ingestsmux.ClientRequest) error {
@@ -77,9 +86,37 @@ func (s *fakeSmuxSender) Send(ctx context.Context, req ingestsmux.ClientRequest)
 	return s.err
 }
 
+func (s *fakeSmuxSender) Close() error {
+	s.closeCount++
+	return s.closeErr
+}
+
+type fakeHTTPTransport struct {
+	requests   int
+	closed     int
+	idleClosed int
+	closeErr   error
+}
+
+func (t *fakeHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.requests++
+	_, _ = io.Copy(io.Discard, req.Body)
+	return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+}
+
+func (t *fakeHTTPTransport) Close() error {
+	t.closed++
+	return t.closeErr
+}
+
+func (t *fakeHTTPTransport) CloseIdleConnections() {
+	t.idleClosed++
+}
+
 func connectorConfig() config.ConnectorConfig {
 	return config.ConnectorConfig{
 		AllowedBuckets: []string{"demo-bucket"},
+		IngestPoolSize: 32,
 		S3: config.S3Config{
 			AllowedBuckets:  []string{"demo-bucket"},
 			AccessKeyID:     "access",
@@ -105,9 +142,11 @@ func TestConnectorSafeLogErrorRedactsDetails(t *testing.T) {
 func TestIngestHTTPClientClonesDefaultTransportWithConnectorSettings(t *testing.T) {
 	defaultTransport := http.DefaultTransport.(*http.Transport)
 	defaultDisableCompression := defaultTransport.DisableCompression
+	defaultMaxIdleConns := defaultTransport.MaxIdleConns
 	defaultMaxIdleConnsPerHost := defaultTransport.MaxIdleConnsPerHost
+	poolSize := 64
 
-	client, err := ingestHTTPClient(config.MTLSPaths{}, 7*time.Second, false)
+	client, err := ingestHTTPClient(config.MTLSPaths{}, 7*time.Second, false, poolSize)
 	if err != nil {
 		t.Fatalf("ingestHTTPClient() error = %v", err)
 	}
@@ -121,18 +160,24 @@ func TestIngestHTTPClientClonesDefaultTransportWithConnectorSettings(t *testing.
 	if transport == defaultTransport {
 		t.Fatal("ingestHTTPClient() returned http.DefaultTransport instead of a clone")
 	}
-	if defaultTransport.DisableCompression != defaultDisableCompression || defaultTransport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
+	if defaultTransport.DisableCompression != defaultDisableCompression || defaultTransport.MaxIdleConns != defaultMaxIdleConns || defaultTransport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
 		t.Fatal("ingestHTTPClient() mutated http.DefaultTransport")
 	}
 	if !transport.DisableCompression {
 		t.Fatal("transport.DisableCompression = false, want true")
 	}
-	wantMaxIdleConnsPerHost := defaultMaxIdleConnsPerHost
-	if wantMaxIdleConnsPerHost < 32 {
-		wantMaxIdleConnsPerHost = 32
+	if transport.MaxConnsPerHost != poolSize {
+		t.Fatalf("MaxConnsPerHost = %d, want %d", transport.MaxConnsPerHost, poolSize)
 	}
-	if transport.MaxIdleConnsPerHost != wantMaxIdleConnsPerHost {
-		t.Fatalf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, wantMaxIdleConnsPerHost)
+	if transport.MaxIdleConnsPerHost != poolSize {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, poolSize)
+	}
+	wantMaxIdleConns := defaultMaxIdleConns
+	if wantMaxIdleConns < poolSize {
+		wantMaxIdleConns = poolSize
+	}
+	if transport.MaxIdleConns != wantMaxIdleConns {
+		t.Fatalf("MaxIdleConns = %d, want %d", transport.MaxIdleConns, wantMaxIdleConns)
 	}
 	if transport.TLSHandshakeTimeout != defaultTransport.TLSHandshakeTimeout || transport.IdleConnTimeout != defaultTransport.IdleConnTimeout || transport.ExpectContinueTimeout != defaultTransport.ExpectContinueTimeout || transport.ResponseHeaderTimeout != defaultTransport.ResponseHeaderTimeout {
 		t.Fatalf("transport did not preserve default timeout behavior: got TLSHandshake=%v IdleConn=%v ExpectContinue=%v ResponseHeader=%v", transport.TLSHandshakeTimeout, transport.IdleConnTimeout, transport.ExpectContinueTimeout, transport.ResponseHeaderTimeout)
@@ -150,7 +195,7 @@ func TestIngestHTTPClientClonesDefaultTransportWithConnectorSettings(t *testing.
 		t.Fatalf("buffer sizes read=%d write=%d, want %d", transport.ReadBufferSize, transport.WriteBufferSize, ingestTransportBufferBytes)
 	}
 
-	client, err = ingestHTTPClient(config.MTLSPaths{}, 7*time.Second, true)
+	client, err = ingestHTTPClient(config.MTLSPaths{}, 7*time.Second, true, poolSize)
 	if err != nil {
 		t.Fatalf("ingestHTTPClient(disableHTTP2) error = %v", err)
 	}
@@ -164,10 +209,13 @@ func TestIngestHTTPClientClonesDefaultTransportWithConnectorSettings(t *testing.
 	if disabledTransport.TLSNextProto == nil || len(disabledTransport.TLSNextProto) != 0 {
 		t.Fatalf("TLSNextProto = %#v, want empty non-nil map when HTTP/2 is disabled", disabledTransport.TLSNextProto)
 	}
+	if disabledTransport.MaxConnsPerHost != poolSize || disabledTransport.MaxIdleConnsPerHost != poolSize {
+		t.Fatalf("disabled pool limits MaxConnsPerHost=%d MaxIdleConnsPerHost=%d, want %d", disabledTransport.MaxConnsPerHost, disabledTransport.MaxIdleConnsPerHost, poolSize)
+	}
 	if disabledTransport.ReadBufferSize != ingestTransportBufferBytes || disabledTransport.WriteBufferSize != ingestTransportBufferBytes {
 		t.Fatalf("disabled buffer sizes read=%d write=%d, want %d", disabledTransport.ReadBufferSize, disabledTransport.WriteBufferSize, ingestTransportBufferBytes)
 	}
-	if defaultTransport.DisableCompression != defaultDisableCompression || defaultTransport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
+	if defaultTransport.DisableCompression != defaultDisableCompression || defaultTransport.MaxIdleConns != defaultMaxIdleConns || defaultTransport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
 		t.Fatal("ingestHTTPClient(disableHTTP2) mutated http.DefaultTransport")
 	}
 }
@@ -195,6 +243,49 @@ func TestIngestHTTP3ClientUsesHTTP3TransportAndMTLS(t *testing.T) {
 	}
 	if transport.TLSClientConfig.ServerName != "edge.internal" || !transport.TLSClientConfig.InsecureSkipVerify {
 		t.Fatalf("TLSClientConfig ServerName=%q InsecureSkipVerify=%t, want connector mTLS settings", transport.TLSClientConfig.ServerName, transport.TLSClientConfig.InsecureSkipVerify)
+	}
+}
+
+func TestPooledHTTPIngestSenderUsesIndependentClientsRoundRobinAndCloses(t *testing.T) {
+	var transports []*fakeHTTPTransport
+	sender, err := newPooledHTTPIngestSender(3, func() (*http.Client, error) {
+		transport := &fakeHTTPTransport{}
+		transports = append(transports, transport)
+		return &http.Client{Transport: transport}, nil
+	})
+	if err != nil {
+		t.Fatalf("newPooledHTTPIngestSender() error = %v", err)
+	}
+	if len(sender.senders) != 3 || len(transports) != 3 {
+		t.Fatalf("pool size senders=%d transports=%d, want 3", len(sender.senders), len(transports))
+	}
+	for i := range sender.senders {
+		if sender.senders[i].client == nil || sender.senders[i].client.Transport != transports[i] {
+			t.Fatalf("sender %d client/transport was not independently created", i)
+		}
+	}
+
+	ticket := validTicket("https://edge.internal/_ingest/req-1", http.MethodGet)
+	metadata := ingestMetadata{StatusCode: http.StatusOK, ContentLength: 4}
+	for i := 0; i < 7; i++ {
+		if err := sender.Send(context.Background(), ticket, metadata, strings.NewReader("body")); err != nil {
+			t.Fatalf("Send(%d) error = %v", i, err)
+		}
+	}
+	wantRequests := []int{3, 2, 2}
+	for i, want := range wantRequests {
+		if transports[i].requests != want {
+			t.Fatalf("transport %d requests = %d, want %d", i, transports[i].requests, want)
+		}
+	}
+
+	if err := sender.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	for i, transport := range transports {
+		if transport.closed != 1 || transport.idleClosed != 1 {
+			t.Fatalf("transport %d close=%d idleClose=%d, want one close and one idle close", i, transport.closed, transport.idleClosed)
+		}
 	}
 }
 
@@ -616,6 +707,17 @@ func TestQUICIngestSenderPropagatesSendError(t *testing.T) {
 	}
 }
 
+func TestQUICIngestSenderCloseForwardsToUnderlyingSender(t *testing.T) {
+	wantErr := errors.New("close failed")
+	fakeSender := &fakeQuicSender{closeErr: wantErr}
+	sender := quicIngestSender{sender: fakeSender}
+
+	err := sender.Close()
+	if !errors.Is(err, wantErr) || fakeSender.closeCount != 1 {
+		t.Fatalf("Close() error=%v closeCount=%d, want forwarded close error and one close", err, fakeSender.closeCount)
+	}
+}
+
 func TestSMUXIngestSenderBuildsKnownLengthRequestAndSanitizesMetadata(t *testing.T) {
 	fakeSender := &fakeSmuxSender{}
 	sender := smuxIngestSender{sender: fakeSender}
@@ -688,6 +790,17 @@ func TestSMUXIngestSenderPropagatesSendError(t *testing.T) {
 	}
 }
 
+func TestSMUXIngestSenderCloseForwardsToUnderlyingSender(t *testing.T) {
+	wantErr := errors.New("close failed")
+	fakeSender := &fakeSmuxSender{closeErr: wantErr}
+	sender := smuxIngestSender{sender: fakeSender}
+
+	err := sender.Close()
+	if !errors.Is(err, wantErr) || fakeSender.closeCount != 1 {
+		t.Fatalf("Close() error=%v closeCount=%d, want forwarded close error and one close", err, fakeSender.closeCount)
+	}
+}
+
 func TestNewIngestSenderSelectsTransport(t *testing.T) {
 	t.Run("http protocols", func(t *testing.T) {
 		tests := []struct {
@@ -706,6 +819,7 @@ func TestNewIngestSenderSelectsTransport(t *testing.T) {
 				cfg := connectorConfig()
 				cfg.IngestTransport = tc.transport
 				cfg.IngestDisableHTTP2 = tc.disableHTTP2Flag
+				cfg.IngestPoolSize = 7
 				sender, err := newIngestSender(cfg)
 				if err != nil {
 					t.Fatalf("newIngestSender() error = %v", err)
@@ -717,6 +831,9 @@ func TestNewIngestSenderSelectsTransport(t *testing.T) {
 				transport, ok := httpSender.client.Transport.(*http.Transport)
 				if !ok {
 					t.Fatalf("http transport = %T, want *http.Transport", httpSender.client.Transport)
+				}
+				if transport.MaxConnsPerHost != cfg.IngestPoolSize || transport.MaxIdleConnsPerHost != cfg.IngestPoolSize {
+					t.Fatalf("pool limits MaxConnsPerHost=%d MaxIdleConnsPerHost=%d, want %d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost, cfg.IngestPoolSize)
 				}
 				if tc.wantHTTP2Disabled {
 					if transport.ForceAttemptHTTP2 || transport.TLSNextProto == nil || len(transport.TLSNextProto) != 0 {
@@ -732,6 +849,7 @@ func TestNewIngestSenderSelectsTransport(t *testing.T) {
 	t.Run("http3", func(t *testing.T) {
 		cfg := connectorConfig()
 		cfg.IngestTransport = config.IngestTransportHTTP3
+		cfg.IngestPoolSize = 3
 		cfg.Timeouts.StreamTimeout = 11 * time.Second
 		cfg.MTLS.ServerName = "edge.internal"
 		cfg.MTLS.InsecureSkipVerify = true
@@ -739,19 +857,30 @@ func TestNewIngestSenderSelectsTransport(t *testing.T) {
 		if err != nil {
 			t.Fatalf("newIngestSender() error = %v", err)
 		}
-		httpSender, ok := sender.(httpIngestSender)
+		t.Cleanup(func() { _ = closeIngestSender(sender) })
+		pooledSender, ok := sender.(*pooledHTTPIngestSender)
 		if !ok {
-			t.Fatalf("sender = %T, want httpIngestSender", sender)
+			t.Fatalf("sender = %T, want *pooledHTTPIngestSender", sender)
 		}
-		transport, ok := httpSender.client.Transport.(*http3.Transport)
-		if !ok {
-			t.Fatalf("http transport = %T, want *http3.Transport", httpSender.client.Transport)
+		if len(pooledSender.senders) != cfg.IngestPoolSize {
+			t.Fatalf("http3 pool size = %d, want %d", len(pooledSender.senders), cfg.IngestPoolSize)
 		}
-		if httpSender.client.Timeout != 11*time.Second || transport.QUICConfig == nil || !transport.DisableCompression {
-			t.Fatalf("http3 client timeout=%v quicConfig=%p DisableCompression=%t, want configured HTTP/3 client", httpSender.client.Timeout, transport.QUICConfig, transport.DisableCompression)
-		}
-		if transport.TLSClientConfig == nil || transport.TLSClientConfig.ServerName != "edge.internal" || !transport.TLSClientConfig.InsecureSkipVerify {
-			t.Fatalf("http3 TLS config = %#v, want connector mTLS settings", transport.TLSClientConfig)
+		seenTransports := map[*http3.Transport]bool{}
+		for i, httpSender := range pooledSender.senders {
+			transport, ok := httpSender.client.Transport.(*http3.Transport)
+			if !ok {
+				t.Fatalf("http transport %d = %T, want *http3.Transport", i, httpSender.client.Transport)
+			}
+			if seenTransports[transport] {
+				t.Fatalf("http3 transport %d reuses a previous transport", i)
+			}
+			seenTransports[transport] = true
+			if httpSender.client.Timeout != 11*time.Second || transport.QUICConfig == nil || !transport.DisableCompression {
+				t.Fatalf("http3 client %d timeout=%v quicConfig=%p DisableCompression=%t, want configured HTTP/3 client", i, httpSender.client.Timeout, transport.QUICConfig, transport.DisableCompression)
+			}
+			if transport.TLSClientConfig == nil || transport.TLSClientConfig.ServerName != "edge.internal" || !transport.TLSClientConfig.InsecureSkipVerify {
+				t.Fatalf("http3 TLS config %d = %#v, want connector mTLS settings", i, transport.TLSClientConfig)
+			}
 		}
 	})
 

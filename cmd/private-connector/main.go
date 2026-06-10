@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,6 +39,18 @@ type objectFetcher interface {
 
 type ingestSender interface {
 	Send(context.Context, tickets.Ticket, ingestMetadata, io.Reader) error
+}
+
+type closeableIngestSender interface {
+	Close() error
+}
+
+func closeIngestSender(sender any) error {
+	closer, ok := sender.(closeableIngestSender)
+	if !ok || closer == nil {
+		return nil
+	}
+	return closer.Close()
 }
 
 type connector struct {
@@ -72,6 +85,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := closeIngestSender(sender); err != nil {
+			logger.Warn("ingest sender close failed", "error", safeLogError(err))
+		}
+	}()
 	worker := newConnector(cfg, fetcher, sender, logger)
 
 	natsCtx, cancelNATS := context.WithTimeout(ctx, 10*time.Second)
@@ -148,6 +166,10 @@ type httpIngestSender struct {
 	client *http.Client
 }
 
+func (s httpIngestSender) Close() error {
+	return closeHTTPClient(s.client)
+}
+
 func (s httpIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metadata ingestMetadata, body io.Reader) error {
 	if body == nil {
 		body = http.NoBody
@@ -175,6 +197,45 @@ func (s httpIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metad
 		return fmt.Errorf("ingest rejected with status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+type pooledHTTPIngestSender struct {
+	senders []httpIngestSender
+	next    atomic.Uint64
+}
+
+func newPooledHTTPIngestSender(poolSize int, newClient func() (*http.Client, error)) (*pooledHTTPIngestSender, error) {
+	if poolSize < 1 {
+		return nil, fmt.Errorf("ingest http sender pool size must be at least 1: %d", poolSize)
+	}
+	sender := &pooledHTTPIngestSender{senders: make([]httpIngestSender, 0, poolSize)}
+	for i := 0; i < poolSize; i++ {
+		client, err := newClient()
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("create ingest http client %d: %w", i, err), sender.Close())
+		}
+		sender.senders = append(sender.senders, httpIngestSender{client: client})
+	}
+	return sender, nil
+}
+
+func (s *pooledHTTPIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metadata ingestMetadata, body io.Reader) error {
+	if s == nil || len(s.senders) == 0 {
+		return errors.New("ingest http sender pool is empty")
+	}
+	idx := s.next.Add(1) - 1
+	return s.senders[idx%uint64(len(s.senders))].Send(ctx, ticket, metadata, body)
+}
+
+func (s *pooledHTTPIngestSender) Close() error {
+	if s == nil {
+		return nil
+	}
+	var closeErr error
+	for _, sender := range s.senders {
+		closeErr = errors.Join(closeErr, sender.Close())
+	}
+	return closeErr
 }
 
 type tcpIngestSender struct {
@@ -226,6 +287,10 @@ func (s quicIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metad
 	return nil
 }
 
+func (s quicIngestSender) Close() error {
+	return closeIngestSender(s.sender)
+}
+
 type smuxClientSender interface {
 	Send(context.Context, ingestsmux.ClientRequest) error
 }
@@ -251,6 +316,10 @@ func (s smuxIngestSender) Send(ctx context.Context, ticket tickets.Ticket, metad
 	return nil
 }
 
+func (s smuxIngestSender) Close() error {
+	return closeIngestSender(s.sender)
+}
+
 func ingestRequestBody(body io.Reader, metadata ingestMetadata, unknownBodyLength int64) (io.Reader, int64) {
 	if body == nil {
 		return http.NoBody, 0
@@ -267,29 +336,31 @@ func ingestRequestBody(body io.Reader, metadata ingestMetadata, unknownBodyLengt
 func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
 	switch cfg.IngestTransport {
 	case config.IngestTransportHTTP:
-		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, cfg.IngestDisableHTTP2)
+		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, cfg.IngestDisableHTTP2, cfg.IngestPoolSize)
 		if err != nil {
 			return nil, err
 		}
 		return httpIngestSender{client: client}, nil
 	case config.IngestTransportHTTP1:
-		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, true)
+		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, true, cfg.IngestPoolSize)
 		if err != nil {
 			return nil, err
 		}
 		return httpIngestSender{client: client}, nil
 	case config.IngestTransportHTTP2:
-		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, false)
+		client, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, false, cfg.IngestPoolSize)
 		if err != nil {
 			return nil, err
 		}
 		return httpIngestSender{client: client}, nil
 	case config.IngestTransportHTTP3:
-		client, err := ingestHTTP3Client(cfg.MTLS, cfg.Timeouts.StreamTimeout)
+		sender, err := newPooledHTTPIngestSender(cfg.IngestPoolSize, func() (*http.Client, error) {
+			return ingestHTTP3Client(cfg.MTLS, cfg.Timeouts.StreamTimeout)
+		})
 		if err != nil {
 			return nil, err
 		}
-		return httpIngestSender{client: client}, nil
+		return sender, nil
 	case config.IngestTransportTCP:
 		tlsCfg, err := ingestClientTLSConfig(cfg.MTLS)
 		if err != nil {
@@ -301,7 +372,7 @@ func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load ingest smux client tls config: %w", err)
 		}
-		sender, err := ingestsmux.NewSender("tcp", cfg.IngestTCPAddr, tlsCfg)
+		sender, err := ingestsmux.NewSender("tcp", cfg.IngestTCPAddr, tlsCfg, ingestsmux.WithSessionPoolSize(cfg.IngestPoolSize))
 		if err != nil {
 			return nil, fmt.Errorf("create ingest smux sender: %w", err)
 		}
@@ -311,7 +382,7 @@ func newIngestSender(cfg config.ConnectorConfig) (ingestSender, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load ingest quic client tls config: %w", err)
 		}
-		sender, err := ingestquic.NewSender(cfg.IngestQUICAddr, tlsCfg)
+		sender, err := ingestquic.NewSender(cfg.IngestQUICAddr, tlsCfg, ingestquic.WithConnectionPoolSize(cfg.IngestPoolSize))
 		if err != nil {
 			return nil, fmt.Errorf("create ingest quic sender: %w", err)
 		}
@@ -418,6 +489,18 @@ func validateIngestURL(raw string) error {
 	return nil
 }
 
+func closeHTTPClient(client *http.Client) error {
+	if client == nil {
+		return nil
+	}
+	var closeErr error
+	if closer, ok := client.Transport.(interface{ Close() error }); ok {
+		closeErr = errors.Join(closeErr, closer.Close())
+	}
+	client.CloseIdleConnections()
+	return closeErr
+}
+
 func ingestClientTLSConfig(paths config.MTLSPaths) (*tls.Config, error) {
 	return mtls.ClientConfig(mtls.ClientOptions{Files: mtls.Files{CAFile: paths.CAFile, CertFile: paths.CertFile, KeyFile: paths.KeyFile, ServerName: paths.ServerName, InsecureSkipVerify: paths.InsecureSkipVerify}})
 }
@@ -441,13 +524,15 @@ func ingestHTTP3Client(paths config.MTLSPaths, timeout time.Duration) (*http.Cli
 	}, nil
 }
 
-func ingestHTTPClient(paths config.MTLSPaths, timeout time.Duration, disableHTTP2 bool) (*http.Client, error) {
+func ingestHTTPClient(paths config.MTLSPaths, timeout time.Duration, disableHTTP2 bool, poolSize int) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DisableCompression = true
 	transport.ReadBufferSize = ingestTransportBufferBytes
 	transport.WriteBufferSize = ingestTransportBufferBytes
-	if transport.MaxIdleConnsPerHost < 32 {
-		transport.MaxIdleConnsPerHost = 32
+	transport.MaxConnsPerHost = poolSize
+	transport.MaxIdleConnsPerHost = poolSize
+	if transport.MaxIdleConns < poolSize {
+		transport.MaxIdleConns = poolSize
 	}
 	if disableHTTP2 {
 		transport.ForceAttemptHTTP2 = false
