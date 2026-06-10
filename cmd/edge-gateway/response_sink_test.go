@@ -44,6 +44,43 @@ func (w *sinkResponseWriter) Flush() {
 	w.flushes++
 }
 
+type panicWriteResponseWriter struct {
+	*sinkResponseWriter
+}
+
+func (w *panicWriteResponseWriter) Write([]byte) (int, error) {
+	panic("write failed")
+}
+
+type panicFlushResponseWriter struct {
+	*sinkResponseWriter
+	beforePanic func()
+}
+
+func (w *panicFlushResponseWriter) Flush() {
+	if w.beforePanic != nil {
+		w.beforePanic()
+	}
+	panic("flush failed")
+}
+
+type cancelOnWriteResponseWriter struct {
+	*sinkResponseWriter
+	cancel      context.CancelFunc
+	flushCalled bool
+}
+
+func (w *cancelOnWriteResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.sinkResponseWriter.Write(p)
+	w.cancel()
+	return n, err
+}
+
+func (w *cancelOnWriteResponseWriter) Flush() {
+	w.flushCalled = true
+	panic("flush should have been skipped")
+}
+
 func TestResponseSinkMetadataAllowlistAndDefaultStatus(t *testing.T) {
 	resp := newSinkResponseWriter()
 	sink := newResponseSink(resp, http.MethodGet, context.Background())
@@ -198,6 +235,84 @@ func TestResponseSinkGETFlushesAndHEADDiscards(t *testing.T) {
 	}
 	if body := headResp.body.String(); body != "" {
 		t.Fatalf("HEAD body = %q, want empty", body)
+	}
+}
+
+func TestResponseSinkWriteRecoversResponseWriterPanics(t *testing.T) {
+	t.Run("write panic", func(t *testing.T) {
+		resp := &panicWriteResponseWriter{sinkResponseWriter: newSinkResponseWriter()}
+		sink := newResponseSink(resp, http.MethodGet, context.Background())
+		writer, err := sink.Start(pending.Metadata{})
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+
+		n, err := writer.Write([]byte("hello"))
+		if n != 0 {
+			t.Fatalf("Write() n = %d, want 0", n)
+		}
+		if !errors.Is(err, errResponseWriterPanic) {
+			t.Fatalf("Write() error = %v, want response writer panic", err)
+		}
+	})
+
+	t.Run("flush panic", func(t *testing.T) {
+		resp := &panicFlushResponseWriter{sinkResponseWriter: newSinkResponseWriter()}
+		sink := newResponseSink(resp, http.MethodGet, context.Background())
+		writer, err := sink.Start(pending.Metadata{})
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+
+		n, err := writer.Write([]byte("hello"))
+		if n != 5 {
+			t.Fatalf("Write() n = %d, want 5", n)
+		}
+		if !errors.Is(err, errResponseWriterPanic) {
+			t.Fatalf("Write() error = %v, want response writer panic", err)
+		}
+		if body := resp.body.String(); body != "hello" {
+			t.Fatalf("body = %q, want hello", body)
+		}
+	})
+}
+
+func TestResponseSinkWriteTreatsFlushRaceAsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	resp := &panicFlushResponseWriter{sinkResponseWriter: newSinkResponseWriter(), beforePanic: cancel}
+	sink := newResponseSink(resp, http.MethodGet, ctx)
+	writer, err := sink.Start(pending.Metadata{})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	n, err := writer.Write([]byte("hello"))
+	if n != 5 {
+		t.Fatalf("Write() n = %d, want 5", n)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Write() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestResponseSinkWriteSkipsFlushAfterContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	resp := &cancelOnWriteResponseWriter{sinkResponseWriter: newSinkResponseWriter(), cancel: cancel}
+	sink := newResponseSink(resp, http.MethodGet, ctx)
+	writer, err := sink.Start(pending.Metadata{})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	n, err := writer.Write([]byte("hello"))
+	if n != 5 {
+		t.Fatalf("Write() n = %d, want 5", n)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Write() error = %v, want context.Canceled", err)
+	}
+	if resp.flushCalled {
+		t.Fatal("Flush() was called after context cancellation")
 	}
 }
 

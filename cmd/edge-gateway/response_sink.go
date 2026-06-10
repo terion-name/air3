@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -9,6 +11,8 @@ import (
 
 	"github.com/terion-name/air3/internal/pending"
 )
+
+var errResponseWriterPanic = errors.New("response writer panic")
 
 type responseSink struct {
 	w      http.ResponseWriter
@@ -110,16 +114,68 @@ func (s *responseSink) write(p []byte) (int, error) {
 	}
 	s.mu.Unlock()
 
-	n, err := s.w.Write(p)
+	n, err := s.writeResponse(p)
 	if err != nil {
 		return n, err
 	}
-	if n > 0 {
-		if flusher, ok := s.w.(http.Flusher); ok {
-			flusher.Flush()
-		}
+	if n == 0 {
+		return n, nil
+	}
+	if err := s.ctx.Err(); err != nil {
+		return n, err
+	}
+	flusher, ok := s.w.(http.Flusher)
+	if !ok {
+		return n, nil
+	}
+	if err := s.flushResponse(flusher); err != nil {
+		return n, err
+	}
+	if err := s.ctx.Err(); err != nil {
+		return n, err
 	}
 	return n, nil
+}
+
+func (s *responseSink) writeResponse(p []byte) (n int, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = s.responseWriterPanicError("write", recovered)
+		}
+	}()
+
+	n, err = s.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if err := s.ctx.Err(); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func (s *responseSink) flushResponse(flusher http.Flusher) (err error) {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = s.responseWriterPanicError("flush", recovered)
+		}
+	}()
+
+	flusher.Flush()
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *responseSink) responseWriterPanicError(op string, recovered any) error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w during %s: %v", errResponseWriterPanic, op, recovered)
 }
 
 func (s *responseSink) discard(p []byte) (int, error) {
