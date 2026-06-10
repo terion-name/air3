@@ -6,7 +6,7 @@ COMPOSE_PERF_FILE := deploy/compose.perf.yaml
 COMPOSE := docker compose -f $(COMPOSE_FILE)
 AIR3_PERF_MULTI_CONNECTORS ?= 3
 
-.PHONY: fmt test ts-test python-test build validate compose-config compose-perf-config compose-up compose-down certs seed smoke e2e perf perf-multi clean
+.PHONY: fmt test ts-test python-test build validate compose-config compose-perf-config compose-up compose-down certs seed smoke e2e perf perf-multi readme-benchmark clean
 
 fmt:
 	gofmt -w cmd internal packages/go
@@ -58,6 +58,9 @@ perf: compose-perf-config
 
 perf-multi: compose-perf-config
 	AIR3_PERF_CONNECTORS=$(AIR3_PERF_MULTI_CONNECTORS) ./deploy/scripts/perf-compose.sh
+
+readme-benchmark:
+	./deploy/scripts/readme-benchmark.sh
 
 clean:
 	rm -rf $(BIN_DIR)
