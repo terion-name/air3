@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -99,6 +100,117 @@ func TestConcurrentSenderSendsUseOneTCPConnection(t *testing.T) {
 	}
 	if got := fixture.acceptCount(); got != 1 {
 		t.Fatalf("accepted TCP connections = %d, want 1", got)
+	}
+}
+
+func TestSessionPoolUsesMultipleTCPConnectionsForConcurrentBlockedSends(t *testing.T) {
+	fixture := newSmuxFixture(t, "connector.local")
+	sender, err := NewSender("tcp", fixture.address, fixture.clientTLS("connector.local"), WithSessionPoolSize(2))
+	if err != nil {
+		t.Fatalf("NewSender() error = %v", err)
+	}
+	defer sender.Close()
+
+	const n = 2
+	writers := make([]*blockingWriter, n)
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		writer := newBlockingWriter()
+		writers[i] = writer
+		defer closeOnce(writer.release)
+		req, target := fixture.register("req-pooled-blocked-"+string(rune('a'+i)), &fakeIngestTarget{writer: writer})
+		body := "body-" + req.ID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := sender.Send(context.Background(), ClientRequest{RequestID: req.ID, IngestToken: req.IngestToken, Body: strings.NewReader(body), BodyLength: int64(len(body))}); err != nil {
+				errs <- err
+				return
+			}
+			if got := target.snapshot().body; got != "" {
+				errs <- fmt.Errorf("target buffered body = %q, want writer-owned body", got)
+			}
+		}()
+	}
+
+	for _, writer := range writers {
+		select {
+		case <-writer.entered:
+		case <-time.After(time.Second):
+			t.Fatal("pooled send did not reach target writer")
+		}
+	}
+	if got := fixture.acceptCount(); got != 2 {
+		t.Fatalf("accepted TCP connections = %d, want 2", got)
+	}
+
+	for _, writer := range writers {
+		closeOnce(writer.release)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("pooled Send() error = %v", err)
+		}
+	}
+	for i, writer := range writers {
+		want := "body-req-pooled-blocked-" + string(rune('a'+i))
+		if got := writer.body(); got != want {
+			t.Fatalf("writer %d body = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestSessionPoolCloseClosesAllSessions(t *testing.T) {
+	fixture := newSmuxFixture(t, "connector.local")
+	sender, err := NewSender("tcp", fixture.address, fixture.clientTLS("connector.local"), WithSessionPoolSize(2))
+	if err != nil {
+		t.Fatalf("NewSender() error = %v", err)
+	}
+	defer sender.Close()
+
+	for _, id := range []string{"req-close-pool-1", "req-close-pool-2"} {
+		req, target := fixture.register(id, nil)
+		if err := sender.Send(context.Background(), ClientRequest{RequestID: req.ID, IngestToken: req.IngestToken, Body: strings.NewReader(id), BodyLength: int64(len(id))}); err != nil {
+			t.Fatalf("Send(%s) error = %v", id, err)
+		}
+		if got := target.snapshot().body; got != id {
+			t.Fatalf("body for %s = %q", id, got)
+		}
+	}
+	if got := fixture.acceptCount(); got != 2 {
+		t.Fatalf("accepted TCP connections = %d, want 2", got)
+	}
+
+	sessions := make([]*smux.Session, 0, len(sender.slots))
+	for i := range sender.slots {
+		sender.slots[i].mu.Lock()
+		if sender.slots[i].session == nil {
+			sender.slots[i].mu.Unlock()
+			t.Fatalf("slot %d session is nil", i)
+		}
+		sessions = append(sessions, sender.slots[i].session)
+		sender.slots[i].mu.Unlock()
+	}
+
+	if err := sender.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := sender.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	for i, session := range sessions {
+		if !session.IsClosed() {
+			t.Fatalf("captured session %d is not closed", i)
+		}
+		sender.slots[i].mu.Lock()
+		if sender.slots[i].session != nil {
+			sender.slots[i].mu.Unlock()
+			t.Fatalf("slot %d session not cleared", i)
+		}
+		sender.slots[i].mu.Unlock()
 	}
 }
 
@@ -317,13 +429,13 @@ func TestStaleSessionRetryReconnectsBeforeWritingRequest(t *testing.T) {
 		t.Fatalf("first body = %q, want one", got)
 	}
 
-	sender.mu.Lock()
-	if sender.session == nil {
-		sender.mu.Unlock()
+	sender.slots[0].mu.Lock()
+	if sender.slots[0].session == nil {
+		sender.slots[0].mu.Unlock()
 		t.Fatal("sender session is nil after first send")
 	}
-	_ = sender.session.Close()
-	sender.mu.Unlock()
+	_ = sender.slots[0].session.Close()
+	sender.slots[0].mu.Unlock()
 
 	req2, target2 := fixture.register("req-stale-2", nil)
 	if err := sender.Send(context.Background(), ClientRequest{RequestID: req2.ID, IngestToken: req2.IngestToken, Body: strings.NewReader("two"), BodyLength: 3}); err != nil {
@@ -342,6 +454,9 @@ func TestOptionsCloneCloseAndProtocolDelegation(t *testing.T) {
 	badConfig.Version = 99
 	if _, err := NewSender("tcp", "127.0.0.1:1", &tls.Config{}, WithSmuxConfig(badConfig)); err == nil {
 		t.Fatal("NewSender() with invalid smux config error = nil")
+	}
+	if _, err := NewSender("tcp", "127.0.0.1:1", &tls.Config{}, WithSessionPoolSize(0)); err == nil {
+		t.Fatal("NewSender() with invalid session pool size error = nil")
 	}
 
 	fixture := newSmuxFixture(t, "connector.local")

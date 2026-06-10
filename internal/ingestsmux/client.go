@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/terion-name/air3/internal/pending"
@@ -25,12 +26,21 @@ type ClientRequest struct {
 type Option func(*senderOptions)
 
 type senderOptions struct {
-	smuxConfig *smux.Config
+	smuxConfig      *smux.Config
+	sessionPoolSize int
 }
 
 func WithSmuxConfig(config *smux.Config) Option {
 	return func(opts *senderOptions) {
 		opts.smuxConfig = cloneSmuxConfig(config)
+	}
+}
+
+// WithSessionPoolSize sets the number of lazily created smux sessions used by a Sender.
+// Size must be at least 1.
+func WithSessionPoolSize(size int) Option {
+	return func(opts *senderOptions) {
+		opts.sessionPoolSize = size
 	}
 }
 
@@ -49,25 +59,39 @@ type Sender struct {
 	tlsConfig  *tls.Config
 	smuxConfig *smux.Config
 
+	nextSlot atomic.Uint64
+	closed   atomic.Bool
+	slots    []smuxSessionSlot
+}
+
+type smuxSessionSlot struct {
 	mu      sync.Mutex
 	session *smux.Session
-	closed  bool
 }
 
 func NewSender(network, address string, tlsConfig *tls.Config, opts ...Option) (*Sender, error) {
 	if tlsConfig == nil {
 		return nil, errors.New("TLS config is required")
 	}
-	options := senderOptions{}
+	options := senderOptions{sessionPoolSize: 1}
 	for _, option := range opts {
 		if option != nil {
 			option(&options)
 		}
 	}
+	if options.sessionPoolSize < 1 {
+		return nil, fmt.Errorf("session pool size must be at least 1: %d", options.sessionPoolSize)
+	}
 	if err := smux.VerifyConfig(smuxConfigOrDefault(options.smuxConfig)); err != nil {
 		return nil, fmt.Errorf("smux config: %w", err)
 	}
-	return &Sender{network: network, address: address, tlsConfig: tlsConfig.Clone(), smuxConfig: options.smuxConfig}, nil
+	return &Sender{
+		network:    network,
+		address:    address,
+		tlsConfig:  tlsConfig.Clone(),
+		smuxConfig: options.smuxConfig,
+		slots:      make([]smuxSessionSlot, options.sessionPoolSize),
+	}, nil
 }
 
 func (s *Sender) Send(ctx context.Context, req ClientRequest) error {
@@ -102,47 +126,71 @@ func (s *Sender) Send(ctx context.Context, req ClientRequest) error {
 }
 
 func (s *Sender) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closed = true
-	return s.closeSessionLocked()
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	var closeErr error
+	for i := range s.slots {
+		slot := &s.slots[i]
+		slot.mu.Lock()
+		closeErr = errors.Join(closeErr, closeSessionSlotLocked(slot))
+		slot.mu.Unlock()
+	}
+	return closeErr
 }
 
 func (s *Sender) openStream(ctx context.Context) (*smux.Stream, error) {
-	stream, err := s.openStreamOnce(ctx)
+	slot := s.nextSessionSlot()
+	stream, err := s.openStreamOnce(ctx, slot)
 	if err == nil {
 		return stream, nil
 	}
-	s.resetSession()
-	stream, retryErr := s.openStreamOnce(ctx)
+	s.resetSession(slot)
+	stream, retryErr := s.openStreamOnce(ctx, slot)
 	if retryErr != nil {
 		return nil, fmt.Errorf("retry opening smux stream after %v: %w", err, retryErr)
 	}
 	return stream, nil
 }
 
-func (s *Sender) openStreamOnce(ctx context.Context) (*smux.Stream, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
+func (s *Sender) nextSessionSlot() *smuxSessionSlot {
+	idx := s.nextSlot.Add(1) - 1
+	return &s.slots[idx%uint64(len(s.slots))]
+}
+
+func (s *Sender) openStreamOnce(ctx context.Context, slot *smuxSessionSlot) (*smux.Stream, error) {
+	if s.closed.Load() {
 		return nil, errors.New("ingest smux sender is closed")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s.session == nil || s.session.IsClosed() {
-		if err := s.dialLocked(ctx); err != nil {
+
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if s.closed.Load() {
+		return nil, errors.New("ingest smux sender is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if slot.session == nil || slot.session.IsClosed() {
+		if err := s.dialSlotLocked(ctx, slot); err != nil {
 			return nil, err
 		}
+		if s.closed.Load() {
+			_ = closeSessionSlotLocked(slot)
+			return nil, errors.New("ingest smux sender is closed")
+		}
 	}
-	stream, err := s.session.OpenStream()
+	stream, err := slot.session.OpenStream()
 	if err != nil {
 		return nil, fmt.Errorf("open smux stream: %w", err)
 	}
 	return stream, nil
 }
 
-func (s *Sender) dialLocked(ctx context.Context) error {
+func (s *Sender) dialSlotLocked(ctx context.Context, slot *smuxSessionSlot) error {
 	dialer := &tls.Dialer{Config: s.tlsConfig.Clone()}
 	conn, err := dialer.DialContext(ctx, s.network, s.address)
 	if err != nil {
@@ -153,22 +201,22 @@ func (s *Sender) dialLocked(ctx context.Context) error {
 		_ = conn.Close()
 		return fmt.Errorf("start smux client session: %w", err)
 	}
-	s.session = session
+	slot.session = session
 	return nil
 }
 
-func (s *Sender) resetSession() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_ = s.closeSessionLocked()
+func (s *Sender) resetSession(slot *smuxSessionSlot) {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	_ = closeSessionSlotLocked(slot)
 }
 
-func (s *Sender) closeSessionLocked() error {
-	if s.session == nil {
+func closeSessionSlotLocked(slot *smuxSessionSlot) error {
+	if slot.session == nil {
 		return nil
 	}
-	err := s.session.Close()
-	s.session = nil
+	err := slot.session.Close()
+	slot.session = nil
 	return err
 }
 
