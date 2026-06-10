@@ -137,6 +137,75 @@ AIR3_INGEST_TRANSPORT=http3 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PER
 
 Results are written under `.air3-perf-results/` as per-request CSV plus a summary CSV with average latency, speed, throughput, and penalty percentages for `direct_s3`, `caddy_s3`, and `air3_gateway`. Default result filenames include the transport label, and the CSVs include an `ingest_transport` column so explicit HTTP variants, legacy HTTP, and experimental TCP/smux/quic runs are distinguishable. Downloaded source files are cached under `.air3-perf-cache/` so repeat runs do not re-download them.
 
+### README Benchmark Harness
+
+For the broader README comparison matrix, run:
+
+```sh
+make readme-benchmark
+```
+
+That harness compares the Caddy baseline with Air3 over all ingest transports (`http1`, `http2`, `tcp`, `smux`, `quic`, and `http3`) across single and scaled Compose modes, sequential and 16-way concurrent traffic, and small/medium/big/mixed content sets. It writes `raw.csv`, `aggregate.csv`, and `summary.md` under `.air3-perf-results/readme-*`.
+
+### Performance Snapshot
+
+The following snapshot comes from `.air3-perf-results/readme-20260610-151107`, generated on 2026-06-10 with the README benchmark harness. It is a local Docker Compose comparison using hot object-store/cache data, intended for relative Caddy-vs-Air3 transport analysis rather than a cloud SLA or production capacity claim.
+
+Scale modes:
+
+- **single:** Caddy 2 CPU, edge-gateway 2 CPU, 1 private connector with 2 CPU.
+- **scaled:** Caddy 4 CPU, edge-gateway 4 CPU, 3 private connectors with 2 CPU each.
+
+Cells are `avg TTFB ms / RPS / MiB/s`, with sequential runs using one request at a time and concurrent runs using 16 requests at concurrency 16.
+
+#### Single sequential
+
+| Target | Small | Medium | Big | Mixed |
+|---|---:|---:|---:|---:|
+| Caddy baseline | 4.5 / 23.8 / 3 | 1.8 / 39.3 / 196 | 1.8 / 19.5 / 889 | 2.5 / 25.4 / 429 |
+| Air3 http1 | 6.8 / 9.4 / 1 | 6.1 / 11.0 / 55 | 9.2 / 6.1 / 280 | 7.3 / 7.3 / 124 |
+| Air3 http2 | 13.3 / 5.4 / 1 | 15.8 / 5.1 / 25 | 14.9 / 4.5 / 206 | 6.1 / 11.5 / 194 |
+| Air3 tcp | 20.3 / 5.2 / 1 | 20.2 / 5.2 / 26 | 22.3 / 5.3 / 243 | 13.2 / 6.4 / 108 |
+| Air3 smux | 15.4 / 6.6 / 1 | 17.0 / 6.5 / 32 | 18.6 / 5.1 / 231 | 16.2 / 5.8 / 99 |
+| Air3 quic | 9.1 / 7.4 / 1 | 10.7 / 8.5 / 42 | 17.6 / 4.0 / 184 | 10.3 / 10.0 / 170 |
+| Air3 http3 | 12.5 / 14.6 / 2 | 12.7 / 10.0 / 50 | 14.4 / 3.7 / 171 | 10.0 / 6.8 / 116 |
+
+#### Single concurrent
+
+| Target | Small | Medium | Big | Mixed |
+|---|---:|---:|---:|---:|
+| Caddy baseline | 6.4 / 147.8 / 16 | 20.4 / 138.7 / 690 | 41.9 / 66.4 / 3032 | 22.7 / 114.7 / 1821 |
+| Air3 http1 | 13.9 / 61.4 / 6 | 27.7 / 60.0 / 299 | 73.0 / 32.1 / 1466 | 32.5 / 43.9 / 697 |
+| Air3 http2 | 11.2 / 64.6 / 7 | 11.9 / 52.1 / 259 | 19.3 / 14.3 / 651 | 15.5 / 32.3 / 513 |
+| Air3 tcp | 20.7 / 63.7 / 7 | 31.0 / 75.1 / 374 | 82.4 / 27.9 / 1276 | 32.0 / 42.4 / 674 |
+| Air3 smux | 19.3 / 67.3 / 7 | 31.5 / 56.1 / 279 | 64.8 / 23.5 / 1072 | 34.0 / 38.7 / 613 |
+| Air3 quic | 20.5 / 72.6 / 8 | 57.0 / 31.5 / 157 | 52.4 / 13.2 / 604 | 26.6 / 27.5 / 437 |
+| Air3 http3 | 29.6 / 58.1 / 6 | 42.3 / 26.0 / 130 | 47.4 / 8.6 / 391 | 24.7 / 21.9 / 348 |
+
+#### Scaled sequential
+
+| Target | Small | Medium | Big | Mixed |
+|---|---:|---:|---:|---:|
+| Caddy baseline | 4.6 / 22.7 / 2 | 2.1 / 27.4 / 136 | 1.7 / 21.3 / 975 | 1.9 / 29.4 / 498 |
+| Air3 http1 | 6.5 / 14.3 / 2 | 12.7 / 5.9 / 29 | 9.7 / 6.9 / 316 | 5.0 / 12.9 / 219 |
+| Air3 http2 | 12.5 / 7.9 / 1 | 5.9 / 10.1 / 50 | 9.5 / 6.0 / 275 | 8.4 / 5.6 / 95 |
+| Air3 tcp | 15.5 / 6.9 / 1 | 19.7 / 5.4 / 27 | 15.8 / 6.3 / 289 | 15.2 / 6.1 / 104 |
+| Air3 smux | 13.0 / 10.3 / 1 | 24.3 / 6.3 / 31 | 17.0 / 5.4 / 249 | 18.9 / 6.0 / 101 |
+| Air3 quic | 17.8 / 5.7 / 1 | 18.3 / 5.2 / 26 | 9.2 / 6.5 / 298 | 18.9 / 4.6 / 78 |
+| Air3 http3 | 8.4 / 11.7 / 1 | 9.8 / 6.3 / 31 | 20.2 / 2.4 / 111 | 19.3 / 4.2 / 71 |
+
+#### Scaled concurrent
+
+| Target | Small | Medium | Big | Mixed |
+|---|---:|---:|---:|---:|
+| Caddy baseline | 5.4 / 169.4 / 18 | 9.5 / 145.3 / 723 | 25.7 / 83.3 / 3805 | 11.9 / 100.0 / 1588 |
+| Air3 http1 | 8.2 / 70.7 / 7 | 15.3 / 62.0 / 308 | 44.5 / 35.4 / 1617 | 18.8 / 50.9 / 808 |
+| Air3 http2 | 7.8 / 71.5 / 8 | 13.9 / 71.3 / 355 | 11.3 / 29.9 / 1365 | 11.1 / 43.1 / 684 |
+| Air3 tcp | 13.4 / 69.0 / 7 | 22.4 / 70.5 / 351 | 42.3 / 38.8 / 1773 | 41.3 / 42.6 / 676 |
+| Air3 smux | 15.2 / 67.9 / 7 | 25.4 / 57.5 / 286 | 48.4 / 31.1 / 1420 | 22.5 / 44.4 / 704 |
+| Air3 quic | 15.0 / 95.8 / 10 | 16.6 / 41.8 / 208 | 29.7 / 17.7 / 809 | 16.5 / 32.7 / 519 |
+| Air3 http3 | 15.1 / 75.8 / 8 | 48.2 / 31.0 / 154 | 22.4 / 13.8 / 629 | 15.5 / 25.4 / 404 |
+
 Useful knobs:
 
 - `AIR3_PERF_ITERATIONS` (default `5`)
