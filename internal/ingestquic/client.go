@@ -13,7 +13,10 @@ import (
 	"github.com/terion-name/air3/internal/pending"
 )
 
-const alpn = "air3-ingest-quic/1"
+const (
+	alpn                      = "air3-ingest-quic/1"
+	defaultConnectionPoolSize = 1
+)
 
 type ClientRequest struct {
 	RequestID   string
@@ -26,12 +29,19 @@ type ClientRequest struct {
 type Option func(*senderOptions)
 
 type senderOptions struct {
-	quicConfig *quic.Config
+	quicConfig         *quic.Config
+	connectionPoolSize int
 }
 
 func WithQUICConfig(config *quic.Config) Option {
 	return func(opts *senderOptions) {
 		opts.quicConfig = cloneQUICConfig(config)
+	}
+}
+
+func WithConnectionPoolSize(size int) Option {
+	return func(opts *senderOptions) {
+		opts.connectionPoolSize = size
 	}
 }
 
@@ -49,22 +59,36 @@ type Sender struct {
 	tlsConfig  *tls.Config
 	quicConfig *quic.Config
 
-	mu     sync.Mutex
-	conn   *quic.Conn
-	closed bool
+	mu       sync.Mutex
+	closed   bool
+	nextSlot int
+	slots    []quicConnSlot
+}
+
+type quicConnSlot struct {
+	mu   sync.Mutex
+	conn *quic.Conn
 }
 
 func NewSender(address string, tlsConfig *tls.Config, opts ...Option) (*Sender, error) {
 	if tlsConfig == nil {
 		return nil, errors.New("TLS config is required")
 	}
-	options := senderOptions{}
+	options := senderOptions{connectionPoolSize: defaultConnectionPoolSize}
 	for _, option := range opts {
 		if option != nil {
 			option(&options)
 		}
 	}
-	return &Sender{address: address, tlsConfig: cloneTLSConfigWithALPN(tlsConfig), quicConfig: options.quicConfig}, nil
+	if options.connectionPoolSize <= 0 {
+		options.connectionPoolSize = defaultConnectionPoolSize
+	}
+	return &Sender{
+		address:    address,
+		tlsConfig:  cloneTLSConfigWithALPN(tlsConfig),
+		quicConfig: options.quicConfig,
+		slots:      make([]quicConnSlot, options.connectionPoolSize),
+	}, nil
 }
 
 func (s *Sender) Send(ctx context.Context, req ClientRequest) error {
@@ -100,43 +124,76 @@ func (s *Sender) Send(ctx context.Context, req ClientRequest) error {
 
 func (s *Sender) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.closed = true
-	return s.closeConnLocked()
+	slots := s.slots
+	s.mu.Unlock()
+
+	var errs []error
+	for i := range slots {
+		slots[i].mu.Lock()
+		if err := closeSlotConnLocked(&slots[i]); err != nil {
+			errs = append(errs, err)
+		}
+		slots[i].mu.Unlock()
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Sender) openStream(ctx context.Context) (*quic.Stream, error) {
-	stream, retryable, err := s.openStreamOnce(ctx)
+	slot, err := s.nextConnSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stream, retryable, err := s.openStreamOnce(ctx, slot)
 	if err == nil {
 		return stream, nil
 	}
 	if !retryable {
 		return nil, err
 	}
-	s.resetConn()
-	stream, _, retryErr := s.openStreamOnce(ctx)
+	s.resetSlot(slot)
+	stream, _, retryErr := s.openStreamOnce(ctx, slot)
 	if retryErr != nil {
 		return nil, fmt.Errorf("retry opening QUIC stream after %v: %w", err, retryErr)
 	}
 	return stream, nil
 }
 
-func (s *Sender) openStreamOnce(ctx context.Context) (*quic.Stream, bool, error) {
+func (s *Sender) nextConnSlot(ctx context.Context) (*quicConnSlot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
+		return nil, errors.New("ingest QUIC sender is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(s.slots) == 0 {
+		return nil, errors.New("ingest QUIC sender has no connection slots")
+	}
+	slot := &s.slots[s.nextSlot%len(s.slots)]
+	s.nextSlot = (s.nextSlot + 1) % len(s.slots)
+	return slot, nil
+}
+
+func (s *Sender) openStreamOnce(ctx context.Context, slot *quicConnSlot) (*quic.Stream, bool, error) {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if s.isClosed() {
 		return nil, false, errors.New("ingest QUIC sender is closed")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	if s.conn == nil || s.conn.Context().Err() != nil {
-		_ = s.closeConnLocked()
-		if err := s.dialLocked(ctx); err != nil {
+	if slot.conn == nil || slot.conn.Context().Err() != nil {
+		_ = closeSlotConnLocked(slot)
+		conn, err := s.dial(ctx)
+		if err != nil {
 			return nil, false, err
 		}
+		slot.conn = conn
 	}
-	stream, err := s.conn.OpenStreamSync(ctx)
+	stream, err := slot.conn.OpenStreamSync(ctx)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, false, ctxErr
@@ -146,27 +203,32 @@ func (s *Sender) openStreamOnce(ctx context.Context) (*quic.Stream, bool, error)
 	return stream, false, nil
 }
 
-func (s *Sender) dialLocked(ctx context.Context) error {
-	conn, err := quic.DialAddr(ctx, s.address, s.tlsConfig.Clone(), cloneQUICConfig(s.quicConfig))
-	if err != nil {
-		return fmt.Errorf("dial ingest QUIC server: %w", err)
-	}
-	s.conn = conn
-	return nil
-}
-
-func (s *Sender) resetConn() {
+func (s *Sender) isClosed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_ = s.closeConnLocked()
+	return s.closed
 }
 
-func (s *Sender) closeConnLocked() error {
-	if s.conn == nil {
+func (s *Sender) dial(ctx context.Context) (*quic.Conn, error) {
+	conn, err := quic.DialAddr(ctx, s.address, s.tlsConfig.Clone(), cloneQUICConfig(s.quicConfig))
+	if err != nil {
+		return nil, fmt.Errorf("dial ingest QUIC server: %w", err)
+	}
+	return conn, nil
+}
+
+func (s *Sender) resetSlot(slot *quicConnSlot) {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	_ = closeSlotConnLocked(slot)
+}
+
+func closeSlotConnLocked(slot *quicConnSlot) error {
+	if slot.conn == nil {
 		return nil
 	}
-	err := s.conn.CloseWithError(0, "")
-	s.conn = nil
+	err := slot.conn.CloseWithError(0, "")
+	slot.conn = nil
 	return err
 }
 

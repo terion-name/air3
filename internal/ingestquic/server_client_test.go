@@ -117,6 +117,79 @@ func TestConcurrentSenderSendsUseOneQUICConnection(t *testing.T) {
 	}
 }
 
+func TestPooledSenderUsesDistinctConnectionsForConcurrentBlockedSends(t *testing.T) {
+	fixture := newQUICFixture(t, "connector.local")
+	sender, err := NewSender(fixture.address, fixture.clientTLS("connector.local"), WithConnectionPoolSize(2))
+	if err != nil {
+		t.Fatalf("NewSender() error = %v", err)
+	}
+
+	writer1 := newBlockingWriter()
+	writer2 := newBlockingWriter()
+	req1, _ := fixture.register("req-pool-1", &fakeIngestTarget{writer: writer1})
+	req2, _ := fixture.register("req-pool-2", &fakeIngestTarget{writer: writer2})
+
+	t.Cleanup(func() {
+		closeOnce(writer1.release)
+		closeOnce(writer2.release)
+		_ = sender.Close()
+	})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	send := func(req pending.Request, body string) {
+		defer wg.Done()
+		if err := sender.Send(context.Background(), ClientRequest{RequestID: req.ID, IngestToken: req.IngestToken, Body: strings.NewReader(body), BodyLength: int64(len(body))}); err != nil {
+			errs <- err
+		}
+	}
+
+	wg.Add(2)
+	go send(req1, "pool-one")
+	go send(req2, "pool-two")
+
+	waitForBlockedWrite(t, writer1)
+	waitForBlockedWrite(t, writer2)
+
+	conns := sender.currentConns()
+	if len(conns) != 2 {
+		t.Fatalf("cached connections = %d, want 2", len(conns))
+	}
+	if conns[0] == conns[1] {
+		t.Fatal("pool slots cached the same QUIC connection")
+	}
+
+	close(writer1.release)
+	close(writer2.release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("pooled Send() error = %v", err)
+		}
+	}
+	if got := writer1.body(); got != "pool-one" {
+		t.Fatalf("first pooled body = %q, want pool-one", got)
+	}
+	if got := writer2.body(); got != "pool-two" {
+		t.Fatalf("second pooled body = %q, want pool-two", got)
+	}
+
+	if err := sender.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	for _, conn := range conns {
+		select {
+		case <-conn.Context().Done():
+		case <-time.After(time.Second):
+			t.Fatal("Close() did not close a pooled QUIC connection")
+		}
+	}
+	if got := sender.currentConns(); len(got) != 0 {
+		t.Fatalf("cached connections after Close() = %d, want 0", len(got))
+	}
+}
+
 func TestWrongTokenDoesNotClaimThenCorrectTokenSucceeds(t *testing.T) {
 	fixture := newQUICFixture(t, "connector.local")
 	req, target := fixture.register("req-token", nil)
@@ -334,14 +407,11 @@ func TestStaleConnectionRetryReconnectsBeforeWritingRequest(t *testing.T) {
 		t.Fatalf("first body = %q, want one", got)
 	}
 
-	sender.mu.Lock()
-	staleConn := sender.conn
+	staleConn := sender.currentConn()
 	if staleConn == nil {
-		sender.mu.Unlock()
 		t.Fatal("sender conn is nil after first send")
 	}
 	_ = staleConn.CloseWithError(0, "stale test connection")
-	sender.mu.Unlock()
 
 	req2, target2 := fixture.register("req-stale-2", nil)
 	if err := sender.Send(context.Background(), ClientRequest{RequestID: req2.ID, IngestToken: req2.IngestToken, Body: strings.NewReader("two"), BodyLength: 3}); err != nil {
@@ -497,9 +567,32 @@ func (f *quicFixture) sendRaw(payload []byte, body string) error {
 }
 
 func (s *Sender) currentConn() *quic.Conn {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.conn
+	conns := s.currentConns()
+	if len(conns) == 0 {
+		return nil
+	}
+	return conns[0]
+}
+
+func (s *Sender) currentConns() []*quic.Conn {
+	conns := make([]*quic.Conn, 0, len(s.slots))
+	for i := range s.slots {
+		s.slots[i].mu.Lock()
+		if s.slots[i].conn != nil {
+			conns = append(conns, s.slots[i].conn)
+		}
+		s.slots[i].mu.Unlock()
+	}
+	return conns
+}
+
+func waitForBlockedWrite(t *testing.T, writer *blockingWriter) {
+	t.Helper()
+	select {
+	case <-writer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("ingest did not reach blocking writer")
+	}
 }
 
 var fixedNow = time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC)
