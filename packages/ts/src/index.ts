@@ -13,7 +13,7 @@ export interface SignUrlInput {
   range?: string;
   responseContentType?: string;
   responseContentDisposition?: string;
-  /** Emit /{server}/{key} while signing the canonical claims with bucket. */
+  /** Emit /{key} (or /{server}/{key} when server is set) while signing the canonical claims with bucket. */
   defaultBucketPath?: boolean;
 }
 
@@ -24,7 +24,7 @@ export interface VerifyUrlInput {
   secret: string;
   now: Date | number;
   range?: string;
-  /** Accept /{server}/{key} paths and verify them against this real bucket. */
+  /** Accept /{key} (or /{server}/{key} when server is set) paths and verify them against this real bucket. */
   defaultBucket?: string;
 }
 
@@ -78,9 +78,6 @@ export function signUrl(input: SignUrlInput): string {
   if (input.secret === '') {
     throw new EdgeSignError('signing secret is required');
   }
-  if (input.defaultBucketPath === true && (input.server ?? '') === '') {
-    throw new EdgeSignError('server is required for default bucket path');
-  }
   const claims = claimsFromInput(input);
   const parsed = parseUrl(input.baseUrl, 'base url');
   if (parsed.protocol === 'edge-relative:') {
@@ -117,8 +114,7 @@ export function verifyUrl(input: VerifyUrlInput): Claims {
     return verifyDecodedClaims(input, claimsFromUrl(input.method, input.url, input.server ?? ''));
   } catch (error) {
     if (
-      (input.server ?? '') === ''
-      || (input.defaultBucket ?? '') === ''
+      (input.defaultBucket ?? '') === ''
       || error instanceof RangeMismatchError
       || error instanceof UnsignedRangeError
     ) {
@@ -203,7 +199,9 @@ function claimsFromUrl(
   }
   const parsed = parseUrl(rawUrl, 'signed url');
   const [server, bucket, key] = expectedServer === ''
-    ? ['', ...objectFromPath(parsed.pathname)]
+    ? defaultBucket === ''
+      ? ['', ...objectFromPath(parsed.pathname)]
+      : objectFromSingleServerDefaultBucketPath(parsed.pathname, defaultBucket)
     : defaultBucket === ''
       ? objectFromServerPath(parsed.pathname)
       : objectFromDefaultBucketPath(parsed.pathname, defaultBucket);
@@ -287,6 +285,15 @@ function objectFromServerPath(escapedPath: string): [string, string, string] {
   const bucket = pathUnescape(cleaned.slice(firstSlash + 1, secondSlash), 'decode bucket path');
   const key = pathUnescape(cleaned.slice(secondSlash + 1), 'decode key path');
   return [server, bucket, key];
+}
+
+function objectFromSingleServerDefaultBucketPath(escapedPath: string, defaultBucket: string): [string, string, string] {
+  const cleaned = cleanPath(`/${escapedPath}`).replace(/^\/+/, '');
+  if (cleaned === '' || cleaned === '.') {
+    throw new EdgeSignError('signed url path must include key');
+  }
+  const key = pathUnescape(cleaned, 'decode key path');
+  return ['', defaultBucket, key];
 }
 
 function objectFromDefaultBucketPath(escapedPath: string, defaultBucket: string): [string, string, string] {

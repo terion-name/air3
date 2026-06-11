@@ -201,19 +201,62 @@ test('default bucket short path signs real bucket and verifies explicitly', () =
   );
 });
 
-test('default bucket path requires server', () => {
+test('single-server default bucket short path signs real bucket and verifies explicitly', () => {
+  const raw = signUrl({
+    method: 'GET',
+    baseUrl: 'https://files.example.com',
+    bucket: 'demo',
+    key: 'file.txt',
+    secret: 'secret',
+    expires: 1780938000,
+    defaultBucketPath: true,
+  });
+
+  const parsed = new URL(raw);
+  assert.equal(parsed.pathname, '/file.txt');
+
   assert.throws(
-    () => signUrl({
-      method: 'GET',
-      baseUrl: 'https://files.example.com',
-      bucket: 'demo-bucket',
-      key: 'object.txt',
-      secret: 'secret',
-      expires: 1780938000,
-      defaultBucketPath: true,
-    }),
+    () => verifyUrl({ method: 'GET', url: raw, secret: 'secret', now: 1780934400 }),
     EdgeSignError,
   );
+
+  const claims = verifyUrl({
+    method: 'GET',
+    url: raw,
+    secret: 'secret',
+    now: 1780934400,
+    defaultBucket: 'demo',
+  });
+  assert.equal(claims.server, undefined);
+  assert.equal(claims.bucket, 'demo');
+  assert.equal(claims.key, 'file.txt');
+  assert.equal(canonicalString(claims), ['GET', 'demo', 'file.txt', '1780938000', '', '', ''].join('\n'));
+});
+
+test('single-server default bucket treats the whole short path as key', () => {
+  const raw = signUrl({
+    method: 'GET',
+    baseUrl: 'https://files.example.com',
+    bucket: 'demo',
+    key: 'demo/file.txt',
+    secret: 'secret',
+    expires: 1780938000,
+    defaultBucketPath: true,
+  });
+
+  const parsed = new URL(raw);
+  assert.equal(parsed.pathname, '/demo/file.txt');
+
+  const claims = verifyUrl({
+    method: 'GET',
+    url: raw,
+    secret: 'secret',
+    now: 1780934400,
+    defaultBucket: 'demo',
+  });
+  assert.equal(claims.server, undefined);
+  assert.equal(claims.bucket, 'demo');
+  assert.equal(claims.key, 'demo/file.txt');
 });
 
 test('empty server keeps legacy signing and verification behavior', () => {

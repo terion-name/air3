@@ -10,7 +10,7 @@ export interface SignUrlInput {
     range?: string;
     responseContentType?: string;
     responseContentDisposition?: string;
-    /** Emit /{server}/{key} while signing the canonical claims with bucket. */
+    /** Emit /{key} (or /{server}/{key} when server is set) while signing the canonical claims with bucket. */
     defaultBucketPath?: boolean;
 }
 export interface VerifyUrlInput {
@@ -20,7 +20,7 @@ export interface VerifyUrlInput {
     secret: string;
     now: Date | number;
     range?: string;
-    /** Accept /{server}/{key} paths and verify them against this real bucket. */
+    /** Accept /{key} (or /{server}/{key} when server is set) paths and verify them against this real bucket. */
     defaultBucket?: string;
 }
 export interface Claims {

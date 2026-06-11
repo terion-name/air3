@@ -33,9 +33,6 @@ export function signUrl(input) {
     if (input.secret === '') {
         throw new EdgeSignError('signing secret is required');
     }
-    if (input.defaultBucketPath === true && (input.server ?? '') === '') {
-        throw new EdgeSignError('server is required for default bucket path');
-    }
     const claims = claimsFromInput(input);
     const parsed = parseUrl(input.baseUrl, 'base url');
     if (parsed.protocol === 'edge-relative:') {
@@ -65,8 +62,7 @@ export function verifyUrl(input) {
         return verifyDecodedClaims(input, claimsFromUrl(input.method, input.url, input.server ?? ''));
     }
     catch (error) {
-        if ((input.server ?? '') === ''
-            || (input.defaultBucket ?? '') === ''
+        if ((input.defaultBucket ?? '') === ''
             || error instanceof RangeMismatchError
             || error instanceof UnsignedRangeError) {
             throw error;
@@ -133,7 +129,9 @@ function claimsFromUrl(method, rawUrl, expectedServer, defaultBucket = '') {
     }
     const parsed = parseUrl(rawUrl, 'signed url');
     const [server, bucket, key] = expectedServer === ''
-        ? ['', ...objectFromPath(parsed.pathname)]
+        ? defaultBucket === ''
+            ? ['', ...objectFromPath(parsed.pathname)]
+            : objectFromSingleServerDefaultBucketPath(parsed.pathname, defaultBucket)
         : defaultBucket === ''
             ? objectFromServerPath(parsed.pathname)
             : objectFromDefaultBucketPath(parsed.pathname, defaultBucket);
@@ -211,6 +209,14 @@ function objectFromServerPath(escapedPath) {
     const bucket = pathUnescape(cleaned.slice(firstSlash + 1, secondSlash), 'decode bucket path');
     const key = pathUnescape(cleaned.slice(secondSlash + 1), 'decode key path');
     return [server, bucket, key];
+}
+function objectFromSingleServerDefaultBucketPath(escapedPath, defaultBucket) {
+    const cleaned = cleanPath(`/${escapedPath}`).replace(/^\/+/, '');
+    if (cleaned === '' || cleaned === '.') {
+        throw new EdgeSignError('signed url path must include key');
+    }
+    const key = pathUnescape(cleaned, 'decode key path');
+    return ['', defaultBucket, key];
 }
 function objectFromDefaultBucketPath(escapedPath, defaultBucket) {
     const cleaned = cleanPath(`/${escapedPath}`).replace(/^\/+/, '');
