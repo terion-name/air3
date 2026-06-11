@@ -122,6 +122,48 @@ func TestMultiServerSignAndVerify(t *testing.T) {
 	}
 }
 
+func TestDefaultBucketPathSignAndVerify(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	expires := now.Add(time.Minute)
+	raw, err := SignURL(SignInput{
+		Method:            "GET",
+		BaseURL:           "https://files.example.com",
+		Server:            "blue",
+		Bucket:            "demo",
+		Key:               "file.txt",
+		Secret:            "top-secret",
+		Expires:           expires,
+		DefaultBucketPath: true,
+	})
+	if err != nil {
+		t.Fatalf("SignURL() error = %v", err)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse signed URL: %v", err)
+	}
+	if got, want := u.EscapedPath(), "/blue/file.txt"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+
+	_, err = VerifyURL(VerifyInput{Method: "GET", URL: raw, Server: "blue", Secret: "top-secret", Now: now})
+	if err == nil {
+		t.Fatal("VerifyURL() without DefaultBucket succeeded, want error")
+	}
+
+	claims, err := VerifyURL(VerifyInput{Method: "GET", URL: raw, Server: "blue", Secret: "top-secret", Now: now, DefaultBucket: "demo"})
+	if err != nil {
+		t.Fatalf("VerifyURL() error = %v", err)
+	}
+	if claims.Server != "blue" || claims.Bucket != "demo" || claims.Key != "file.txt" {
+		t.Fatalf("claims = %#v", claims)
+	}
+	wantCanonical := "GET\nblue\ndemo\nfile.txt\n" + formatUnixSeconds(expires) + "\n\n\n"
+	if got := CanonicalString(claims); got != wantCanonical {
+		t.Fatalf("CanonicalString() = %q, want %q", got, wantCanonical)
+	}
+}
+
 func TestVerifyURLMultiServerRejectsTamperAndExpectedServerMismatch(t *testing.T) {
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	raw, err := SignURL(SignInput{Method: "GET", BaseURL: "https://files.example.com", Server: "edge-1", Bucket: "demo-bucket", Key: "object.txt", Secret: "secret", Expires: now.Add(time.Minute)})

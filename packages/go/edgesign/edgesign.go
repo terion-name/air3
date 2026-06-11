@@ -2,6 +2,8 @@ package edgesign
 
 import (
 	"errors"
+	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +28,9 @@ var (
 )
 
 // SignInput describes one public edge object URL to sign.
+//
+// DefaultBucketPath only applies in multi-server mode. When set, SignURL emits
+// /{server}/{key} while signing the canonical claims with the real Bucket.
 type SignInput struct {
 	Method                     string
 	BaseURL                    string
@@ -37,6 +42,7 @@ type SignInput struct {
 	Range                      string
 	ResponseContentType        string
 	ResponseContentDisposition string
+	DefaultBucketPath          bool
 }
 
 // Claims are the signed fields decoded from an edge URL.
@@ -56,18 +62,24 @@ type Claims struct {
 // Range is the optional HTTP Range header supplied with the request. When it is
 // set, the URL must include the same signed range claim. When it is empty, a
 // signed range claim remains valid and is returned in Claims.Range.
+//
+// DefaultBucket only applies in multi-server mode. When set, VerifyURL also
+// accepts /{server}/{key} paths and verifies the signature against DefaultBucket
+// as the real signed bucket claim.
 type VerifyInput struct {
-	Method string
-	URL    string
-	Server string
-	Secret string
-	Now    time.Time
-	Range  string
+	Method        string
+	URL           string
+	Server        string
+	Secret        string
+	Now           time.Time
+	Range         string
+	DefaultBucket string
 }
 
 // SignURL returns BaseURL/{bucket}/{key}?expires=...&sig=... using the edge
 // gateway HMAC canonical form. When Server is set, it returns
-// BaseURL/{server}/{bucket}/{key}?expires=...&sig=... using multi-server mode.
+// BaseURL/{server}/{bucket}/{key}?expires=...&sig=... using multi-server mode
+// unless DefaultBucketPath requests the short /{server}/{key} form.
 func SignURL(input SignInput) (string, error) {
 	signingInput := signing.SignInput{
 		Method:                     input.Method,
@@ -84,7 +96,11 @@ func SignURL(input SignInput) (string, error) {
 	if input.Server == "" {
 		return signing.SignURL(signingInput)
 	}
-	return signing.SignURLForMode(signingInput, publicpath.ModeMulti)
+	raw, err := signing.SignURLForMode(signingInput, publicpath.ModeMulti)
+	if err != nil || !input.DefaultBucketPath {
+		return raw, err
+	}
+	return withDefaultBucketPath(raw, input.BaseURL, input.Server, input.Key)
 }
 
 // VerifyURL validates the signature and expiration in input.URL for input.Method.
@@ -122,7 +138,87 @@ func validateURL(input VerifyInput) (signing.Claims, error) {
 	if input.Server == "" {
 		return signing.ValidateURL(input.Method, input.URL, cfg, input.Now)
 	}
-	return signing.ValidateURLForMode(input.Method, input.URL, cfg, input.Now, publicpath.ModeMulti)
+	claims, err := signing.ValidateURLForMode(input.Method, input.URL, cfg, input.Now, publicpath.ModeMulti)
+	if err == nil || input.DefaultBucket == "" {
+		return claims, err
+	}
+	return validateDefaultBucketURL(input, cfg)
+}
+
+func withDefaultBucketPath(rawURL, baseURL, server, key string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse signed url: %w", err)
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("parse base url: %w", err)
+	}
+	u.Path = objectPath(base.Path, publicpath.Object{Server: server, Key: key})
+	u.RawPath = ""
+	return u.String(), nil
+}
+
+func validateDefaultBucketURL(input VerifyInput, cfg signing.ValidationConfig) (signing.Claims, error) {
+	u, err := url.Parse(input.URL)
+	if err != nil {
+		return signing.Claims{}, fmt.Errorf("parse signed url: %w", err)
+	}
+	object, err := defaultBucketObject(u.EscapedPath(), input.DefaultBucket)
+	if err != nil {
+		return signing.Claims{}, err
+	}
+	u.Path = objectPath("", object)
+	u.RawPath = ""
+	return signing.ValidateURLForMode(input.Method, u.String(), cfg, input.Now, publicpath.ModeMulti)
+}
+
+func defaultBucketObject(escapedPath, defaultBucket string) (publicpath.Object, error) {
+	if !strings.HasPrefix(escapedPath, "/") {
+		return publicpath.Object{}, fmt.Errorf("public path: missing leading slash")
+	}
+	parts := strings.Split(escapedPath[1:], "/")
+	if len(parts) < 2 || parts[0] == "" {
+		return publicpath.Object{}, fmt.Errorf("public path: missing server")
+	}
+	server, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return publicpath.Object{}, fmt.Errorf("public path: bad escape in server: %w", err)
+	}
+	if err := publicpath.ValidateAlias(server); err != nil {
+		return publicpath.Object{}, fmt.Errorf("public path: invalid server alias %q: %w", server, err)
+	}
+	keyParts := make([]string, len(parts)-1)
+	for i, escapedPart := range parts[1:] {
+		part, err := url.PathUnescape(escapedPart)
+		if err != nil {
+			return publicpath.Object{}, fmt.Errorf("public path: bad escape in key: %w", err)
+		}
+		keyParts[i] = part
+	}
+	return publicpath.Object{Server: server, Bucket: defaultBucket, Key: strings.Join(keyParts, "/")}, nil
+}
+
+func objectPath(basePath string, object publicpath.Object) string {
+	parts := []string{strings.Trim(basePath, "/")}
+	if object.Server != "" {
+		parts = append(parts, object.Server)
+	}
+	if object.Bucket != "" {
+		parts = append(parts, object.Bucket)
+	}
+	parts = append(parts, strings.Split(object.Key, "/")...)
+	return "/" + strings.Join(nonEmpty(parts), "/")
+}
+
+func nonEmpty(parts []string) []string {
+	out := parts[:0]
+	for _, part := range parts {
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // CanonicalString returns the exact newline-delimited text signed by the edge
