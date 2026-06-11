@@ -118,6 +118,23 @@ func signedMultiURL(t *testing.T, method, server, bucket, key string, now time.T
 	return signed
 }
 
+func signedDefaultBucketMultiURL(t *testing.T, method, server, bucket, key string, now time.Time) string {
+	t.Helper()
+	signed, err := signing.SignURLForModeWithOptions(signing.SignInput{
+		Method:  method,
+		BaseURL: "https://files.example",
+		Server:  server,
+		Bucket:  bucket,
+		Key:     key,
+		Expires: now.Add(time.Minute),
+		Secret:  "secret",
+	}, publicpath.ModeMulti, signing.SignOptions{DefaultBucketPath: true})
+	if err != nil {
+		t.Fatalf("SignURLForModeWithOptions() error = %v", err)
+	}
+	return signed
+}
+
 func testMultiEdge(pub *fakePublisher, cfg config.EdgeConfig, fetchers map[string]objectFetcher) (*edgeServer, *pending.Registry) {
 	reg := pending.NewRegistry(pending.Options{})
 	cfg.IngestURL = "https://edge.internal/_ingest"
@@ -625,6 +642,185 @@ func TestMultiServerConnectorPublishesRoutedSubjectAndTicket(t *testing.T) {
 	}
 }
 
+func TestMultiServerDefaultBucketShortPathPublishesRoutedTicket(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		path    string
+		wantKey string
+	}{
+		{name: "single segment key", path: "/blue/file.txt", wantKey: "file.txt"},
+		{name: "additional path segments", path: "/blue/archive/file.txt", wantKey: "archive/file.txt"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &fakePublisher{err: errors.New("stop after publish")}
+			edge, _ := testMultiEdge(pub, config.EdgeConfig{
+				AllowedBuckets:       []string{"demo"},
+				ServerDefaultBuckets: map[string]string{"BLUE": "demo"},
+				Signing:              config.SigningConfig{Disabled: true},
+			}, nil)
+			resp := httptest.NewRecorder()
+			edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, tt.path, nil))
+
+			published := pub.snapshot()
+			if len(published) != 1 {
+				t.Fatalf("published tickets = %#v, want one", published)
+			}
+			if published[0].Server != "blue" || published[0].Bucket != "demo" || published[0].Key != tt.wantKey {
+				t.Fatalf("published ticket = %#v, want server blue bucket demo key %q", published[0], tt.wantKey)
+			}
+			subjects := pub.subjectSnapshot()
+			if len(subjects) != 1 || subjects[0] != "air3.blue" {
+				t.Fatalf("subjects = %#v, want [air3.blue]", subjects)
+			}
+		})
+	}
+}
+
+func TestDirectDefaultBucketShortPathBypassesNATS(t *testing.T) {
+	pub := &fakePublisher{}
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, ContentType: "text/plain", ContentLength: 5, Body: io.NopCloser(strings.NewReader("hello"))}}
+	edge, reg := testMultiEdge(pub, config.EdgeConfig{
+		AllowedBuckets:       []string{"connector-bucket"},
+		ServerDefaultBuckets: map[string]string{"BLUE": "demo"},
+		DirectServers: map[string]config.S3Config{
+			"blue": {AllowedBuckets: []string{"demo"}},
+		},
+		Signing: config.SigningConfig{Disabled: true},
+	}, map[string]objectFetcher{"blue": fetcher})
+	edge.newToken = func() (string, error) {
+		t.Fatal("direct default-bucket path allocated a connector token")
+		return "", nil
+	}
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/blue/file.txt", nil))
+
+	if got := resp.Result().StatusCode; got != http.StatusOK {
+		t.Fatalf("status = %d, want %d", got, http.StatusOK)
+	}
+	requests := fetcher.snapshot()
+	if len(requests) != 1 {
+		t.Fatalf("fetch requests = %#v, want one", requests)
+	}
+	if requests[0].Bucket != "demo" || requests[0].Key != "file.txt" {
+		t.Fatalf("fetch request = %#v, want bucket demo key file.txt", requests[0])
+	}
+	if pub.count() != 0 {
+		t.Fatalf("published %d tickets, want 0", pub.count())
+	}
+	if _, err := reg.StartIngest("req-multi", "ingest-multi-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+		t.Fatalf("direct alias registered pending request: %v", err)
+	}
+}
+
+func TestDefaultBucketShortPathAllowlistUsesResolvedBucket(t *testing.T) {
+	t.Run("routed", func(t *testing.T) {
+		pub := &fakePublisher{}
+		edge, _ := testMultiEdge(pub, config.EdgeConfig{
+			AllowedBuckets:       []string{"other"},
+			ServerDefaultBuckets: map[string]string{"BLUE": "demo"},
+			Signing:              config.SigningConfig{Disabled: true},
+		}, nil)
+
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/blue/file.txt", nil))
+		if got := resp.Result().StatusCode; got != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+		}
+		if pub.count() != 0 {
+			t.Fatalf("published %d tickets, want 0", pub.count())
+		}
+	})
+
+	t.Run("direct", func(t *testing.T) {
+		pub := &fakePublisher{}
+		fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("unused"))}}
+		edge, _ := testMultiEdge(pub, config.EdgeConfig{
+			AllowedBuckets:       []string{"demo"},
+			ServerDefaultBuckets: map[string]string{"BLUE": "demo"},
+			DirectServers: map[string]config.S3Config{
+				"blue": {AllowedBuckets: []string{"other"}},
+			},
+			Signing: config.SigningConfig{Disabled: true},
+		}, map[string]objectFetcher{"blue": fetcher})
+
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/blue/file.txt", nil))
+		if got := resp.Result().StatusCode; got != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+		}
+		if pub.count() != 0 {
+			t.Fatalf("published %d tickets, want 0", pub.count())
+		}
+		if got := len(fetcher.snapshot()); got != 0 {
+			t.Fatalf("fetch calls = %d, want 0", got)
+		}
+	})
+}
+
+func TestSignedDefaultBucketShortURLAcceptedAndTamperingRejected(t *testing.T) {
+	now := time.Now()
+	signed := signedDefaultBucketMultiURL(t, http.MethodGet, "blue", "demo", "file.txt", now)
+
+	t.Run("accepted", func(t *testing.T) {
+		pub := &fakePublisher{err: errors.New("stop after publish")}
+		edge, _ := testMultiEdge(pub, config.EdgeConfig{
+			AllowedBuckets:       []string{"demo"},
+			ServerDefaultBuckets: map[string]string{"BLUE": "demo"},
+			Signing:              config.SigningConfig{Secret: "secret"},
+		}, nil)
+		edge.now = func() time.Time { return now }
+		edge.newToken = func() (string, error) { return "signed-default-token", nil }
+
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, signed, nil))
+
+		published := pub.snapshot()
+		if len(published) != 1 {
+			t.Fatalf("published tickets = %#v, want one", published)
+		}
+		if published[0].Server != "blue" || published[0].Bucket != "demo" || published[0].Key != "file.txt" {
+			t.Fatalf("published ticket = %#v, want server blue bucket demo key file.txt", published[0])
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "server", raw: strings.Replace(signed, "/blue/", "/green/", 1)},
+		{name: "key", raw: strings.Replace(signed, "/file.txt", "/other.txt", 1)},
+	} {
+		t.Run("tampered "+tt.name, func(t *testing.T) {
+			pub := &fakePublisher{}
+			blueFetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("blue"))}}
+			greenFetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("green"))}}
+			edge, _ := testMultiEdge(pub, config.EdgeConfig{
+				AllowedBuckets:       []string{"demo"},
+				ServerDefaultBuckets: map[string]string{"BLUE": "demo", "GREEN": "demo"},
+				DirectServers: map[string]config.S3Config{
+					"blue":  {AllowedBuckets: []string{"demo"}},
+					"green": {AllowedBuckets: []string{"demo"}},
+				},
+				Signing: config.SigningConfig{Secret: "secret"},
+			}, map[string]objectFetcher{"blue": blueFetcher, "green": greenFetcher})
+			edge.now = func() time.Time { return now }
+
+			resp := httptest.NewRecorder()
+			edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, tt.raw, nil))
+			if got := resp.Result().StatusCode; got != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+			}
+			if pub.count() != 0 {
+				t.Fatalf("published %d tickets, want 0", pub.count())
+			}
+			if got := len(blueFetcher.snapshot()) + len(greenFetcher.snapshot()); got != 0 {
+				t.Fatalf("fetch calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestMultiServerSignedURLRejectsServerPathTampering(t *testing.T) {
 	pub := &fakePublisher{}
 	now := time.Now()
@@ -658,7 +854,7 @@ func TestInvalidMultiServerPathFailsBeforePublishOrFetch(t *testing.T) {
 		Signing: config.SigningConfig{Disabled: true},
 	}, map[string]objectFetcher{"blue": fetcher})
 
-	for _, path := range []string{"/bad%2Falias/demo-bucket/file.txt", "/blue/demo-bucket"} {
+	for _, path := range []string{"/bad%2Falias/demo-bucket/file.txt", "/blue/demo-bucket", "/blue/file.txt"} {
 		resp := httptest.NewRecorder()
 		edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, path, nil))
 		if got := resp.Result().StatusCode; got != http.StatusBadRequest {

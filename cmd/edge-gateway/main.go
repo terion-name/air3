@@ -264,7 +264,8 @@ func edgeMode(cfg config.EdgeConfig) publicpath.Mode {
 }
 
 func (s *edgeServer) validatePublicRequest(r *http.Request) (publicObject, error) {
-	parsed, err := publicpath.ParseEscapedPath(r.URL.EscapedPath(), edgeMode(s.cfg))
+	mode := edgeMode(s.cfg)
+	parsed, err := publicpath.ParseEscapedPathWithDefaultBucket(r.URL.EscapedPath(), mode, s.cfg.DefaultBucketForServer)
 	if err != nil {
 		return publicObject{}, errBadRequest
 	}
@@ -277,7 +278,7 @@ func (s *edgeServer) validatePublicRequest(r *http.Request) (publicObject, error
 
 	queryRange := ""
 	if !s.cfg.Signing.Disabled {
-		claims, err := signing.ValidateURLForMode(r.Method, r.URL.RequestURI(), signing.ValidationConfig{Secret: s.cfg.Signing.Secret}, s.now(), edgeMode(s.cfg))
+		claims, err := signing.ValidateURLForModeWithOptions(r.Method, r.URL.RequestURI(), signing.ValidationConfig{Secret: s.cfg.Signing.Secret}, s.now(), mode, signing.ValidationOptions{DefaultBucket: s.cfg.DefaultBucketForServer})
 		if err != nil {
 			return publicObject{}, errUnauthorized
 		}
