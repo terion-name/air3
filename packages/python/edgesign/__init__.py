@@ -69,10 +69,13 @@ def sign_url(
     range: str = "",
     response_content_type: str = "",
     response_content_disposition: str = "",
+    default_bucket_path: bool = False,
 ) -> str:
     """Return an air3 edge signed object URL."""
     if secret == "":
         raise EdgeSignError("signing secret is required")
+    if default_bucket_path and not server:
+        raise EdgeSignError("server is required for default bucket path")
     claims = _claims_from_input(
         method=method,
         bucket=bucket,
@@ -87,7 +90,13 @@ def sign_url(
     if not parsed.scheme or not parsed.netloc:
         raise EdgeSignError("base url must be absolute")
 
-    object_path = _append_object_path(unquote(parsed.path), bucket, key, server=server)
+    object_path = _append_object_path(
+        unquote(parsed.path),
+        bucket,
+        key,
+        server=server,
+        omit_bucket=default_bucket_path,
+    )
     query = _collect_query(parsed.query)
     _set_query_value(query, PARAM_EXPIRES, str(_unix_seconds(expires)))
     if range:
@@ -109,9 +118,10 @@ def verify_url(
     now: datetime | int | float,
     server: str = "",
     range: str = "",
+    default_bucket: str = "",
 ) -> Claims:
     """Validate an air3 edge signed URL and return its signed claims."""
-    claims, sig = _claims_from_url(method, url, server=server)
+    claims, sig = _claims_from_url(method, url, server=server, default_bucket=default_bucket)
     if secret == "":
         raise EdgeSignError("signing secret is required")
     if sig == "":
@@ -181,11 +191,23 @@ def _claims_from_input(
     )
 
 
-def _claims_from_url(method: str, raw_url: str, *, server: str = "") -> tuple[Claims, str]:
+def _claims_from_url(
+    method: str,
+    raw_url: str,
+    *,
+    server: str = "",
+    default_bucket: str = "",
+) -> tuple[Claims, str]:
     parsed = urlsplit(raw_url)
     if server:
         _validate_server_alias(server)
-        path_server, bucket, key = _object_from_server_path(parsed.path)
+        if default_bucket:
+            path_server, bucket, key = _object_from_default_bucket_path(
+                parsed.path,
+                default_bucket,
+            )
+        else:
+            path_server, bucket, key = _object_from_server_path(parsed.path)
         if path_server != server:
             raise InvalidSignatureError()
     else:
@@ -222,11 +244,19 @@ def _constant_time_hex_equal(supplied_hex: str, expected_hex: str) -> bool:
     return hmac.compare_digest(supplied, expected)
 
 
-def _append_object_path(base_path: str, bucket: str, key: str, *, server: str = "") -> str:
+def _append_object_path(
+    base_path: str,
+    bucket: str,
+    key: str,
+    *,
+    server: str = "",
+    omit_bucket: bool = False,
+) -> str:
     parts = [_trim_slashes(base_path)]
     if server:
         parts.append(_go_path_escape(server))
-    parts.append(_go_path_escape(bucket))
+    if not omit_bucket:
+        parts.append(_go_path_escape(bucket))
     parts.extend(_go_path_escape(part) for part in key.split("/"))
     return "/" + "/".join(part for part in parts if part)
 
@@ -249,6 +279,19 @@ def _object_from_server_path(escaped_path: str) -> tuple[str, str, str]:
     if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2]:
         raise EdgeSignError("signed url path must include server, bucket, and key")
     return unquote(parts[0]), unquote(parts[1]), unquote(parts[2])
+
+
+def _object_from_default_bucket_path(
+    escaped_path: str,
+    default_bucket: str,
+) -> tuple[str, str, str]:
+    cleaned = normpath("/" + escaped_path).lstrip("/")
+    if cleaned in {"", "."}:
+        raise EdgeSignError("signed url path must include server and key")
+    parts = cleaned.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise EdgeSignError("signed url path must include server and key")
+    return unquote(parts[0]), default_bucket, unquote(parts[1])
 
 
 def _query_get(values: list[tuple[str, str]], key: str) -> str:
