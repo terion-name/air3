@@ -44,10 +44,10 @@ If you have isolated Kubernetes clusters, locked-down microservices, or a heavil
 
 The default and recommended deployment is still the isolated single-server topology shown below: public URLs use `/{bucket}/{key}`, tickets publish to `AIR3_NATS_SUBJECT` (default `air3.tickets`), and only the Private Connector has S3 credentials or private S3 network access.
 
-Multi-server mode is opt-in with `AIR3_MULTI_SERVER=true` on the Edge. In this mode, public URLs include a server alias: `/{server}/{bucket}/{key}`. The Edge verifies that the signed URL includes the same server alias, then publishes connector tickets to the routed NATS subject rendered from `AIR3_NATS_SUBJECT_TEMPLATE` (default `air3.{server}`). A connector for that alias sets `AIR3_SERVER_NAME=<server>` and subscribes to the same derived subject. For example, `server=blue` routes `/blue/demo-bucket/file.txt` to NATS subject `air3.blue` by default.
+Multi-server mode is opt-in with `AIR3_MULTI_SERVER=true` on the Edge. In this mode, public URLs normally include a server alias and bucket: `/{server}/{bucket}/{key}`. The Edge verifies that the signed URL includes the same server alias, then publishes connector tickets to the routed NATS subject rendered from `AIR3_NATS_SUBJECT_TEMPLATE` (default `air3.{server}`). A connector for that alias sets `AIR3_SERVER_NAME=<server>` and subscribes to the same derived subject. For example, `server=blue` routes `/blue/demo-bucket/file.txt` to NATS subject `air3.blue` by default. If the Edge sets `S3_BLUE_BUCKET=demo-bucket`, signed URLs can use the short form `/blue/dir/object.txt`; the signature still binds the real bucket (`demo-bucket`) even though it is omitted from the path. For aliases with a default bucket, short-form parsing wins, so `/blue/demo-bucket/dir/object.txt` means key `demo-bucket/dir/object.txt` in the default bucket rather than an explicit bucket segment.
 
 ```sh
-# Sign a multi-server URL for the blue connector alias.
+# Sign a full-path multi-server URL for the blue connector alias.
 go run ./cmd/signurl \
   -base-url https://files.example.com \
   -server blue \
@@ -55,13 +55,22 @@ go run ./cmd/signurl \
   -key dir/object.txt \
   -secret "$AIR3_SIGNING_SECRET"
 
+# If the Edge has S3_BLUE_BUCKET=demo-bucket, emit /blue/dir/object.txt.
+go run ./cmd/signurl \
+  -base-url https://files.example.com \
+  -server blue \
+  -bucket demo-bucket \
+  -key dir/object.txt \
+  -secret "$AIR3_SIGNING_SECRET" \
+  -default-bucket-path
+
 # Connector for that alias; default template renders air3.blue.
 AIR3_SERVER_NAME=blue ./bin/private-connector
 # Or customize both sides with, for example:
 # AIR3_NATS_SUBJECT_TEMPLATE='air3.{server}.tickets'
 ```
 
-Direct servers are a separate opt-in exception for multi-server deployments. Aliases listed in `AIR3_DIRECT_SERVERS` are fetched by the Edge directly from their per-alias S3 configuration instead of using NATS and a Private Connector. That places S3 credentials and S3 network reachability on the Edge, so use it only when you intentionally accept that different trust boundary.
+Direct servers are a separate opt-in exception for multi-server deployments. Aliases listed in `AIR3_DIRECT_SERVERS` are fetched by the Edge directly from their per-alias S3 configuration instead of using NATS and a Private Connector. A direct alias can also set `S3_{SUFFIX}_BUCKET` for short-form URLs, but that default bucket must be present in `S3_{SUFFIX}_ALLOWED_BUCKETS` so the Edge allowlist still validates the real bucket. Direct mode places S3 credentials and S3 network reachability on the Edge, so use it only when you intentionally accept that different trust boundary.
 
 ```mermaid
 sequenceDiagram
@@ -145,7 +154,7 @@ make e2e
 
 The smoke tests (`make smoke`) automatically verify that signed `GET`/`HEAD` requests work, expired signatures are rejected, missing objects return `404`, and most importantly, that the Edge container *cannot* bypass the system to connect directly to the private S3 server.
 
-For a runnable multi-server example, use `make e2e-multiserver`. It exercises `blue` as a routed alias through NATS plus a Private Connector, and `direct` as an Edge direct-S3 alias using the `deploy/compose.multiserver.yaml` overlay.
+For a runnable multi-server example, use `make e2e-multiserver`. It exercises `blue` as a routed alias through NATS plus a Private Connector, and `direct` as an Edge direct-S3 alias using the `deploy/compose.multiserver.yaml` overlay. Both aliases set a demo default bucket and the smoke harness signs short-form URLs for them, while retaining a full-path `green` request to show non-default aliases are unchanged.
 
 ## Performance Benchmarks & Transport Recommendations
 

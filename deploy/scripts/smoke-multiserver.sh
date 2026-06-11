@@ -54,6 +54,14 @@ sign_url() {
   go run ./cmd/signurl -method "$method" -server "$server" -base-url "$BASE_URL" -bucket "$BUCKET" -key "$key" -secret "$SECRET" -expiration "$expiration"
 }
 
+sign_default_bucket_url() {
+  local method=$1
+  local server=$2
+  local key=$3
+  local expiration=${4:-2m}
+  go run ./cmd/signurl -method "$method" -server "$server" -base-url "$BASE_URL" -bucket "$BUCKET" -key "$key" -secret "$SECRET" -expiration "$expiration" -default-bucket-path
+}
+
 status_for() {
   local url=$1
   curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$CERT_DIR/dev-ca.crt" "$url"
@@ -137,7 +145,7 @@ check_optional_head() {
 wait_for_blue() {
   echo "Waiting for edge gateway at $BASE_URL with server '$BLUE_SERVER'..."
   local url
-  url=$(sign_url GET "$BLUE_SERVER" "$KEY" 2m)
+  url=$(sign_default_bucket_url GET "$BLUE_SERVER" "$KEY" 2m)
   for i in $(seq 1 60); do
     if [ "$(status_for "$url" || true)" = "200" ]; then
       echo "ok: edge gateway is serving routed signed requests"
@@ -166,16 +174,16 @@ fi
 
 wait_for_blue
 
-blue_get_url=$(sign_url GET "$BLUE_SERVER" "$KEY" 2m)
+blue_get_url=$(sign_default_bucket_url GET "$BLUE_SERVER" "$KEY" 2m)
 assert_body "blue signed GET" "$blue_get_url"
 
-blue_head_url=$(sign_url HEAD "$BLUE_SERVER" "$KEY" 2m)
+blue_head_url=$(sign_default_bucket_url HEAD "$BLUE_SERVER" "$KEY" 2m)
 assert_head_no_body "blue signed" "$blue_head_url"
 
-direct_get_url=$(sign_url GET "$DIRECT_SERVER" "$KEY" 2m)
+direct_get_url=$(sign_default_bucket_url GET "$DIRECT_SERVER" "$KEY" 2m)
 assert_body "direct signed GET" "$direct_get_url"
 
-direct_head_url=$(sign_url HEAD "$DIRECT_SERVER" "$KEY" 2m)
+direct_head_url=$(sign_default_bucket_url HEAD "$DIRECT_SERVER" "$KEY" 2m)
 check_optional_head "direct signed" "$direct_head_url"
 
 mutated_url=${blue_get_url/\/$BLUE_SERVER\//\/$GREEN_SERVER\/}
@@ -192,16 +200,16 @@ echo "Checking routed connector-down isolation behavior..."
 run_compose stop -t 2 private-connector-blue >/dev/null
 connector_stopped=true
 
-blue_down_url=$(sign_url GET "$BLUE_SERVER" "$KEY" 30s)
+blue_down_url=$(sign_default_bucket_url GET "$BLUE_SERVER" "$KEY" 30s)
 assert_status "blue connector-down behavior" "504" "$blue_down_url"
 
-direct_while_down_url=$(sign_url GET "$DIRECT_SERVER" "$KEY" 30s)
+direct_while_down_url=$(sign_default_bucket_url GET "$DIRECT_SERVER" "$KEY" 30s)
 assert_body "direct signed GET while blue connector is stopped" "$direct_while_down_url"
 
 run_compose start private-connector-blue >/dev/null
 connector_stopped=false
 for i in $(seq 1 30); do
-  fresh_url=$(sign_url GET "$BLUE_SERVER" "$KEY" 30s)
+  fresh_url=$(sign_default_bucket_url GET "$BLUE_SERVER" "$KEY" 30s)
   if [ "$(status_for "$fresh_url" || true)" = "200" ]; then
     echo "ok: blue connector restarted and fresh routed requests work"
     echo "Multi-server smoke tests passed"
