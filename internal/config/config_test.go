@@ -28,6 +28,15 @@ func TestLoadEdgeDefaultsWithDisabledSigning(t *testing.T) {
 	if cfg.IngestTransport != IngestTransportHTTP || cfg.IngestTCPListenAddr != "" || cfg.IngestQUICListenAddr != "" {
 		t.Fatalf("ingest transport defaults = %q/%q/%q, want http with no direct address", cfg.IngestTransport, cfg.IngestTCPListenAddr, cfg.IngestQUICListenAddr)
 	}
+	if cfg.MultiServer {
+		t.Fatal("MultiServer = true, want default false")
+	}
+	if cfg.DirectServers != nil {
+		t.Fatalf("DirectServers = %#v, want nil by default", cfg.DirectServers)
+	}
+	if cfg.NATS.Subject != "air3.tickets" || cfg.NATS.SubjectTemplate != "air3.{server}" {
+		t.Fatalf("NATS subject defaults = %q/%q, want air3.tickets/air3.{server}", cfg.NATS.Subject, cfg.NATS.SubjectTemplate)
+	}
 }
 
 func TestLoadEdgeRequiresSigningSecretWhenEnabled(t *testing.T) {
@@ -635,6 +644,300 @@ func TestTLSCertKeyMustBeConfiguredTogether(t *testing.T) {
 	env := map[string]string{"AIR3_SIGNING_DISABLED": "true", "AIR3_EDGE_MTLS_CERT_FILE": "/cert.pem"}
 	if _, err := LoadEdge(testOptions(env, map[string]bool{"/cert.pem": true})); err == nil || !strings.Contains(err.Error(), "together") {
 		t.Fatalf("LoadEdge() error = %v, want cert/key pair error", err)
+	}
+}
+
+func TestLoadEdgeParsesMultiServer(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{"default", "", false},
+		{"true", "true", true},
+		{"false", "false", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{"AIR3_SIGNING_DISABLED": "true"}
+			if tc.name != "default" {
+				env["AIR3_MULTI_SERVER"] = tc.value
+			}
+			cfg, err := LoadEdge(testOptions(env, nil))
+			if err != nil {
+				t.Fatalf("LoadEdge() error = %v", err)
+			}
+			if cfg.MultiServer != tc.want {
+				t.Fatalf("MultiServer = %t, want %t", cfg.MultiServer, tc.want)
+			}
+		})
+	}
+
+	_, err := LoadEdge(testOptions(map[string]string{
+		"AIR3_SIGNING_DISABLED": "true",
+		"AIR3_MULTI_SERVER":     "sometimes",
+	}, nil))
+	if err == nil || !strings.Contains(err.Error(), "AIR3_MULTI_SERVER must be a boolean") {
+		t.Fatalf("LoadEdge() error = %v, want AIR3_MULTI_SERVER boolean error", err)
+	}
+}
+
+func TestLoadEdgeParsesDirectServers(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED": "true",
+		"AIR3_DIRECT_SERVERS":   "alpha, beta-server,alpha",
+
+		"S3_ALPHA_ENDPOINT":          "https://alpha.example",
+		"S3_ALPHA_REGION":            "us-east-1",
+		"S3_ALPHA_ALLOWED_BUCKETS":   "demo,logs,demo",
+		"S3_ALPHA_ACCESS_KEY_ID":     "alpha-access",
+		"S3_ALPHA_SECRET_ACCESS_KEY": "alpha-secret",
+
+		"S3_BETA_SERVER_ENDPOINT":             "https://beta.example",
+		"S3_BETA_SERVER_REGION":               "us-west-2",
+		"S3_BETA_SERVER_ALLOWED_BUCKETS":      "archive",
+		"S3_BETA_SERVER_ACCESS_KEY_ID":        "beta-access",
+		"S3_BETA_SERVER_SECRET_ACCESS_KEY":    "beta-secret",
+		"S3_BETA_SERVER_USE_PATH_STYLE":       "false",
+		"S3_BETA_SERVER_INSECURE_SKIP_VERIFY": "true",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if len(cfg.DirectServers) != 2 {
+		t.Fatalf("DirectServers len = %d, want 2: %#v", len(cfg.DirectServers), cfg.DirectServers)
+	}
+	alpha := cfg.DirectServers["alpha"]
+	if alpha.Endpoint != "https://alpha.example" || alpha.Region != "us-east-1" || alpha.AccessKeyID != "alpha-access" || alpha.SecretAccessKey != "alpha-secret" {
+		t.Fatalf("alpha direct S3 config = %#v", alpha)
+	}
+	if !reflect.DeepEqual(alpha.AllowedBuckets, []string{"demo", "logs"}) {
+		t.Fatalf("alpha buckets = %#v, want demo/logs", alpha.AllowedBuckets)
+	}
+	if !alpha.UsePathStyle || alpha.InsecureSkipVerify {
+		t.Fatalf("alpha bool defaults = path-style %t insecure %t, want true/false", alpha.UsePathStyle, alpha.InsecureSkipVerify)
+	}
+	beta := cfg.DirectServers["beta-server"]
+	if beta.Endpoint != "https://beta.example" || beta.UsePathStyle || !beta.InsecureSkipVerify {
+		t.Fatalf("beta direct S3 config = %#v", beta)
+	}
+}
+
+func TestLoadEdgeParsesBareDirectServersFallback(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED":        "true",
+		"DIRECT_SERVERS":               "bare",
+		"S3_BARE_ENDPOINT":             "https://bare.example",
+		"S3_BARE_REGION":               "us-east-1",
+		"S3_BARE_ALLOWED_BUCKETS":      "demo",
+		"S3_BARE_ACCESS_KEY_ID":        "access",
+		"S3_BARE_SECRET_ACCESS_KEY":    "secret",
+		"S3_BARE_USE_PATH_STYLE":       "true",
+		"S3_BARE_INSECURE_SKIP_VERIFY": "false",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.DirectServers["bare"].Endpoint != "https://bare.example" {
+		t.Fatalf("bare direct server config = %#v", cfg.DirectServers)
+	}
+}
+
+func TestLoadEdgeRejectsDirectServerConfigErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "conflicting scoped and bare aliases",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_DIRECT_SERVERS":   "alpha",
+				"DIRECT_SERVERS":        "beta",
+			},
+			want: "AIR3_DIRECT_SERVERS and DIRECT_SERVERS conflict",
+		},
+		{
+			name: "invalid alias",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_DIRECT_SERVERS":   "bad/alias",
+			},
+			want: "invalid direct server alias",
+		},
+		{
+			name: "empty alias entry",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_DIRECT_SERVERS":   "alpha,,beta",
+			},
+			want: "empty direct server alias",
+		},
+		{
+			name: "suffix collision",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_DIRECT_SERVERS":   "a-b,a_b",
+			},
+			want: "S3_A_B_*",
+		},
+		{
+			name: "missing per-alias s3 config",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_DIRECT_SERVERS":   "alpha",
+			},
+			want: "direct server \"alpha\" (suffix ALPHA): S3_ALPHA_ALLOWED_BUCKETS",
+		},
+		{
+			name: "missing per-alias credentials",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED":    "true",
+				"AIR3_DIRECT_SERVERS":      "alpha",
+				"S3_ALPHA_ENDPOINT":        "https://alpha.example",
+				"S3_ALPHA_REGION":          "us-east-1",
+				"S3_ALPHA_ALLOWED_BUCKETS": "demo",
+				"S3_ALPHA_ACCESS_KEY_ID":   "access",
+			},
+			want: "S3_ALPHA_ACCESS_KEY_ID and S3_ALPHA_SECRET_ACCESS_KEY",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadEdge(testOptions(tc.env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadEdge() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadConnectorServerNameDerivesNATSSubject(t *testing.T) {
+	env := map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":      "access",
+		"AIR3_S3_SECRET_ACCESS_KEY":  "secret",
+		"AIR3_SERVER_NAME":           " west-1 ",
+		"AIR3_NATS_SUBJECT_TEMPLATE": "air3.{server}.tickets",
+	}
+	cfg, err := LoadConnector(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadConnector() error = %v", err)
+	}
+	if cfg.ServerName != "west-1" {
+		t.Fatalf("ServerName = %q, want west-1", cfg.ServerName)
+	}
+	if cfg.NATS.Subject != "air3.west-1.tickets" || cfg.NATS.SubjectTemplate != "air3.{server}.tickets" {
+		t.Fatalf("NATS subject/template = %q/%q, want derived/template", cfg.NATS.Subject, cfg.NATS.SubjectTemplate)
+	}
+
+	env["AIR3_NATS_SUBJECT"] = "air3.override"
+	cfg, err = LoadConnector(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadConnector() with explicit subject error = %v", err)
+	}
+	if cfg.NATS.Subject != "air3.override" {
+		t.Fatalf("explicit NATS subject = %q, want air3.override", cfg.NATS.Subject)
+	}
+}
+
+func TestLoadEdgeDoesNotDeriveNATSSubject(t *testing.T) {
+	cfg, err := LoadEdge(testOptions(map[string]string{
+		"AIR3_SIGNING_DISABLED":      "true",
+		"AIR3_NATS_SUBJECT_TEMPLATE": "air3.{server}.tickets",
+	}, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.NATS.Subject != "air3.tickets" || cfg.NATS.SubjectTemplate != "air3.{server}.tickets" {
+		t.Fatalf("edge NATS subject/template = %q/%q, want default/template", cfg.NATS.Subject, cfg.NATS.SubjectTemplate)
+	}
+}
+
+func TestLoadNATSRejectsInvalidSubjectEnv(t *testing.T) {
+	_, err := LoadEdge(testOptions(map[string]string{
+		"AIR3_SIGNING_DISABLED": "true",
+		"AIR3_NATS_SUBJECT":     "air3.*",
+	}, nil))
+	if err == nil || !strings.Contains(err.Error(), "AIR3_NATS_SUBJECT") {
+		t.Fatalf("LoadEdge() error = %v, want AIR3_NATS_SUBJECT validation error", err)
+	}
+}
+
+func TestLoadNATSRejectsInvalidSubjectTemplateEnv(t *testing.T) {
+	_, err := LoadConnector(testOptions(map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":      "access",
+		"AIR3_S3_SECRET_ACCESS_KEY":  "secret",
+		"AIR3_NATS_SUBJECT_TEMPLATE": "air3.static",
+	}, nil))
+	if err == nil || !strings.Contains(err.Error(), "AIR3_NATS_SUBJECT_TEMPLATE") {
+		t.Fatalf("LoadConnector() error = %v, want AIR3_NATS_SUBJECT_TEMPLATE validation error", err)
+	}
+}
+
+func TestLoadConnectorRejectsInvalidServerName(t *testing.T) {
+	_, err := LoadConnector(testOptions(map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":     "access",
+		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+		"AIR3_SERVER_NAME":          "bad/alias",
+	}, nil))
+	if err == nil || !strings.Contains(err.Error(), "AIR3_SERVER_NAME") {
+		t.Fatalf("LoadConnector() error = %v, want AIR3_SERVER_NAME error", err)
+	}
+}
+
+func TestValidateNATSSubject(t *testing.T) {
+	valid := []string{"air3.tickets", "air3.server_1.tickets", "foo-bar.1"}
+	for _, subject := range valid {
+		t.Run("valid/"+subject, func(t *testing.T) {
+			if err := ValidateNATSSubject(subject); err != nil {
+				t.Fatalf("ValidateNATSSubject(%q) error = %v", subject, err)
+			}
+		})
+	}
+
+	invalid := []string{"", " ", ".air3", "air3.", "air3..tickets", "air3.*", "air3.>", "air3. tickets", "air3.\u2003tickets", "air3.\x7ftickets"}
+	for _, subject := range invalid {
+		t.Run("invalid/"+subject, func(t *testing.T) {
+			if err := ValidateNATSSubject(subject); err == nil {
+				t.Fatalf("ValidateNATSSubject(%q) error = nil, want error", subject)
+			}
+		})
+	}
+}
+
+func TestValidateNATSSubjectTemplate(t *testing.T) {
+	valid := []string{"air3.{server}", "{server}.tickets"}
+	for _, template := range valid {
+		t.Run("valid/"+template, func(t *testing.T) {
+			if err := ValidateNATSSubjectTemplate(template); err != nil {
+				t.Fatalf("ValidateNATSSubjectTemplate(%q) error = %v", template, err)
+			}
+		})
+	}
+
+	invalid := []string{"", "air3", "air3.{server", "air3.server}", "air3.{bucket}", "air3.{server}.*", "air3..{server}", "air3.{server}. "}
+	for _, template := range invalid {
+		t.Run("invalid/"+template, func(t *testing.T) {
+			if err := ValidateNATSSubjectTemplate(template); err == nil {
+				t.Fatalf("ValidateNATSSubjectTemplate(%q) error = nil, want error", template)
+			}
+		})
+	}
+}
+
+func TestDeriveNATSSubject(t *testing.T) {
+	subject, err := DeriveNATSSubject("air3.{server}.tickets", "east-1")
+	if err != nil {
+		t.Fatalf("DeriveNATSSubject() error = %v", err)
+	}
+	if subject != "air3.east-1.tickets" {
+		t.Fatalf("DeriveNATSSubject() = %q, want air3.east-1.tickets", subject)
+	}
+	if _, err := DeriveNATSSubject("air3.{server}.tickets", "bad/alias"); err == nil || !strings.Contains(err.Error(), "server") {
+		t.Fatalf("DeriveNATSSubject() invalid server error = %v", err)
 	}
 }
 

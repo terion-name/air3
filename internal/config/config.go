@@ -4,9 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+
+	"github.com/terion-name/air3/internal/publicpath"
 )
 
 type LookupFunc func(string) (string, bool)
@@ -70,6 +74,8 @@ type EdgeConfig struct {
 	StreamCopyBufferBytes      int
 	AllowedBuckets             []string
 	AllowedConnectorIdentities []string
+	MultiServer                bool
+	DirectServers              map[string]S3Config
 	NATS                       NATSConfig
 	Signing                    SigningConfig
 	MTLS                       MTLSPaths
@@ -77,6 +83,7 @@ type EdgeConfig struct {
 }
 
 type ConnectorConfig struct {
+	ServerName         string
 	IngestURL          string
 	IngestDisableHTTP2 bool
 	IngestTransport    IngestTransport
@@ -92,14 +99,15 @@ type ConnectorConfig struct {
 }
 
 type NATSConfig struct {
-	URL        string
-	Subject    string
-	QueueGroup string
-	TLS        MTLSPaths
-	CredsFile  string
-	NKeyFile   string
-	User       string
-	Password   string
+	URL             string
+	Subject         string
+	SubjectTemplate string
+	QueueGroup      string
+	TLS             MTLSPaths
+	CredsFile       string
+	NKeyFile        string
+	User            string
+	Password        string
 }
 
 type S3Config struct {
@@ -145,6 +153,10 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	if err != nil {
 		return EdgeConfig{}, err
 	}
+	multiServer, err := env.bool("AIR3_MULTI_SERVER", false)
+	if err != nil {
+		return EdgeConfig{}, err
+	}
 	ingestTransport, err := loadIngestTransport(env)
 	if err != nil {
 		return EdgeConfig{}, err
@@ -157,6 +169,7 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 		IngestTCPListenAddr:   env.get("AIR3_EDGE_INGEST_TCP_ADDR", ""),
 		IngestQUICListenAddr:  env.get("AIR3_EDGE_INGEST_QUIC_ADDR", ""),
 		StreamCopyBufferBytes: streamCopyBufferBytes,
+		MultiServer:           multiServer,
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
@@ -166,7 +179,11 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	if err != nil {
 		return EdgeConfig{}, err
 	}
-	cfg.NATS, err = loadNATS(env, true)
+	cfg.DirectServers, err = loadDirectServers(env)
+	if err != nil {
+		return EdgeConfig{}, err
+	}
+	cfg.NATS, err = loadNATS(env, true, "")
 	if err != nil {
 		return EdgeConfig{}, err
 	}
@@ -212,7 +229,12 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 	if err != nil {
 		return ConnectorConfig{}, err
 	}
+	serverName, err := loadServerName(env)
+	if err != nil {
+		return ConnectorConfig{}, err
+	}
 	cfg := ConnectorConfig{
+		ServerName:         serverName,
 		IngestURL:          env.get("AIR3_INGEST_URL", "https://localhost:8443/ingest"),
 		IngestDisableHTTP2: ingestDisableHTTP2,
 		IngestTransport:    ingestTransport,
@@ -225,7 +247,7 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 	if err != nil {
 		return ConnectorConfig{}, err
 	}
-	cfg.NATS, err = loadNATS(env, false)
+	cfg.NATS, err = loadNATS(env, false, cfg.ServerName)
 	if err != nil {
 		return ConnectorConfig{}, err
 	}
@@ -263,27 +285,111 @@ func loadIngestTransport(env envReader) (IngestTransport, error) {
 	}
 }
 
-func loadNATS(env envReader, edge bool) (NATSConfig, error) {
+func DeriveNATSSubject(template, server string) (string, error) {
+	if err := publicpath.ValidateAlias(server); err != nil {
+		return "", fmt.Errorf("nats subject server %q is invalid: %w", server, err)
+	}
+	if err := ValidateNATSSubjectTemplate(template); err != nil {
+		return "", err
+	}
+	subject := strings.ReplaceAll(template, "{server}", server)
+	if err := ValidateNATSSubject(subject); err != nil {
+		return "", fmt.Errorf("derived nats subject %q is invalid: %w", subject, err)
+	}
+	return subject, nil
+}
+
+func ValidateNATSSubject(subject string) error {
+	if strings.TrimSpace(subject) == "" {
+		return errors.New("nats subject is required")
+	}
+	for _, r := range subject {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("nats subject %q contains whitespace or control characters", subject)
+		}
+		if r == '*' || r == '>' {
+			return fmt.Errorf("nats subject %q must not contain wildcards", subject)
+		}
+	}
+	for _, token := range strings.Split(subject, ".") {
+		if token == "" {
+			return fmt.Errorf("nats subject %q contains an empty token", subject)
+		}
+	}
+	return nil
+}
+
+func ValidateNATSSubjectTemplate(template string) error {
+	if strings.TrimSpace(template) == "" {
+		return errors.New("nats subject template is required")
+	}
+	seenServer := false
+	for i := 0; i < len(template); i++ {
+		switch template[i] {
+		case '{':
+			end := strings.IndexByte(template[i+1:], '}')
+			if end < 0 {
+				return fmt.Errorf("nats subject template %q has unbalanced braces", template)
+			}
+			placeholder := template[i+1 : i+1+end]
+			if placeholder != "server" {
+				return fmt.Errorf("nats subject template %q contains unknown placeholder {%s}", template, placeholder)
+			}
+			seenServer = true
+			i += end + 1
+		case '}':
+			return fmt.Errorf("nats subject template %q has unbalanced braces", template)
+		}
+	}
+	if !seenServer {
+		return fmt.Errorf("nats subject template %q must contain {server}", template)
+	}
+	sample := strings.ReplaceAll(template, "{server}", "sample")
+	if err := ValidateNATSSubject(sample); err != nil {
+		return fmt.Errorf("nats subject template %q renders an invalid subject: %w", template, err)
+	}
+	return nil
+}
+
+func loadNATS(env envReader, edge bool, serverName string) (NATSConfig, error) {
 	queueDefault := "air3-connectors"
 	if edge {
 		queueDefault = ""
 	}
+	subjectTemplate := env.get("AIR3_NATS_SUBJECT_TEMPLATE", "air3.{server}")
+	if err := ValidateNATSSubjectTemplate(subjectTemplate); err != nil {
+		return NATSConfig{}, fmt.Errorf("AIR3_NATS_SUBJECT_TEMPLATE: %w", err)
+	}
+	subject := "air3.tickets"
+	if explicitSubject, ok := env.lookupTrimmed("AIR3_NATS_SUBJECT"); ok {
+		subject = explicitSubject
+	} else if !edge && serverName != "" {
+		derived, err := DeriveNATSSubject(subjectTemplate, serverName)
+		if err != nil {
+			return NATSConfig{}, fmt.Errorf("deriving AIR3_NATS_SUBJECT from AIR3_NATS_SUBJECT_TEMPLATE and AIR3_SERVER_NAME: %w", err)
+		}
+		subject = derived
+	}
+	if err := ValidateNATSSubject(subject); err != nil {
+		return NATSConfig{}, fmt.Errorf("AIR3_NATS_SUBJECT: %w", err)
+	}
 	cfg := NATSConfig{
-		URL:        env.get("AIR3_NATS_URL", "nats://localhost:4222"),
-		Subject:    env.get("AIR3_NATS_SUBJECT", "air3.tickets"),
-		QueueGroup: env.get("AIR3_NATS_QUEUE", queueDefault),
-		CredsFile:  env.get("AIR3_NATS_CREDS_FILE", ""),
-		NKeyFile:   env.get("AIR3_NATS_NKEY_FILE", ""),
-		User:       env.get("AIR3_NATS_USER", ""),
-		Password:   env.get("AIR3_NATS_PASSWORD", ""),
+		URL:             env.get("AIR3_NATS_URL", "nats://localhost:4222"),
+		Subject:         subject,
+		SubjectTemplate: subjectTemplate,
+		QueueGroup:      env.get("AIR3_NATS_QUEUE", queueDefault),
+		CredsFile:       env.get("AIR3_NATS_CREDS_FILE", ""),
+		NKeyFile:        env.get("AIR3_NATS_NKEY_FILE", ""),
+		User:            env.get("AIR3_NATS_USER", ""),
+		Password:        env.get("AIR3_NATS_PASSWORD", ""),
 	}
 	var err error
 	cfg.TLS, err = loadMTLS(env, "AIR3_NATS_TLS")
 	if err != nil {
 		return NATSConfig{}, err
 	}
-	if cfg.URL == "" || cfg.Subject == "" {
-		return NATSConfig{}, errors.New("nats url and subject are required")
+	if cfg.URL == "" {
+		return NATSConfig{}, errors.New("nats url is required")
 	}
 	if (cfg.User == "") != (cfg.Password == "") {
 		return NATSConfig{}, errors.New("nats user and password must be configured together")
@@ -293,6 +399,128 @@ func loadNATS(env envReader, edge bool) (NATSConfig, error) {
 	}
 	if err := env.requireFile("AIR3_NATS_NKEY_FILE", cfg.NKeyFile); err != nil {
 		return NATSConfig{}, err
+	}
+	return cfg, nil
+}
+
+func loadServerName(env envReader) (string, error) {
+	serverName, ok := env.lookupTrimmed("AIR3_SERVER_NAME")
+	if !ok || serverName == "" {
+		return "", nil
+	}
+	if err := publicpath.ValidateAlias(serverName); err != nil {
+		return "", fmt.Errorf("AIR3_SERVER_NAME %q is invalid: %w", serverName, err)
+	}
+	return serverName, nil
+}
+
+func loadDirectServers(env envReader) (map[string]S3Config, error) {
+	aliasesText, source, err := directServersValue(env)
+	if err != nil {
+		return nil, err
+	}
+	if aliasesText == "" {
+		return nil, nil
+	}
+	aliases, err := parseDirectServerAliases(source, aliasesText)
+	if err != nil {
+		return nil, err
+	}
+	if len(aliases) == 0 {
+		return nil, nil
+	}
+	if err := rejectEnvSuffixCollisions(aliases); err != nil {
+		return nil, err
+	}
+	direct := make(map[string]S3Config, len(aliases))
+	for _, alias := range aliases {
+		cfg, err := loadDirectServerS3(env, alias)
+		if err != nil {
+			return nil, err
+		}
+		direct[alias] = cfg
+	}
+	return direct, nil
+}
+
+func directServersValue(env envReader) (value, source string, err error) {
+	scoped, scopedOK := env.lookupTrimmed("AIR3_DIRECT_SERVERS")
+	bare, bareOK := env.lookupTrimmed("DIRECT_SERVERS")
+	switch {
+	case scopedOK && bareOK && scoped != bare:
+		return "", "", fmt.Errorf("AIR3_DIRECT_SERVERS and DIRECT_SERVERS conflict: scoped value %q differs from bare value %q", scoped, bare)
+	case scopedOK:
+		return scoped, "AIR3_DIRECT_SERVERS", nil
+	case bareOK:
+		return bare, "DIRECT_SERVERS", nil
+	default:
+		return "", "", nil
+	}
+}
+
+func parseDirectServerAliases(source, text string) ([]string, error) {
+	parts := strings.Split(text, ",")
+	aliases := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, part := range parts {
+		alias := strings.TrimSpace(part)
+		if alias == "" {
+			return nil, fmt.Errorf("%s contains an empty direct server alias", source)
+		}
+		if err := publicpath.ValidateAlias(alias); err != nil {
+			return nil, fmt.Errorf("%s contains invalid direct server alias %q: %w", source, alias, err)
+		}
+		if !seen[alias] {
+			aliases = append(aliases, alias)
+			seen[alias] = true
+		}
+	}
+	return aliases, nil
+}
+
+func rejectEnvSuffixCollisions(aliases []string) error {
+	collisions := publicpath.EnvSuffixCollisions(aliases)
+	if len(collisions) == 0 {
+		return nil
+	}
+	suffixes := make([]string, 0, len(collisions))
+	for suffix := range collisions {
+		suffixes = append(suffixes, suffix)
+	}
+	sort.Strings(suffixes)
+	suffix := suffixes[0]
+	return fmt.Errorf("direct server aliases %s collide on S3_%s_* env suffix", strings.Join(collisions[suffix], ","), suffix)
+}
+
+func loadDirectServerS3(env envReader, alias string) (S3Config, error) {
+	suffix := publicpath.EnvSuffix(alias)
+	prefix := "S3_" + suffix
+	buckets, err := env.list(prefix+"_ALLOWED_BUCKETS", "")
+	if err != nil {
+		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %w", alias, suffix, err)
+	}
+	usePathStyle, err := env.bool(prefix+"_USE_PATH_STYLE", true)
+	if err != nil {
+		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %w", alias, suffix, err)
+	}
+	insecure, err := env.bool(prefix+"_INSECURE_SKIP_VERIFY", false)
+	if err != nil {
+		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %w", alias, suffix, err)
+	}
+	cfg := S3Config{
+		Endpoint:           env.get(prefix+"_ENDPOINT", ""),
+		Region:             env.get(prefix+"_REGION", ""),
+		AllowedBuckets:     buckets,
+		AccessKeyID:        env.get(prefix+"_ACCESS_KEY_ID", ""),
+		SecretAccessKey:    env.get(prefix+"_SECRET_ACCESS_KEY", ""),
+		UsePathStyle:       usePathStyle,
+		InsecureSkipVerify: insecure,
+	}
+	if cfg.Endpoint == "" || cfg.Region == "" {
+		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %s_ENDPOINT and %s_REGION are required", alias, suffix, prefix, prefix)
+	}
+	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
+		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %s_ACCESS_KEY_ID and %s_SECRET_ACCESS_KEY are required", alias, suffix, prefix, prefix)
 	}
 	return cfg, nil
 }
@@ -408,10 +636,18 @@ func normalizedOptions(opts Options) envReader {
 }
 
 func (e envReader) get(name, fallback string) string {
-	if value, ok := e.lookup(name); ok {
-		return strings.TrimSpace(value)
+	if value, ok := e.lookupTrimmed(name); ok {
+		return value
 	}
 	return fallback
+}
+
+func (e envReader) lookupTrimmed(name string) (string, bool) {
+	value, ok := e.lookup(name)
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(value), true
 }
 
 func (e envReader) duration(name string, fallback time.Duration) (time.Duration, error) {
