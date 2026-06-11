@@ -5,6 +5,7 @@ export type HttpMethod = 'GET' | 'HEAD' | string;
 export interface SignUrlInput {
   method: HttpMethod;
   baseUrl: string;
+  server?: string;
   bucket: string;
   key: string;
   secret: string;
@@ -17,6 +18,7 @@ export interface SignUrlInput {
 export interface VerifyUrlInput {
   method: HttpMethod;
   url: string;
+  server?: string;
   secret: string;
   now: Date | number;
   range?: string;
@@ -24,6 +26,7 @@ export interface VerifyUrlInput {
 
 export interface Claims {
   method: 'GET' | 'HEAD';
+  server?: string;
   bucket: string;
   key: string;
   expires: Date;
@@ -77,7 +80,7 @@ export function signUrl(input: SignUrlInput): string {
     throw new EdgeSignError('base url must be absolute');
   }
 
-  const objectPath = appendObjectPath(decodePathname(parsed.pathname), input.bucket, input.key);
+  const objectPath = appendObjectPath(decodePathname(parsed.pathname), claims.server ?? '', input.bucket, input.key);
   const query = collectQuery(parsed.searchParams);
   setQueryValue(query, 'expires', String(toUnixSeconds(input.expires)));
   if (input.range) setQueryValue(query, 'range', input.range);
@@ -94,7 +97,7 @@ export function signUrl(input: SignUrlInput): string {
 }
 
 export function verifyUrl(input: VerifyUrlInput): Claims {
-  const { claims, sig } = claimsFromUrl(input.method, input.url);
+  const { claims, sig } = claimsFromUrl(input.method, input.url, input.server ?? '');
   if (input.secret === '') {
     throw new EdgeSignError('signing secret is required');
   }
@@ -121,19 +124,27 @@ export function verifyUrl(input: VerifyUrlInput): Claims {
 }
 
 export function canonicalString(claims: Claims): string {
-  return [
-    claims.method.toUpperCase(),
+  const fields = [claims.method.toUpperCase()];
+  if ((claims.server ?? '') !== '') {
+    fields.push(claims.server ?? '');
+  }
+  fields.push(
     claims.bucket,
     claims.key,
     String(toUnixSeconds(claims.expires)),
     claims.range,
     claims.responseContentType,
     claims.responseContentDisposition,
-  ].join('\n');
+  );
+  return fields.join('\n');
 }
 
 function claimsFromInput(input: SignUrlInput): Claims {
   const method = normalizeMethod(input.method);
+  const server = input.server ?? '';
+  if (server !== '') {
+    validateServerAlias(server);
+  }
   validateBucket(input.bucket);
   validateKey(input.key);
   const expires = toUnixSeconds(input.expires);
@@ -142,6 +153,7 @@ function claimsFromInput(input: SignUrlInput): Claims {
   }
   return {
     method,
+    ...(server !== '' ? { server } : {}),
     bucket: input.bucket,
     key: input.key,
     expires: new Date(expires * 1000),
@@ -151,9 +163,17 @@ function claimsFromInput(input: SignUrlInput): Claims {
   };
 }
 
-function claimsFromUrl(method: HttpMethod, rawUrl: string): { claims: Claims; sig: string } {
+function claimsFromUrl(method: HttpMethod, rawUrl: string, expectedServer: string): { claims: Claims; sig: string } {
+  if (expectedServer !== '') {
+    validateServerAlias(expectedServer);
+  }
   const parsed = parseUrl(rawUrl, 'signed url');
-  const [bucket, key] = objectFromPath(parsed.pathname);
+  const [server, bucket, key] = expectedServer === ''
+    ? ['', ...objectFromPath(parsed.pathname)]
+    : objectFromServerPath(parsed.pathname);
+  if (expectedServer !== '' && server !== expectedServer) {
+    throw new InvalidSignatureError();
+  }
   const expiresText = parsed.searchParams.get('expires') ?? '';
   if (expiresText === '') {
     throw new EdgeSignError('expires query parameter is required');
@@ -162,6 +182,7 @@ function claimsFromUrl(method: HttpMethod, rawUrl: string): { claims: Claims; si
   const claims = claimsFromInput({
     method,
     baseUrl: 'https://edge.invalid',
+    server,
     bucket,
     key,
     expires,
@@ -194,8 +215,13 @@ function constantTimeHexEqual(suppliedHex: string, expectedHex: string): boolean
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
-function appendObjectPath(basePath: string, bucket: string, key: string): string {
-  const parts = [trimSlashes(basePath), goPathEscape(bucket), ...key.split('/').map(goPathEscape)].filter((part) => part !== '');
+function appendObjectPath(basePath: string, server: string, bucket: string, key: string): string {
+  const parts = [
+    trimSlashes(basePath),
+    ...(server !== '' ? [goPathEscape(server)] : []),
+    goPathEscape(bucket),
+    ...key.split('/').map(goPathEscape),
+  ].filter((part) => part !== '');
   return `/${parts.join('/')}`;
 }
 
@@ -211,6 +237,20 @@ function objectFromPath(escapedPath: string): [string, string] {
   const bucket = pathUnescape(cleaned.slice(0, slash), 'decode bucket path');
   const key = pathUnescape(cleaned.slice(slash + 1), 'decode key path');
   return [bucket, key];
+}
+
+function objectFromServerPath(escapedPath: string): [string, string, string] {
+  const cleaned = cleanPath(`/${escapedPath}`).replace(/^\/+/, '');
+  const firstSlash = cleaned.indexOf('/');
+  const secondSlash = firstSlash < 0 ? -1 : cleaned.indexOf('/', firstSlash + 1);
+  if (cleaned === '' || cleaned === '.' || firstSlash <= 0 || secondSlash <= firstSlash + 1 || secondSlash === cleaned.length - 1) {
+    throw new EdgeSignError('signed url path must include server, bucket and key');
+  }
+  const server = pathUnescape(cleaned.slice(0, firstSlash), 'decode server path');
+  validateServerAlias(server);
+  const bucket = pathUnescape(cleaned.slice(firstSlash + 1, secondSlash), 'decode bucket path');
+  const key = pathUnescape(cleaned.slice(secondSlash + 1), 'decode key path');
+  return [server, bucket, key];
 }
 
 function cleanPath(pathname: string): string {
@@ -334,6 +374,33 @@ function parseUnixSeconds(text: string): number {
     throw new EdgeSignError('expires query parameter must be positive');
   }
   return n;
+}
+
+function validateServerAlias(alias: string): void {
+  const bytes = Buffer.from(alias, 'utf8');
+  if (alias === '') {
+    throw new EdgeSignError('server alias: alias is empty');
+  }
+  if (bytes.length > 63) {
+    throw new EdgeSignError('server alias: alias is too long');
+  }
+  if (!isAliasAlphaNum(bytes[0] ?? 0)) {
+    throw new EdgeSignError('server alias: alias must start with an ASCII letter or digit');
+  }
+  for (let i = 1; i < bytes.length; i += 1) {
+    const byte = bytes[i] ?? 0;
+    if (!isAliasChar(byte)) {
+      throw new EdgeSignError(`server alias: alias contains invalid character ${JSON.stringify(String.fromCharCode(byte))}`);
+    }
+  }
+}
+
+function isAliasChar(byte: number): boolean {
+  return isAliasAlphaNum(byte) || byte === 0x5f || byte === 0x2d;
+}
+
+function isAliasAlphaNum(byte: number): boolean {
+  return isAlphaNum(byte);
 }
 
 function validateBucket(bucket: string): void {

@@ -1,0 +1,49 @@
+export type HttpMethod = 'GET' | 'HEAD' | string;
+export interface SignUrlInput {
+    method: HttpMethod;
+    baseUrl: string;
+    server?: string;
+    bucket: string;
+    key: string;
+    secret: string;
+    expires: Date | number;
+    range?: string;
+    responseContentType?: string;
+    responseContentDisposition?: string;
+}
+export interface VerifyUrlInput {
+    method: HttpMethod;
+    url: string;
+    server?: string;
+    secret: string;
+    now: Date | number;
+    range?: string;
+}
+export interface Claims {
+    method: 'GET' | 'HEAD';
+    server?: string;
+    bucket: string;
+    key: string;
+    expires: Date;
+    range: string;
+    responseContentType: string;
+    responseContentDisposition: string;
+}
+export declare class EdgeSignError extends Error {
+    constructor(message: string);
+}
+export declare class InvalidSignatureError extends EdgeSignError {
+    constructor();
+}
+export declare class ExpiredSignatureError extends EdgeSignError {
+    constructor();
+}
+export declare class UnsignedRangeError extends EdgeSignError {
+    constructor();
+}
+export declare class RangeMismatchError extends EdgeSignError {
+    constructor();
+}
+export declare function signUrl(input: SignUrlInput): string;
+export declare function verifyUrl(input: VerifyUrlInput): Claims;
+export declare function canonicalString(claims: Claims): string;
