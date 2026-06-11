@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/terion-name/air3/internal/publicpath"
 )
 
 const Version = 1
@@ -36,6 +38,7 @@ type Ticket struct {
 	Key            string `json:"key"`
 	Method         string `json:"method"`
 	Range          string `json:"range,omitempty"`
+	Server         string `json:"server,omitempty"`
 	DeadlineUnixMS int64  `json:"deadline_unix_ms"`
 	IngestURL      string `json:"ingest_url"`
 	IngestToken    string `json:"ingest_token"`
@@ -92,6 +95,11 @@ func (t Ticket) Validate(now time.Time) error {
 	}
 	if t.Range != "" && !validRange(t.Range) {
 		return fieldError("range", "must be a single HTTP byte range")
+	}
+	if t.Server != "" {
+		if err := publicpath.ValidateAlias(t.Server); err != nil {
+			return fieldError("server", "must be a valid server alias")
+		}
 	}
 	if t.DeadlineUnixMS <= 0 {
 		return fieldError("deadline_unix_ms", "is required")

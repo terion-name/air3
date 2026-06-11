@@ -1,6 +1,7 @@
 package tickets
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -29,12 +30,38 @@ func TestTicketMarshalUnmarshalValidatesClosedSchema(t *testing.T) {
 		t.Fatalf("Marshal() error = %v", err)
 	}
 
+	if bytes.Contains(data, []byte(`"server"`)) {
+		t.Fatalf("Marshal() included legacy empty server: %s", data)
+	}
+
 	got, err := Unmarshal(data, now)
 	if err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	if got.RequestID != "req-123" || got.Bucket != "demo-bucket" || got.Key != "path/to/object.txt" {
+	if got.RequestID != "req-123" || got.Bucket != "demo-bucket" || got.Key != "path/to/object.txt" || got.Server != "" {
 		t.Fatalf("Unmarshal() = %#v", got)
+	}
+}
+
+func TestTicketServerRoundTrip(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	ticket := validTicket(now)
+	ticket.Server = "edge_west-1"
+
+	data, err := Marshal(ticket, now)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"server":"edge_west-1"`)) {
+		t.Fatalf("Marshal() omitted server: %s", data)
+	}
+
+	got, err := Unmarshal(data, now)
+	if err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if got.Server != "edge_west-1" {
+		t.Fatalf("Unmarshal().Server = %q, want %q", got.Server, "edge_west-1")
 	}
 }
 
@@ -50,6 +77,7 @@ func TestTicketValidationRejectsUnsafeCases(t *testing.T) {
 		{"bad bucket", func(t *Ticket) { t.Bucket = "Bad_Bucket" }},
 		{"bad key", func(t *Ticket) { t.Key = "../secret" }},
 		{"bad range", func(t *Ticket) { t.Range = "bytes=10-1" }},
+		{"bad server", func(t *Ticket) { t.Server = "-edge" }},
 		{"expired", func(t *Ticket) { t.DeadlineUnixMS = now.Add(-time.Second).UnixMilli() }},
 		{"plain ingest url", func(t *Ticket) { t.IngestURL = "http://edge/ingest" }},
 		{"ingest url credentials", func(t *Ticket) { t.IngestURL = "https://user:pass@edge/ingest" }},
