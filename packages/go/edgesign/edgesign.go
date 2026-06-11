@@ -29,8 +29,9 @@ var (
 
 // SignInput describes one public edge object URL to sign.
 //
-// DefaultBucketPath only applies in multi-server mode. When set, SignURL emits
-// /{server}/{key} while signing the canonical claims with the real Bucket.
+// DefaultBucketPath applies in single-server and multi-server modes. When set,
+// SignURL emits /{key} in single-server mode or /{server}/{key} in
+// multi-server mode while signing the canonical claims with the real Bucket.
 type SignInput struct {
 	Method                     string
 	BaseURL                    string
@@ -63,9 +64,10 @@ type Claims struct {
 // set, the URL must include the same signed range claim. When it is empty, a
 // signed range claim remains valid and is returned in Claims.Range.
 //
-// DefaultBucket only applies in multi-server mode. When set, VerifyURL also
-// accepts /{server}/{key} paths and verifies the signature against DefaultBucket
-// as the real signed bucket claim.
+// DefaultBucket applies in single-server and multi-server modes. When set,
+// VerifyURL also accepts /{key} in single-server mode or /{server}/{key} in
+// multi-server mode and verifies the signature against DefaultBucket as the real
+// signed bucket claim.
 type VerifyInput struct {
 	Method        string
 	URL           string
@@ -77,7 +79,8 @@ type VerifyInput struct {
 }
 
 // SignURL returns BaseURL/{bucket}/{key}?expires=...&sig=... using the edge
-// gateway HMAC canonical form. When Server is set, it returns
+// gateway HMAC canonical form unless DefaultBucketPath requests the short
+// /{key} form. When Server is set, it returns
 // BaseURL/{server}/{bucket}/{key}?expires=...&sig=... using multi-server mode
 // unless DefaultBucketPath requests the short /{server}/{key} form.
 func SignURL(input SignInput) (string, error) {
@@ -94,6 +97,9 @@ func SignURL(input SignInput) (string, error) {
 		Secret:                     input.Secret,
 	}
 	if input.Server == "" {
+		if input.DefaultBucketPath {
+			return signing.SignURLForModeWithOptions(signingInput, publicpath.ModeSingle, signing.SignOptions{DefaultBucketPath: true})
+		}
 		return signing.SignURL(signingInput)
 	}
 	raw, err := signing.SignURLForMode(signingInput, publicpath.ModeMulti)
@@ -136,6 +142,13 @@ func VerifyURL(input VerifyInput) (Claims, error) {
 func validateURL(input VerifyInput) (signing.Claims, error) {
 	cfg := signing.ValidationConfig{Secret: input.Secret}
 	if input.Server == "" {
+		if input.DefaultBucket != "" {
+			return signing.ValidateURLForModeWithOptions(input.Method, input.URL, cfg, input.Now, publicpath.ModeSingle, signing.ValidationOptions{
+				DefaultBucket: func(server string) (string, bool) {
+					return input.DefaultBucket, server == ""
+				},
+			})
+		}
 		return signing.ValidateURL(input.Method, input.URL, cfg, input.Now)
 	}
 	claims, err := signing.ValidateURLForMode(input.Method, input.URL, cfg, input.Now, publicpath.ModeMulti)

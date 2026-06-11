@@ -211,6 +211,106 @@ func TestNoServerUsesLegacySingleServerBehavior(t *testing.T) {
 	}
 }
 
+func TestSingleServerDefaultBucketPathSignAndVerify(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	expires := now.Add(time.Minute)
+	raw, err := SignURL(SignInput{
+		Method:            "GET",
+		BaseURL:           "https://files.example.com",
+		Bucket:            "demo",
+		Key:               "file.txt",
+		Secret:            "top-secret",
+		Expires:           expires,
+		DefaultBucketPath: true,
+	})
+	if err != nil {
+		t.Fatalf("SignURL() error = %v", err)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse signed URL: %v", err)
+	}
+	if got, want := u.EscapedPath(), "/file.txt"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+
+	claims, err := VerifyURL(VerifyInput{Method: "GET", URL: raw, Secret: "top-secret", Now: now, DefaultBucket: "demo"})
+	if err != nil {
+		t.Fatalf("VerifyURL() error = %v", err)
+	}
+	if claims.Server != "" || claims.Bucket != "demo" || claims.Key != "file.txt" {
+		t.Fatalf("claims = %#v", claims)
+	}
+	wantCanonical := "GET\ndemo\nfile.txt\n" + formatUnixSeconds(expires) + "\n\n\n"
+	if got := CanonicalString(claims); got != wantCanonical {
+		t.Fatalf("CanonicalString() = %q, want %q", got, wantCanonical)
+	}
+}
+
+func TestSingleServerDefaultBucketPathRequiresDefaultBucket(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	raw, err := SignURL(SignInput{
+		Method:            "GET",
+		BaseURL:           "https://files.example.com",
+		Bucket:            "demo",
+		Key:               "file.txt",
+		Secret:            "top-secret",
+		Expires:           now.Add(time.Minute),
+		DefaultBucketPath: true,
+	})
+	if err != nil {
+		t.Fatalf("SignURL() error = %v", err)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse signed URL: %v", err)
+	}
+	if got, want := u.EscapedPath(), "/file.txt"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+
+	_, err = VerifyURL(VerifyInput{Method: "GET", URL: raw, Secret: "top-secret", Now: now})
+	if err == nil {
+		t.Fatal("VerifyURL() without DefaultBucket succeeded, want error")
+	}
+}
+
+func TestSingleServerDefaultBucketPathShortFormWins(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	expires := now.Add(time.Minute)
+	raw, err := SignURL(SignInput{
+		Method:            "GET",
+		BaseURL:           "https://files.example.com",
+		Bucket:            "demo",
+		Key:               "demo/file.txt",
+		Secret:            "top-secret",
+		Expires:           expires,
+		DefaultBucketPath: true,
+	})
+	if err != nil {
+		t.Fatalf("SignURL() error = %v", err)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse signed URL: %v", err)
+	}
+	if got, want := u.EscapedPath(), "/demo/file.txt"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+
+	claims, err := VerifyURL(VerifyInput{Method: "GET", URL: raw, Secret: "top-secret", Now: now, DefaultBucket: "demo"})
+	if err != nil {
+		t.Fatalf("VerifyURL() error = %v", err)
+	}
+	if claims.Server != "" || claims.Bucket != "demo" || claims.Key != "demo/file.txt" {
+		t.Fatalf("claims = %#v", claims)
+	}
+	wantCanonical := "GET\ndemo\ndemo/file.txt\n" + formatUnixSeconds(expires) + "\n\n\n"
+	if got := CanonicalString(claims); got != wantCanonical {
+		t.Fatalf("CanonicalString() = %q, want %q", got, wantCanonical)
+	}
+}
+
 func loadVectors(t *testing.T) []vector {
 	t.Helper()
 	data, err := os.ReadFile("../../testdata/edge-signing-vectors.json")
