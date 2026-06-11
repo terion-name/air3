@@ -135,6 +135,22 @@ func signedDefaultBucketMultiURL(t *testing.T, method, server, bucket, key strin
 	return signed
 }
 
+func signedDefaultBucketSingleURL(t *testing.T, method, bucket, key string, now time.Time) string {
+	t.Helper()
+	signed, err := signing.SignURLForModeWithOptions(signing.SignInput{
+		Method:  method,
+		BaseURL: "https://files.example",
+		Bucket:  bucket,
+		Key:     key,
+		Expires: now.Add(time.Minute),
+		Secret:  "secret",
+	}, publicpath.ModeSingle, signing.SignOptions{DefaultBucketPath: true})
+	if err != nil {
+		t.Fatalf("SignURLForModeWithOptions() error = %v", err)
+	}
+	return signed
+}
+
 func testMultiEdge(pub *fakePublisher, cfg config.EdgeConfig, fetchers map[string]objectFetcher) (*edgeServer, *pending.Registry) {
 	reg := pending.NewRegistry(pending.Options{})
 	cfg.IngestURL = "https://edge.internal/_ingest"
@@ -617,6 +633,136 @@ func TestSingleServerPublishesDefaultSubjectAndEmptyServer(t *testing.T) {
 	subjects := pub.subjectSnapshot()
 	if len(subjects) != 1 || subjects[0] != "air3.tickets" {
 		t.Fatalf("subjects = %#v, want [air3.tickets]", subjects)
+	}
+}
+
+func TestSingleServerDefaultBucketShortPathPublishesTicket(t *testing.T) {
+	pub := &fakePublisher{err: errors.New("stop after publish")}
+	reg := pending.NewRegistry(pending.Options{})
+	edge := newEdgeServer(config.EdgeConfig{
+		IngestURL:      "https://edge.internal/_ingest",
+		DefaultBucket:  "demo",
+		AllowedBuckets: []string{"demo"},
+		NATS:           config.NATSConfig{Subject: "air3.tickets"},
+		Signing:        config.SigningConfig{Disabled: true},
+		Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
+	}, reg, pub, nil)
+	edge.newToken = func() (string, error) { return "single-default-token", nil }
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/file.txt", nil))
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	if published[0].Server != "" || published[0].Bucket != "demo" || published[0].Key != "file.txt" {
+		t.Fatalf("published ticket = %#v, want empty server bucket demo key file.txt", published[0])
+	}
+}
+
+func TestSingleServerDefaultBucketShortFormWinsOverBucketPrefix(t *testing.T) {
+	pub := &fakePublisher{err: errors.New("stop after publish")}
+	reg := pending.NewRegistry(pending.Options{})
+	edge := newEdgeServer(config.EdgeConfig{
+		IngestURL:      "https://edge.internal/_ingest",
+		DefaultBucket:  "demo",
+		AllowedBuckets: []string{"demo"},
+		Signing:        config.SigningConfig{Disabled: true},
+		Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
+	}, reg, pub, nil)
+	edge.newToken = func() (string, error) { return "single-explicit-token", nil }
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/demo/file.txt", nil))
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	if published[0].Server != "" || published[0].Bucket != "demo" || published[0].Key != "demo/file.txt" {
+		t.Fatalf("published ticket = %#v, want empty server bucket demo key demo/file.txt", published[0])
+	}
+}
+
+func TestSingleServerDefaultBucketShortPathAllowlistUsesResolvedBucket(t *testing.T) {
+	pub := &fakePublisher{}
+	reg := pending.NewRegistry(pending.Options{})
+	edge := newEdgeServer(config.EdgeConfig{
+		IngestURL:      "https://edge.internal/_ingest",
+		DefaultBucket:  "demo",
+		AllowedBuckets: []string{"other"},
+		Signing:        config.SigningConfig{Disabled: true},
+		Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
+	}, reg, pub, nil)
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/file.txt", nil))
+	if got := resp.Result().StatusCode; got != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+	}
+	if pub.count() != 0 {
+		t.Fatalf("published %d tickets, want 0", pub.count())
+	}
+}
+
+func TestSignedSingleServerDefaultBucketShortURLAcceptedAndTamperingRejected(t *testing.T) {
+	now := time.Now()
+	signed := signedDefaultBucketSingleURL(t, http.MethodGet, "demo", "file.txt", now)
+
+	t.Run("accepted", func(t *testing.T) {
+		pub := &fakePublisher{err: errors.New("stop after publish")}
+		reg := pending.NewRegistry(pending.Options{})
+		edge := newEdgeServer(config.EdgeConfig{
+			IngestURL:      "https://edge.internal/_ingest",
+			DefaultBucket:  "demo",
+			AllowedBuckets: []string{"demo"},
+			Signing:        config.SigningConfig{Secret: "secret"},
+			Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
+		}, reg, pub, nil)
+		edge.now = func() time.Time { return now }
+		edge.newToken = func() (string, error) { return "signed-single-default-token", nil }
+
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, signed, nil))
+
+		published := pub.snapshot()
+		if len(published) != 1 {
+			t.Fatalf("published tickets = %#v, want one", published)
+		}
+		if published[0].Server != "" || published[0].Bucket != "demo" || published[0].Key != "file.txt" {
+			t.Fatalf("published ticket = %#v, want empty server bucket demo key file.txt", published[0])
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "path", raw: strings.Replace(signed, "/file.txt", "/other.txt", 1)},
+		{name: "signature", raw: strings.Replace(signed, "sig=", "sig=bad", 1)},
+	} {
+		t.Run("tampered "+tt.name, func(t *testing.T) {
+			pub := &fakePublisher{}
+			reg := pending.NewRegistry(pending.Options{})
+			edge := newEdgeServer(config.EdgeConfig{
+				IngestURL:      "https://edge.internal/_ingest",
+				DefaultBucket:  "demo",
+				AllowedBuckets: []string{"demo"},
+				Signing:        config.SigningConfig{Secret: "secret"},
+				Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
+			}, reg, pub, nil)
+			edge.now = func() time.Time { return now }
+
+			resp := httptest.NewRecorder()
+			edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, tt.raw, nil))
+			if got := resp.Result().StatusCode; got != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+			}
+			if pub.count() != 0 {
+				t.Fatalf("published %d tickets, want 0", pub.count())
+			}
+		})
 	}
 }
 
