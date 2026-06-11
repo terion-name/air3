@@ -152,12 +152,90 @@ func TestParseEscapedPathMulti(t *testing.T) {
 
 func TestParseEscapedPathWithDefaultBucketSingle(t *testing.T) {
 	resolver := func(server string) (string, bool) {
-		t.Fatalf("resolver should not be called for ModeSingle, got server %q", server)
+		if server == "" {
+			return "demo", true
+		}
 		return "", false
 	}
 
-	got, err := ParseEscapedPathWithDefaultBucket("/photos/cat.jpg", ModeSingle, resolver)
+	tests := []struct {
+		name    string
+		path    string
+		want    Object
+		wantErr string
+	}{
+		{
+			name: "default bucket single key segment",
+			path: "/file.txt",
+			want: Object{Bucket: "demo", Key: "file.txt"},
+		},
+		{
+			name: "default bucket nested key",
+			path: "/archive/file.txt",
+			want: Object{Bucket: "demo", Key: "archive/file.txt"},
+		},
+		{
+			name: "default bucket preserves bucket-looking key prefix",
+			path: "/demo/file.txt",
+			want: Object{Bucket: "demo", Key: "demo/file.txt"},
+		},
+		{
+			name: "default bucket escaped key segments",
+			path: "/dir%201/file%2Fname.txt",
+			want: Object{Bucket: "demo", Key: "dir 1/file/name.txt"},
+		},
+		{
+			name:    "default bucket missing leading slash",
+			path:    "file.txt",
+			wantErr: "leading slash",
+		},
+		{
+			name:    "default bucket missing key",
+			path:    "/",
+			wantErr: "missing key",
+		},
+		{
+			name:    "default bucket bad key escape",
+			path:    "/bad%ZZ",
+			wantErr: "bad escape in key",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseEscapedPathWithDefaultBucket(tc.path, ModeSingle, resolver)
+			assertParseResult(t, got, err, tc.want, tc.wantErr)
+		})
+	}
+}
+
+func TestParseEscapedPathWithDefaultBucketSingleStrictFallback(t *testing.T) {
+	got, err := ParseEscapedPathWithDefaultBucket("/photos/cat.jpg", ModeSingle, nil)
 	assertParseResult(t, got, err, Object{Bucket: "photos", Key: "cat.jpg"}, "")
+
+	noDefault := func(server string) (string, bool) {
+		if server != "" {
+			t.Fatalf("resolver server = %q, want empty alias", server)
+		}
+		return "", false
+	}
+	got, err = ParseEscapedPathWithDefaultBucket("/photos/cat.jpg", ModeSingle, noDefault)
+	assertParseResult(t, got, err, Object{Bucket: "photos", Key: "cat.jpg"}, "")
+
+	got, err = ParseEscapedPathWithDefaultBucket("/file.txt", ModeSingle, noDefault)
+	assertParseResult(t, got, err, Object{}, "missing key")
+}
+
+func TestParseEscapedPathWithDefaultBucketSingleRejectsEmptyDefault(t *testing.T) {
+	resolver := func(server string) (string, bool) {
+		if server != "" {
+			t.Fatalf("resolver server = %q, want empty alias", server)
+		}
+		return "", true
+	}
+
+	got, err := ParseEscapedPathWithDefaultBucket("/file.txt", ModeSingle, resolver)
+	assertParseResult(t, got, err, Object{}, "empty default bucket")
 }
 
 func TestParseEscapedPathWithDefaultBucketMulti(t *testing.T) {

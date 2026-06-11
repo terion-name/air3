@@ -101,9 +101,46 @@ func ParseEscapedPath(escapedPath string, mode Mode) (Object, error) {
 }
 
 func ParseEscapedPathWithDefaultBucket(escapedPath string, mode Mode, defaultBucket DefaultBucketResolver) (Object, error) {
-	if mode != ModeMulti || defaultBucket == nil {
+	if defaultBucket == nil {
 		return ParseEscapedPath(escapedPath, mode)
 	}
+
+	switch mode {
+	case ModeSingle:
+		return parseSingleEscapedPathWithDefaultBucket(escapedPath, defaultBucket)
+	case ModeMulti:
+		return parseMultiEscapedPathWithDefaultBucket(escapedPath, defaultBucket)
+	default:
+		return ParseEscapedPath(escapedPath, mode)
+	}
+}
+
+func parseSingleEscapedPathWithDefaultBucket(escapedPath string, defaultBucket DefaultBucketResolver) (Object, error) {
+	bucket, ok := defaultBucket("")
+	if !ok {
+		return ParseEscapedPath(escapedPath, ModeSingle)
+	}
+	if bucket == "" {
+		return Object{}, fmt.Errorf("public path: empty default bucket for server %q", "")
+	}
+	if !strings.HasPrefix(escapedPath, "/") {
+		return Object{}, fmt.Errorf("public path: missing leading slash")
+	}
+	if escapedPath == "/" {
+		return Object{}, fmt.Errorf("public path: missing key")
+	}
+
+	key, err := unescapeKey(strings.Split(escapedPath[1:], "/"))
+	if err != nil {
+		return Object{}, err
+	}
+	if key == "" {
+		return Object{}, fmt.Errorf("public path: empty key")
+	}
+	return Object{Bucket: bucket, Key: key}, nil
+}
+
+func parseMultiEscapedPathWithDefaultBucket(escapedPath string, defaultBucket DefaultBucketResolver) (Object, error) {
 	if !strings.HasPrefix(escapedPath, "/") {
 		return Object{}, fmt.Errorf("public path: missing leading slash")
 	}
@@ -126,7 +163,7 @@ func ParseEscapedPathWithDefaultBucket(escapedPath string, mode Mode, defaultBuc
 
 	bucket, ok := defaultBucket(server)
 	if !ok {
-		return ParseEscapedPath(escapedPath, mode)
+		return ParseEscapedPath(escapedPath, ModeMulti)
 	}
 	if bucket == "" {
 		return Object{}, fmt.Errorf("public path: empty default bucket for server %q", server)

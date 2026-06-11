@@ -89,9 +89,6 @@ func SignURLForModeWithOptions(input SignInput, mode publicpath.Mode, opts SignO
 	if err := validateMode(mode); err != nil {
 		return "", err
 	}
-	if opts.DefaultBucketPath && mode != publicpath.ModeMulti {
-		return "", errors.New("default-bucket-path requires multi-server mode")
-	}
 	if input.Secret == "" {
 		return "", errors.New("signing secret is required")
 	}
@@ -317,7 +314,7 @@ func appendObjectPath(basePath string, object publicpath.Object, mode publicpath
 }
 
 func objectFromEscapedPath(escapedPath string, mode publicpath.Mode, opts ValidationOptions) (publicpath.Object, error) {
-	if opts.DefaultBucket != nil && mode == publicpath.ModeMulti {
+	if opts.DefaultBucket != nil {
 		return publicpath.ParseEscapedPathWithDefaultBucket(escapedPath, mode, opts.DefaultBucket)
 	}
 	switch mode {
