@@ -54,6 +54,7 @@ class Claims:
     range: str = ""
     response_content_type: str = ""
     response_content_disposition: str = ""
+    server: str = ""
 
 
 def sign_url(
@@ -64,6 +65,7 @@ def sign_url(
     key: str,
     secret: str,
     expires: datetime | int | float,
+    server: str = "",
     range: str = "",
     response_content_type: str = "",
     response_content_disposition: str = "",
@@ -76,6 +78,7 @@ def sign_url(
         bucket=bucket,
         key=key,
         expires=expires,
+        server=server,
         range=range,
         response_content_type=response_content_type,
         response_content_disposition=response_content_disposition,
@@ -84,7 +87,7 @@ def sign_url(
     if not parsed.scheme or not parsed.netloc:
         raise EdgeSignError("base url must be absolute")
 
-    object_path = _append_object_path(unquote(parsed.path), bucket, key)
+    object_path = _append_object_path(unquote(parsed.path), bucket, key, server=server)
     query = _collect_query(parsed.query)
     _set_query_value(query, PARAM_EXPIRES, str(_unix_seconds(expires)))
     if range:
@@ -104,10 +107,11 @@ def verify_url(
     url: str,
     secret: str,
     now: datetime | int | float,
+    server: str = "",
     range: str = "",
 ) -> Claims:
     """Validate an air3 edge signed URL and return its signed claims."""
-    claims, sig = _claims_from_url(method, url)
+    claims, sig = _claims_from_url(method, url, server=server)
     if secret == "":
         raise EdgeSignError("signing secret is required")
     if sig == "":
@@ -128,9 +132,11 @@ def verify_url(
 
 def canonical_string(claims: Claims) -> str:
     """Return the exact newline-delimited text covered by the edge signature."""
-    return "\n".join(
+    parts = [claims.method.upper()]
+    if claims.server:
+        parts.append(claims.server)
+    parts.extend(
         [
-            claims.method.upper(),
             claims.bucket,
             claims.key,
             str(_unix_seconds(claims.expires)),
@@ -139,6 +145,7 @@ def canonical_string(claims: Claims) -> str:
             claims.response_content_disposition,
         ]
     )
+    return "\n".join(parts)
 
 
 def _claims_from_input(
@@ -147,6 +154,7 @@ def _claims_from_input(
     bucket: str,
     key: str,
     expires: datetime | int | float,
+    server: str = "",
     range: str = "",
     response_content_type: str = "",
     response_content_disposition: str = "",
@@ -154,6 +162,8 @@ def _claims_from_input(
     normalized_method = method.strip().upper()
     if normalized_method not in {"GET", "HEAD"}:
         raise EdgeSignError("method must be GET or HEAD")
+    if server:
+        _validate_server_alias(server)
     _validate_bucket(bucket)
     _validate_key(key)
     expires_unix = _unix_seconds(expires)
@@ -164,15 +174,23 @@ def _claims_from_input(
         bucket=bucket,
         key=key,
         expires=datetime.fromtimestamp(expires_unix, tz=timezone.utc),
+        server=server,
         range=range,
         response_content_type=response_content_type,
         response_content_disposition=response_content_disposition,
     )
 
 
-def _claims_from_url(method: str, raw_url: str) -> tuple[Claims, str]:
+def _claims_from_url(method: str, raw_url: str, *, server: str = "") -> tuple[Claims, str]:
     parsed = urlsplit(raw_url)
-    bucket, key = _object_from_path(parsed.path)
+    if server:
+        _validate_server_alias(server)
+        path_server, bucket, key = _object_from_server_path(parsed.path)
+        if path_server != server:
+            raise InvalidSignatureError()
+    else:
+        path_server = ""
+        bucket, key = _object_from_path(parsed.path)
     query = parse_qsl(parsed.query, keep_blank_values=True)
     expires_text = _query_get(query, PARAM_EXPIRES)
     if not expires_text:
@@ -183,6 +201,7 @@ def _claims_from_url(method: str, raw_url: str) -> tuple[Claims, str]:
         bucket=bucket,
         key=key,
         expires=expires,
+        server=path_server,
         range=_query_get(query, PARAM_RANGE),
         response_content_type=_query_get(query, PARAM_RESPONSE_CONTENT_TYPE),
         response_content_disposition=_query_get(query, PARAM_RESPONSE_CONTENT_DISPOSITION),
@@ -203,8 +222,11 @@ def _constant_time_hex_equal(supplied_hex: str, expected_hex: str) -> bool:
     return hmac.compare_digest(supplied, expected)
 
 
-def _append_object_path(base_path: str, bucket: str, key: str) -> str:
-    parts = [_trim_slashes(base_path), _go_path_escape(bucket)]
+def _append_object_path(base_path: str, bucket: str, key: str, *, server: str = "") -> str:
+    parts = [_trim_slashes(base_path)]
+    if server:
+        parts.append(_go_path_escape(server))
+    parts.append(_go_path_escape(bucket))
     parts.extend(_go_path_escape(part) for part in key.split("/"))
     return "/" + "/".join(part for part in parts if part)
 
@@ -217,6 +239,16 @@ def _object_from_path(escaped_path: str) -> tuple[str, str]:
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise EdgeSignError("signed url path must include bucket and key")
     return unquote(parts[0]), unquote(parts[1])
+
+
+def _object_from_server_path(escaped_path: str) -> tuple[str, str, str]:
+    cleaned = normpath("/" + escaped_path).lstrip("/")
+    if cleaned in {"", "."}:
+        raise EdgeSignError("signed url path must include server, bucket, and key")
+    parts = cleaned.split("/", 2)
+    if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2]:
+        raise EdgeSignError("signed url path must include server, bucket, and key")
+    return unquote(parts[0]), unquote(parts[1]), unquote(parts[2])
 
 
 def _query_get(values: list[tuple[str, str]], key: str) -> str:
@@ -288,6 +320,23 @@ def _parse_unix_seconds(text: str) -> int:
     if value <= 0:
         raise EdgeSignError("expires query parameter must be positive")
     return value
+
+
+def _validate_server_alias(alias: str) -> None:
+    alias_bytes = alias.encode()
+    if alias == "":
+        raise EdgeSignError("invalid ticket: server alias is required")
+    if len(alias_bytes) > 63:
+        raise EdgeSignError("invalid ticket: server alias is too long")
+    if not _is_alias_alnum(alias_bytes[0]):
+        raise EdgeSignError("invalid ticket: server alias must start with an ASCII letter or digit")
+    for byte in alias_bytes[1:]:
+        if not (_is_alias_alnum(byte) or byte in (ord("_"), ord("-"))):
+            raise EdgeSignError("invalid ticket: server alias contains invalid character")
+
+
+def _is_alias_alnum(byte: int) -> bool:
+    return (ord("A") <= byte <= ord("Z")) or (ord("a") <= byte <= ord("z")) or (ord("0") <= byte <= ord("9"))
 
 
 def _validate_bucket(bucket: str) -> None:
