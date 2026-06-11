@@ -135,6 +135,8 @@ make e2e
 
 The smoke tests (`make smoke`) automatically verify that signed `GET`/`HEAD` requests work, expired signatures are rejected, missing objects return `404`, and most importantly, that the Edge container *cannot* bypass the system to connect directly to the private S3 server.
 
+For a runnable multi-server example, use `make e2e-multiserver`. It exercises `blue` as a routed alias through NATS plus a Private Connector, and `direct` as an Edge direct-S3 alias using the `deploy/compose.multiserver.yaml` overlay.
+
 ## Compose Performance Test
 
 The Compose benchmark starts the demo stack with a performance override, exposes perf-only public read baselines, seeds three Wikimedia objects into the demo bucket, and compares those baselines against signed air3 gateway-through downloads. The reported paths are:

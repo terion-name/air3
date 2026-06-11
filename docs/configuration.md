@@ -75,6 +75,8 @@ With `AIR3_MULTI_SERVER=true`, public paths become `/{server}/{bucket}/{key}`. T
 
 `AIR3_NATS_SUBJECT` is still the single-server subject. On a connector, setting it explicitly overrides `AIR3_SERVER_NAME`/template derivation; leave it unset for the normal routed multi-server pattern.
 
+For a runnable Compose example, see the `deploy/compose.multiserver.yaml` overlay and `make e2e-multiserver`. The example covers `blue` as a connector-routed alias and `direct` as an Edge direct-S3 alias.
+
 ## Direct-server aliases (Edge S3 exception)
 
 Direct servers are an explicit Edge trust-boundary exception for multi-server deployments. An alias listed in `AIR3_DIRECT_SERVERS` (or the compatible fallback `DIRECT_SERVERS`) is fetched directly by the Edge from S3 and bypasses NATS and the Private Connector for that alias. This means the Edge must hold S3 credentials and be able to reach that S3 endpoint. Do not use direct servers for storage that must remain private from the public edge.
