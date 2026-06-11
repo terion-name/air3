@@ -75,6 +75,7 @@ type EdgeConfig struct {
 	IngestQUICListenAddr       string
 	StreamCopyBufferBytes      int
 	AllowedBuckets             []string
+	DefaultBucket              string
 	AllowedConnectorIdentities []string
 	MultiServer                bool
 	DirectServers              map[string]S3Config
@@ -86,6 +87,9 @@ type EdgeConfig struct {
 }
 
 func (c EdgeConfig) DefaultBucketForServer(server string) (string, bool) {
+	if server == "" && !c.MultiServer && c.DefaultBucket != "" {
+		return c.DefaultBucket, true
+	}
 	if c.ServerDefaultBuckets == nil {
 		return "", false
 	}
@@ -186,6 +190,13 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
 		return EdgeConfig{}, err
+	}
+	cfg.DefaultBucket, err = env.optionalBucket("AIR3_S3_BUCKET")
+	if err != nil {
+		return EdgeConfig{}, err
+	}
+	if cfg.DefaultBucket != "" && env.has("AIR3_ALLOWED_BUCKETS") && !bucketInList(cfg.DefaultBucket, cfg.AllowedBuckets) {
+		return EdgeConfig{}, fmt.Errorf("AIR3_S3_BUCKET %q must be included in AIR3_ALLOWED_BUCKETS", cfg.DefaultBucket)
 	}
 	cfg.AllowedConnectorIdentities, err = env.optionalList("AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES")
 	if err != nil {
@@ -605,6 +616,13 @@ func loadS3(env envReader) (S3Config, error) {
 	if err != nil {
 		return S3Config{}, err
 	}
+	defaultBucket, err := env.optionalBucket("AIR3_S3_BUCKET")
+	if err != nil {
+		return S3Config{}, err
+	}
+	if defaultBucket != "" && !bucketInList(defaultBucket, buckets) {
+		return S3Config{}, fmt.Errorf("AIR3_S3_BUCKET %q must be included in AIR3_S3_ALLOWED_BUCKETS", defaultBucket)
+	}
 	usePathStyle, err := env.bool("AIR3_S3_USE_PATH_STYLE", true)
 	if err != nil {
 		return S3Config{}, err
@@ -617,6 +635,7 @@ func loadS3(env envReader) (S3Config, error) {
 		Endpoint:           env.get("AIR3_S3_ENDPOINT", "http://localhost:7070"),
 		Region:             env.get("AIR3_S3_REGION", "us-east-1"),
 		AllowedBuckets:     buckets,
+		DefaultBucket:      defaultBucket,
 		AccessKeyID:        env.get("AIR3_S3_ACCESS_KEY_ID", ""),
 		SecretAccessKey:    env.get("AIR3_S3_SECRET_ACCESS_KEY", ""),
 		UsePathStyle:       usePathStyle,
@@ -736,6 +755,11 @@ func (e envReader) lookupTrimmed(name string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(value), true
+}
+
+func (e envReader) has(name string) bool {
+	_, ok := e.lookup(name)
+	return ok
 }
 
 func (e envReader) keys() []string {

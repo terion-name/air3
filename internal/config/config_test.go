@@ -40,6 +40,26 @@ func TestLoadEdgeDefaultsWithDisabledSigning(t *testing.T) {
 	}
 }
 
+func TestLoadEdgeParsesSingleServerDefaultBucket(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED": "true",
+		"AIR3_S3_BUCKET":        "demo",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.DefaultBucket != "demo" {
+		t.Fatalf("DefaultBucket = %q, want demo", cfg.DefaultBucket)
+	}
+	if bucket, ok := cfg.DefaultBucketForServer(""); !ok || bucket != "demo" {
+		t.Fatalf("DefaultBucketForServer(empty) = %q, %t; want demo, true", bucket, ok)
+	}
+	if bucket, ok := cfg.DefaultBucketForServer("blue"); ok || bucket != "" {
+		t.Fatalf("DefaultBucketForServer(blue) = %q, %t; want empty, false", bucket, ok)
+	}
+}
+
 func TestLoadEdgeRequiresSigningSecretWhenEnabled(t *testing.T) {
 	if _, err := LoadEdge(testOptions(nil, nil)); err == nil || !strings.Contains(err.Error(), "signing secret") {
 		t.Fatalf("LoadEdge() error = %v, want signing secret error", err)
@@ -51,6 +71,7 @@ func TestLoadConnectorParsesS3AndDoesNotRequireSigning(t *testing.T) {
 		"AIR3_S3_ACCESS_KEY_ID":     "access",
 		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
 		"AIR3_ALLOWED_BUCKETS":      "demo,logs",
+		"AIR3_S3_BUCKET":            "demo",
 		"AIR3_S3_USE_PATH_STYLE":    "false",
 		"AIR3_INGEST_DISABLE_HTTP2": "true",
 	}
@@ -60,6 +81,9 @@ func TestLoadConnectorParsesS3AndDoesNotRequireSigning(t *testing.T) {
 	}
 	if cfg.S3.AccessKeyID != "access" || cfg.S3.SecretAccessKey != "secret" {
 		t.Fatalf("S3 credentials not parsed: %#v", cfg.S3)
+	}
+	if cfg.S3.DefaultBucket != "demo" {
+		t.Fatalf("S3 default bucket = %q, want demo", cfg.S3.DefaultBucket)
 	}
 	if cfg.S3.UsePathStyle {
 		t.Fatal("S3 UsePathStyle = true, want false")
@@ -597,6 +621,42 @@ func TestLoadConnectorRequiresS3Credentials(t *testing.T) {
 	}
 }
 
+func TestLoadConnectorRejectsDefaultBucketConfigErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "invalid bucket name",
+			env: map[string]string{
+				"AIR3_S3_ACCESS_KEY_ID":     "access",
+				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+				"AIR3_S3_BUCKET":            "BadBucket",
+			},
+			want: "AIR3_S3_BUCKET contains invalid bucket",
+		},
+		{
+			name: "default bucket must be allowed",
+			env: map[string]string{
+				"AIR3_S3_ACCESS_KEY_ID":     "access",
+				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+				"AIR3_S3_ALLOWED_BUCKETS":   "logs",
+				"AIR3_S3_BUCKET":            "demo",
+			},
+			want: "AIR3_S3_BUCKET \"demo\" must be included in AIR3_S3_ALLOWED_BUCKETS",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConnector(testOptions(tc.env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadConnector() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestInvalidDurationAndAllowlist(t *testing.T) {
 	tests := []struct {
 		name string
@@ -610,6 +670,40 @@ func TestInvalidDurationAndAllowlist(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := LoadEdge(testOptions(tc.env, nil)); err == nil {
 				t.Fatal("LoadEdge() error = nil, want error")
+			}
+		})
+	}
+}
+
+func TestLoadEdgeRejectsDefaultBucketConfigErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "invalid bucket name",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_S3_BUCKET":        "BadBucket",
+			},
+			want: "AIR3_S3_BUCKET contains invalid bucket",
+		},
+		{
+			name: "default bucket must be allowed",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_ALLOWED_BUCKETS":  "logs",
+				"AIR3_S3_BUCKET":        "demo",
+			},
+			want: "AIR3_S3_BUCKET \"demo\" must be included in AIR3_ALLOWED_BUCKETS",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadEdge(testOptions(tc.env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadEdge() error = %v, want containing %q", err, tc.want)
 			}
 		})
 	}
