@@ -67,8 +67,17 @@ func Connect(ctx context.Context, cfg config.NATSConfig) (*Client, error) {
 	}, nil
 }
 
-// PublishTicket publishes a validated ticket and flushes within ctx or a short default timeout.
+// PublishTicket publishes a validated ticket to the configured subject and flushes within ctx or a short default timeout.
 func (c *Client) PublishTicket(ctx context.Context, ticket tickets.Ticket) error {
+	subject := ""
+	if c != nil {
+		subject = c.subject
+	}
+	return c.PublishTicketTo(ctx, subject, ticket)
+}
+
+// PublishTicketTo publishes a validated ticket to subject and flushes within ctx or a short default timeout.
+func (c *Client) PublishTicketTo(ctx context.Context, subject string, ticket tickets.Ticket) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -76,13 +85,16 @@ func (c *Client) PublishTicket(ctx context.Context, ticket tickets.Ticket) error
 	if err != nil {
 		return fmt.Errorf("marshal ticket: %w", err)
 	}
+	if err := validatePublishSubject(subject); err != nil {
+		return err
+	}
 	if c == nil || c.conn == nil || c.conn.IsClosed() {
 		return ErrNotConnected
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := c.conn.Publish(c.subject, data); err != nil {
+	if err := c.conn.Publish(subject, data); err != nil {
 		return fmt.Errorf("publish ticket: %w", err)
 	}
 	if err := c.conn.FlushTimeout(timeoutFor(ctx)); err != nil {
@@ -205,19 +217,8 @@ func validateConfig(cfg config.NATSConfig) error {
 }
 
 func validatePublishSubject(subject string) error {
-	if strings.TrimSpace(subject) == "" {
-		return fmt.Errorf("%w: subject is required", ErrInvalidConfig)
-	}
-	if strings.ContainsAny(subject, "*>") {
-		return fmt.Errorf("%w: ticket publish subject must not contain wildcards", ErrInvalidConfig)
-	}
-	for _, token := range strings.Split(subject, ".") {
-		if token == "" {
-			return fmt.Errorf("%w: subject contains an empty token", ErrInvalidConfig)
-		}
-	}
-	if hasSpaceOrControl(subject) {
-		return fmt.Errorf("%w: subject contains whitespace or control characters", ErrInvalidConfig)
+	if err := config.ValidateNATSSubject(subject); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	return nil
 }

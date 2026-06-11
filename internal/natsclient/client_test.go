@@ -40,6 +40,14 @@ func TestValidateConfigRejectsBadSubjectsAndQueues(t *testing.T) {
 			cfg:  config.NATSConfig{URL: "nats://127.0.0.1:4222", Subject: "air3..tickets"},
 		},
 		{
+			name: "whitespace subject",
+			cfg:  config.NATSConfig{URL: "nats://127.0.0.1:4222", Subject: "air3.bad tickets"},
+		},
+		{
+			name: "control subject",
+			cfg:  config.NATSConfig{URL: "nats://127.0.0.1:4222", Subject: "air3.bad\ntickets"},
+		},
+		{
 			name: "whitespace queue",
 			cfg:  config.NATSConfig{URL: "nats://127.0.0.1:4222", Subject: "air3.tickets", QueueGroup: "bad queue"},
 		},
@@ -73,6 +81,30 @@ func TestPublishTicketRejectsInvalidTicketBeforePublish(t *testing.T) {
 	err := client.PublishTicket(context.Background(), tickets.Ticket{Version: tickets.Version})
 	if !errors.Is(err, tickets.ErrInvalidTicket) {
 		t.Fatalf("PublishTicket() error = %v, want invalid ticket", err)
+	}
+}
+
+func TestPublishTicketToRejectsInvalidSubject(t *testing.T) {
+	client := &Client{subject: "air3.tickets", now: func() time.Time { return time.Unix(100, 0) }}
+	tests := []struct {
+		name    string
+		subject string
+	}{
+		{name: "blank", subject: ""},
+		{name: "empty token", subject: "air3..tickets"},
+		{name: "whitespace", subject: "air3.bad tickets"},
+		{name: "control", subject: "air3.bad\ntickets"},
+		{name: "star wildcard", subject: "air3.*.tickets"},
+		{name: "greater wildcard", subject: "air3.>"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := client.PublishTicketTo(context.Background(), tc.subject, validTicket("req-invalid-subject"))
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("PublishTicketTo() error = %v, want ErrInvalidConfig", err)
+			}
+		})
 	}
 }
 
@@ -138,6 +170,50 @@ func TestQueueSubscriptionHandlesOneTicket(t *testing.T) {
 	}
 }
 
+func TestPublishTicketToUsesProvidedSubject(t *testing.T) {
+	url := startNATSServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	cfg := testConfig(url, t.Name())
+	pub, err := Connect(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Connect publisher: %v", err)
+	}
+	t.Cleanup(pub.Close)
+
+	raw, err := nats.Connect(url, nats.Timeout(time.Second), nats.RetryOnFailedConnect(false))
+	if err != nil {
+		t.Fatalf("raw nats connect: %v", err)
+	}
+	t.Cleanup(raw.Close)
+
+	configuredSub, err := raw.SubscribeSync(cfg.Subject)
+	if err != nil {
+		t.Fatalf("subscribe configured subject: %v", err)
+	}
+	toSubject := cfg.Subject + ".derived"
+	toSub, err := raw.SubscribeSync(toSubject)
+	if err != nil {
+		t.Fatalf("subscribe publish-to subject: %v", err)
+	}
+	if err := raw.FlushTimeout(time.Second); err != nil {
+		t.Fatalf("flush subscriptions: %v", err)
+	}
+
+	toRequest := "req-publish-to"
+	if err := pub.PublishTicketTo(ctx, toSubject, validTicket(toRequest)); err != nil {
+		t.Fatalf("PublishTicketTo(): %v", err)
+	}
+	assertNextTicket(t, toSub, toSubject, toRequest)
+
+	configuredRequest := "req-publish-configured"
+	if err := pub.PublishTicket(ctx, validTicket(configuredRequest)); err != nil {
+		t.Fatalf("PublishTicket(): %v", err)
+	}
+	assertNextTicket(t, configuredSub, cfg.Subject, configuredRequest)
+}
+
 func TestQueueSubscriptionRejectsMalformedTicket(t *testing.T) {
 	url := startNATSServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -183,6 +259,24 @@ func TestQueueSubscriptionRejectsMalformedTicket(t *testing.T) {
 	}
 	if handled.Load() != 0 {
 		t.Fatalf("handler called for malformed ticket %d time(s)", handled.Load())
+	}
+}
+
+func assertNextTicket(t *testing.T, sub *nats.Subscription, wantSubject, wantRequestID string) {
+	t.Helper()
+	msg, err := sub.NextMsg(2 * time.Second)
+	if err != nil {
+		t.Fatalf("receive ticket on %s: %v", wantSubject, err)
+	}
+	if msg.Subject != wantSubject {
+		t.Fatalf("received subject %q, want %q", msg.Subject, wantSubject)
+	}
+	ticket, err := tickets.Unmarshal(msg.Data, time.Now())
+	if err != nil {
+		t.Fatalf("decode ticket on %s: %v", wantSubject, err)
+	}
+	if ticket.RequestID != wantRequestID {
+		t.Fatalf("received request id %q on %s, want %q", ticket.RequestID, wantSubject, wantRequestID)
 	}
 }
 
