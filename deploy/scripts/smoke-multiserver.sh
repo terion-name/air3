@@ -186,9 +186,9 @@ assert_body "direct signed GET" "$direct_get_url"
 direct_head_url=$(sign_default_bucket_url HEAD "$DIRECT_SERVER" "$KEY" 2m)
 check_optional_head "direct signed" "$direct_head_url"
 
-mutated_url=${blue_get_url/\/$BLUE_SERVER\//\/$GREEN_SERVER\/}
+mutated_url=${blue_get_url/\/$BLUE_SERVER\//\/$GREEN_SERVER\/$BUCKET\/}
 if [ "$mutated_url" = "$blue_get_url" ]; then
-  echo "error: failed to mutate '$BLUE_SERVER' URL to '$GREEN_SERVER'" >&2
+  echo "error: failed to mutate '$BLUE_SERVER' default-bucket URL to '$GREEN_SERVER' full-path URL" >&2
   exit 1
 fi
 assert_status "server alias signature isolation" "403" "$mutated_url"
