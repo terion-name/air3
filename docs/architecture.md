@@ -2,7 +2,7 @@
 
 **air3** strictly separates your public edge from your private storage to keep your S3 credentials entirely safe.
 
-The architecture is built around the idea that **no inbound connections should ever reach your private network**, and your public-facing gateway should **never possess your S3 credentials**.
+The default and recommended architecture is built around the idea that **no inbound connections should ever reach your private network**, and your public-facing gateway should **never possess your S3 credentials**. Multi-server routing preserves that boundary by routing each server alias to a connector-specific NATS subject. Direct-server aliases are the explicit exception: they intentionally put selected S3 credentials and network reachability on the Edge.
 
 ## The Three Pillars
 
@@ -11,6 +11,8 @@ The architecture is built around the idea that **no inbound connections should e
 3. **Private Connector (Private Network):** A worker that securely holds your S3 credentials. It has **no inbound listeners**. It connects outward to NATS to pull tickets, fetches the requested file from your S3 storage, and opens a secure outbound mTLS connection to the Edge Gateway's private "ingest" port to stream the file bytes back. HTTP ingest is the default; HTTP/3, TCP, smux, and custom QUIC ingest are experimental opt-in transports for benchmarking/tuning.
 
 ## Request and Stream Flow
+
+In default single-server mode, public URLs use `/{bucket}/{key}` and tickets publish to `AIR3_NATS_SUBJECT` (default `air3.tickets`). This is the normal isolated edge/NATS/connector/S3 topology.
 
 - Object bytes are transferred over the Private Connector-to-S3 path and the Private Connector-to-Edge ingest stream. That ingest stream is HTTPS by default; experimental HTTP/3, TCP, smux, or custom QUIC ingest can be enabled explicitly without changing the control plane or public client URL behavior.
 - The public client's response is held open by the Edge Gateway process until the Connector streams the data back.
@@ -34,6 +36,51 @@ sequenceDiagram
     Connector->>Edge: Ingest stream (mTLS + token; HTTP default, TCP/smux/QUIC/HTTP/3 opt-in)
     Edge-->>Client: Forward stream to held response
     Edge->>Edge: Complete pending request
+```
+
+## Multi-server routed flow
+
+Multi-server mode is enabled with `AIR3_MULTI_SERVER=true`. Public URLs use `/{server}/{bucket}/{key}`; the server alias is included in signed URL validation and ticket payloads. For connector-routed aliases, the Edge renders the NATS subject from `AIR3_NATS_SUBJECT_TEMPLATE` (default `air3.{server}`), and each connector sets `AIR3_SERVER_NAME` to subscribe to its derived subject.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Edge as Edge gateway
+    participant NATS as NATS
+    participant Blue as Connector AIR3_SERVER_NAME=blue
+    participant Green as Connector AIR3_SERVER_NAME=green
+    participant S3 as Private S3
+
+    Client->>Edge: Signed GET /blue/demo/file.txt
+    Edge->>Edge: Verify server=blue, bucket, key, method
+    Edge->>NATS: Publish ticket on air3.blue
+    Blue->>NATS: Pull from air3.blue queue
+    Green-->>NATS: Subscribed to air3.green only
+    Blue->>S3: Fetch allowed bucket/key
+    Blue->>Edge: Outbound mTLS ingest stream
+    Edge-->>Client: Stream response
+```
+
+## Direct-server exception flow
+
+Direct-server aliases are configured on the Edge with `AIR3_DIRECT_SERVERS` or `DIRECT_SERVERS` and per-alias `S3_{SUFFIX}_*` settings. They require multi-server paths to select the alias, but they bypass NATS and the Private Connector for that alias. This is useful only when you deliberately accept that the Edge has S3 credentials and network reachability for that storage. It is not the recommended private-storage boundary.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Edge as Edge gateway with direct alias
+    participant S3 as Direct S3 endpoint
+    participant NATS as NATS
+    participant Connector as Private connector
+
+    Client->>Edge: Signed GET /alpha/demo/file.txt
+    Edge->>Edge: Verify signature and alpha bucket allowlist
+    Edge->>S3: Fetch object with S3_ALPHA_* credentials
+    S3-->>Edge: Return object stream or metadata
+    Edge-->>Client: Stream response
+    Note over NATS,Connector: No ticket or connector ingest for direct aliases
 ```
 
 ## Security Boundaries & Conceptual Zones
@@ -71,10 +118,10 @@ flowchart TB
 
 ### Key Security Benefits
 
-- **S3 credentials stay private:** The Edge Gateway has absolutely zero knowledge of `AIR3_S3_ACCESS_KEY_ID` and `AIR3_S3_SECRET_ACCESS_KEY`. If the Edge is compromised, the attacker still cannot access your S3 buckets.
+- **S3 credentials stay private by default:** In the recommended connector-routed topology, the Edge Gateway has absolutely zero knowledge of `AIR3_S3_ACCESS_KEY_ID` and `AIR3_S3_SECRET_ACCESS_KEY`. If the Edge is compromised, the attacker still cannot access your connector-only S3 buckets. Direct-server aliases intentionally opt out for their configured `S3_{SUFFIX}_*` credentials.
 - **Outbound-only application traffic:** The Private Connector has no open inbound ports. It only initiates connections *out* to NATS, S3, and the Edge's ingest endpoint.
 - **Separate public and ingest listeners:** Public requests hit the public listener. The private ingest listener requires strict mTLS authentication *and* a one-time ingest token generated by the Edge. The experimental HTTP/3, TCP, smux, and custom QUIC ingest transports use the same mTLS files, connector identity allowlist, and one-time token semantics as the default HTTP ingest path.
-- **Defense-in-depth allowlists:** Both the Edge and the Connector strictly validate allowed bucket names before taking any action.
+- **Defense-in-depth allowlists:** Both the Edge and the Connector strictly validate allowed bucket names before taking any action. Direct-server aliases have their own Edge-enforced `S3_{SUFFIX}_ALLOWED_BUCKETS` allowlist.
 - **Secret-safe logging:** Logs are designed to be safe to ship anywhere. They use request IDs and high-level outcomes—never logging HMAC secrets, full URLs, ingest tokens, or raw S3 credentials.
 
 ## Data Plane vs. Control Plane
@@ -82,13 +129,16 @@ flowchart TB
 | Plane | Path | Contains | Does not contain |
 | --- | --- | --- | --- |
 | Public data plane | Client to edge public listener | Public `GET`/`HEAD`, signed URL claims, response bytes | S3 credentials |
-| Control plane | Edge to NATS to connector | Request ID, method, bucket, key, range, deadline, HTTPS ingest URL/fallback, one-time ingest token | Object bytes / file data |
+| Control plane | Edge to NATS to connector | Request ID, method, optional server alias, bucket, key, range, deadline, HTTPS ingest URL/fallback, one-time ingest token | Object bytes / file data |
 | Private data plane | Connector to S3 | S3 object fetch and metadata requests | Public client connection |
+| Direct-server data plane | Edge to configured S3 endpoint | S3 requests using `S3_{SUFFIX}_*` credentials for opt-in direct aliases | NATS tickets / Private Connector path |
 | Ingest data plane | Connector to edge ingest listener (HTTP default; HTTP/3, TCP/smux, or QUIC experimental opt-in) | Object stream, safe response metadata, request ID, ingest token | Public client connection |
 
 ## Operational behavior
 
-- NATS exclusively carries short-lived fetch tickets and control messages. Queue-group semantics are unchanged: a ticket is delivered to one connector replica, and each connector uses a bounded local worker pool (`AIR3_CONNECTOR_WORKERS`) for concurrent ticket handling.
+- NATS exclusively carries short-lived fetch tickets and control messages for connector-routed aliases. Queue-group semantics are unchanged: a ticket is delivered to one connector replica, and each connector uses a bounded local worker pool (`AIR3_CONNECTOR_WORKERS`) for concurrent ticket handling.
+- With `AIR3_MULTI_SERVER=true`, the Edge parses `/{server}/{bucket}/{key}` and publishes connector-routed tickets to `AIR3_NATS_SUBJECT_TEMPLATE` (default `air3.{server}`). Connectors set `AIR3_SERVER_NAME` to derive their subscription subject and reject mismatched tickets.
+- Direct-server aliases configured with `AIR3_DIRECT_SERVERS`/`DIRECT_SERVERS` bypass NATS and connector ingest for those aliases; the Edge enforces the direct alias bucket allowlist and fetches from S3 itself.
 - `AIR3_INGEST_URL` remains the HTTPS ingest fallback/ticket URL in all modes and is used directly by the HTTP-family transports (`http`, `http1`, `http2`, `http3`) with the existing headers and body.
 - Custom stream transports (`tcp`, `smux`, `quic`) use the shared MessagePack metadata frame, raw object body, and ack semantics. `smux` multiplexes those streams over persistent mTLS TCP, with one smux stream per object; direct `quic` uses `AIR3_EDGE_INGEST_QUIC_ADDR`/`AIR3_INGEST_QUIC_ADDR`.
 - The Edge Gateway holds the pending client response until the Connector finishes fetching the object.

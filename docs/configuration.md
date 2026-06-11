@@ -1,12 +1,12 @@
 # Configuration Guide
 
-**air3** uses environment variables for all configuration. The Edge Gateway and Private Connector share some settings (like timeouts, allowed buckets, and NATS details), but **only the Private Connector has your S3 credentials**.
+**air3** uses environment variables for all configuration. The Edge Gateway and Private Connector share some settings (like timeouts, allowed buckets, and NATS details), but in the default recommended topology **only the Private Connector has your S3 credentials**. The only exception is the explicit direct-server mode documented below, which intentionally moves selected S3 credentials onto the Edge.
 
-*Note: Durations use standard Go syntax (e.g., `5s`, `30s`, `15m`). Comma-separated lists automatically trim spaces and remove empty or duplicate entries.*
+*Note: Durations use standard Go syntax (e.g., `5s`, `30s`, `15m`). Most comma-separated lists automatically trim spaces and remove empty or duplicate entries. Direct-server alias lists are stricter: empty aliases are rejected, and exact duplicate aliases are ignored.*
 
 ## Edge Gateway
 
-The Edge Gateway is your public-facing entry point. It has **no** S3 settings and should **never** be attached to your private S3 network.
+The Edge Gateway is your public-facing entry point. In the default recommended topology it has **no** S3 settings and should **never** be attached to your private S3 network. Direct-server aliases are an explicit exception and are documented separately below.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -17,6 +17,9 @@ The Edge Gateway is your public-facing entry point. It has **no** S3 settings an
 | `AIR3_EDGE_INGEST_QUIC_ADDR` | unset (Compose: `:9445`) | Edge QUIC ingest listener address. Required only when `AIR3_INGEST_TRANSPORT=quic`; Compose keeps this UDP listener on the internal network and does not publish it to the host by default. If you expose it on a host, use an explicit `/udp` port mapping. |
 | `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The HTTPS ingest URL the Edge embeds in tickets and uses as the HTTP ingest endpoint/fallback. The HTTP family (`http`, `http1`, `http2`, `http3`) uses this URL with the existing headers and body semantics. In custom stream modes (`tcp`, `smux`, `quic`) this remains the fallback/ticket URL. In the Compose demo, this is `https://edge-gateway:9443/ingest`. |
 | `AIR3_ALLOWED_BUCKETS` | `demo` | A strict comma-separated allowlist of bucket names. The Edge drops requests for unlisted buckets before even making a NATS ticket. |
+| `AIR3_MULTI_SERVER` | `false` | Opt-in public path mode. `false` keeps the default `/{bucket}/{key}` shape. `true` requires `/{server}/{bucket}/{key}` and routes connector tickets by server alias. |
+| `AIR3_DIRECT_SERVERS` | unset | Edge-only comma-separated direct-server aliases. Each alias is served directly by the Edge from its `S3_{SUFFIX}_*` settings instead of via NATS/Connector. Requires `AIR3_MULTI_SERVER=true` to be routable. |
+| `DIRECT_SERVERS` | unset | Bare fallback name for `AIR3_DIRECT_SERVERS`. If both are set, the values must match exactly or startup fails. |
 | `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` | unset | (Optional) Comma-separated list of allowed Connector certificate identities for mTLS ingest connections. |
 
 ## Private Connector
@@ -32,6 +35,7 @@ The Private Connector is your secure worker. It has **no public inbound listener
 | `AIR3_INGEST_POOL_SIZE` | `32` (perf: `1024`) | Connector-side reusable ingest pool cap for HTTP-family, smux, QUIC, and HTTP/3 transports. Raw TCP remains one connection per object. Must be `1`-`4096`. |
 | `AIR3_CONNECTOR_WORKERS` | `1` (perf: `1024`) | Per-connector concurrent ticket handling worker limit. Must be `1`-`4096`. |
 | `AIR3_ALLOWED_BUCKETS` | `demo` | Defense-in-depth: the Connector also enforces this allowlist before attempting to reach S3. |
+| `AIR3_SERVER_NAME` | unset | Optional connector server alias for routed multi-server mode. When set, the connector rejects tickets for other aliases and derives its NATS subject from `AIR3_NATS_SUBJECT_TEMPLATE` unless `AIR3_NATS_SUBJECT` is explicitly set. |
 | `AIR3_INGEST_DISABLE_HTTP2` | `false` | Legacy compatibility knob used only when `AIR3_INGEST_TRANSPORT=http`: `true` forces HTTP/1.1 and `false` enables HTTP/2. Explicit `AIR3_INGEST_TRANSPORT=http1`, `http2`, or `http3` ignores this setting. |
 
 ## NATS Broker
@@ -41,16 +45,17 @@ NATS coordinates transfers between the Edge and the Connector. Object bytes **do
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AIR3_NATS_URL` | `nats://localhost:4222` | NATS connection string. Use `tls://...` for secure connections. |
-| `AIR3_NATS_SUBJECT` | `air3.tickets` | The NATS subject used for transferring fetch tickets. |
+| `AIR3_NATS_SUBJECT` | `air3.tickets` | The NATS subject used for single-server ticket transfer. On connectors with `AIR3_SERVER_NAME`, an explicit value overrides subject derivation. |
+| `AIR3_NATS_SUBJECT_TEMPLATE` | `air3.{server}` | Routed multi-server subject template. Must contain `{server}` and render to a valid literal NATS subject; the Edge uses it per request when `AIR3_MULTI_SERVER=true`, and connectors use it with `AIR3_SERVER_NAME` when `AIR3_NATS_SUBJECT` is not set. |
 | `AIR3_NATS_QUEUE` | edge: unset; connector: `air3-connectors` | Queue group. Connectors use this so that only one Connector picks up a given ticket. |
 | `AIR3_NATS_CREDS_FILE` | unset | (Optional) Path to a NATS credentials file. |
 | `AIR3_NATS_NKEY_FILE` | unset | (Optional) Path to an NKey seed file. |
 | `AIR3_NATS_USER` | unset | (Optional) NATS username. Must be paired with `AIR3_NATS_PASSWORD`. |
 | `AIR3_NATS_PASSWORD` | unset | (Optional) NATS password. Must be paired with `AIR3_NATS_USER`. |
 
-## S3-Compatible Storage (Connector Only)
+## S3-Compatible Storage (default Connector path)
 
-These highly sensitive settings belong **only** to the Private Connector.
+These highly sensitive settings belong **only** to the Private Connector in the recommended connector-routed topology. Direct-server aliases use separate Edge-side `S3_{SUFFIX}_*` settings below.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -61,6 +66,53 @@ These highly sensitive settings belong **only** to the Private Connector.
 | `AIR3_S3_SECRET_ACCESS_KEY` | unset | **Your private S3 Secret Access Key.** |
 | `AIR3_S3_USE_PATH_STYLE` | `true` | Use path-style addressing (great for self-hosted S3 alternatives). |
 | `AIR3_S3_INSECURE_SKIP_VERIFY` | `false` | Skip S3 TLS verification. (Use for local testing only!) |
+
+## Multi-server routing
+
+Single-server mode is the default and remains the recommended isolated topology: public paths are `/{bucket}/{key}`, the Edge publishes tickets to `AIR3_NATS_SUBJECT` (default `air3.tickets`), and the Private Connector fetches from S3.
+
+With `AIR3_MULTI_SERVER=true`, public paths become `/{server}/{bucket}/{key}`. The server segment is part of the signed URL claims and must match the request path. For non-direct aliases, the Edge publishes the ticket to `AIR3_NATS_SUBJECT_TEMPLATE` with `{server}` replaced by the alias. The default template `air3.{server}` routes `/blue/demo/file.txt` to subject `air3.blue`; a connector with `AIR3_SERVER_NAME=blue` subscribes to that same derived subject and rejects tickets for other server aliases.
+
+`AIR3_NATS_SUBJECT` is still the single-server subject. On a connector, setting it explicitly overrides `AIR3_SERVER_NAME`/template derivation; leave it unset for the normal routed multi-server pattern.
+
+## Direct-server aliases (Edge S3 exception)
+
+Direct servers are an explicit Edge trust-boundary exception for multi-server deployments. An alias listed in `AIR3_DIRECT_SERVERS` (or the compatible fallback `DIRECT_SERVERS`) is fetched directly by the Edge from S3 and bypasses NATS and the Private Connector for that alias. This means the Edge must hold S3 credentials and be able to reach that S3 endpoint. Do not use direct servers for storage that must remain private from the public edge.
+
+Alias rules:
+
+- Aliases are 1-63 ASCII characters, must start with a letter or digit, and may then contain letters, digits, `_`, or `-`. They are matched exactly in the public URL.
+- `AIR3_DIRECT_SERVERS` and `DIRECT_SERVERS` are comma-separated; spaces are trimmed, empty entries are rejected, and exact duplicate aliases are ignored.
+- Per-alias environment suffixes are normalized by uppercasing and replacing `-` with `_`: `beta-server` uses `S3_BETA_SERVER_*`. Aliases that normalize to the same suffix, such as `a-b` and `a_b`, are rejected to avoid ambiguous credentials.
+
+For each direct alias, configure all required `S3_{SUFFIX}_*` settings on the Edge:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `S3_{SUFFIX}_ENDPOINT` | required | S3-compatible endpoint for this direct alias. |
+| `S3_{SUFFIX}_REGION` | required | S3 region for this direct alias. |
+| `S3_{SUFFIX}_ALLOWED_BUCKETS` | required | Per-alias bucket allowlist enforced by the Edge before direct S3 fetches. |
+| `S3_{SUFFIX}_ACCESS_KEY_ID` | required | S3 access key held by the Edge for this direct alias. |
+| `S3_{SUFFIX}_SECRET_ACCESS_KEY` | required | S3 secret key held by the Edge for this direct alias. |
+| `S3_{SUFFIX}_USE_PATH_STYLE` | `true` | Use path-style addressing for this direct alias. |
+| `S3_{SUFFIX}_INSECURE_SKIP_VERIFY` | `false` | Skip S3 TLS verification for this direct alias. Use only for local testing. |
+
+Example:
+
+```sh
+AIR3_MULTI_SERVER=true
+AIR3_DIRECT_SERVERS=alpha,beta-server
+S3_ALPHA_ENDPOINT=https://alpha-s3.example
+S3_ALPHA_REGION=us-east-1
+S3_ALPHA_ALLOWED_BUCKETS=demo,logs
+S3_ALPHA_ACCESS_KEY_ID=...
+S3_ALPHA_SECRET_ACCESS_KEY=...
+S3_BETA_SERVER_ENDPOINT=https://beta-s3.example
+S3_BETA_SERVER_REGION=us-west-2
+S3_BETA_SERVER_ALLOWED_BUCKETS=archive
+S3_BETA_SERVER_ACCESS_KEY_ID=...
+S3_BETA_SERVER_SECRET_ACCESS_KEY=...
+```
 
 ## URL Signing
 

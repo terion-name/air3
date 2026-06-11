@@ -30,6 +30,29 @@ When a public user requests a file, the Edge Gateway asks the Private Connector 
 - **Data Plane (HTTPS by default):** File bytes stream directly from your S3 storage to the Private Connector, and then securely out to the Edge Gateway over an outbound mTLS connection. Experimental TCP, smux, custom QUIC, and HTTP/3 ingest transports are available as opt-in benchmark/runtime tuning modes; HTTP remains the default and fallback.
 - **No Direct S3 Access:** Users get URLs signed for the Edge Gateway, not S3. The Edge handles authorization before the private network even knows about the request.
 
+### Public URL routing modes
+
+The default and recommended deployment is still the isolated single-server topology shown below: public URLs use `/{bucket}/{key}`, tickets publish to `AIR3_NATS_SUBJECT` (default `air3.tickets`), and only the Private Connector has S3 credentials or private S3 network access.
+
+Multi-server mode is opt-in with `AIR3_MULTI_SERVER=true` on the Edge. In this mode, public URLs include a server alias: `/{server}/{bucket}/{key}`. The Edge verifies that the signed URL includes the same server alias, then publishes connector tickets to the routed NATS subject rendered from `AIR3_NATS_SUBJECT_TEMPLATE` (default `air3.{server}`). A connector for that alias sets `AIR3_SERVER_NAME=<server>` and subscribes to the same derived subject. For example, `server=blue` routes `/blue/demo-bucket/file.txt` to NATS subject `air3.blue` by default.
+
+```sh
+# Sign a multi-server URL for the blue connector alias.
+go run ./cmd/signurl \
+  -base-url https://files.example.com \
+  -server blue \
+  -bucket demo-bucket \
+  -key dir/object.txt \
+  -secret "$AIR3_SIGNING_SECRET"
+
+# Connector for that alias; default template renders air3.blue.
+AIR3_SERVER_NAME=blue ./bin/private-connector
+# Or customize both sides with, for example:
+# AIR3_NATS_SUBJECT_TEMPLATE='air3.{server}.tickets'
+```
+
+Direct servers are a separate opt-in exception for multi-server deployments. Aliases listed in `AIR3_DIRECT_SERVERS` are fetched by the Edge directly from their per-alias S3 configuration instead of using NATS and a Private Connector. That places S3 credentials and S3 network reachability on the Edge, so use it only when you intentionally accept that different trust boundary.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -246,6 +269,7 @@ npm install @terion/air3-edgesign
 raw, err := edgesign.SignURL(edgesign.SignInput{
     Method:  "GET",
     BaseURL: "https://files.example.com",
+    // Server: "blue", // optional: emits /blue/{bucket}/{key} for multi-server mode
     Bucket:  "demo-bucket",
     Key:     "dir/object.txt",
     Secret:  signingSecret,
@@ -262,6 +286,7 @@ import { signUrl, verifyUrl } from '@terion/air3-edgesign';
 const raw = signUrl({
   method: 'GET',
   baseUrl: 'https://files.example.com',
+  // server: 'blue', // optional: emits /blue/{bucket}/{key} for multi-server mode
   bucket: 'demo-bucket',
   key: 'dir/object.txt',
   secret: signingSecret,
@@ -279,6 +304,7 @@ from edgesign import sign_url, verify_url
 raw = sign_url(
     method="GET",
     base_url="https://files.example.com",
+    # server="blue",  # optional: emits /blue/{bucket}/{key} for multi-server mode
     bucket="demo-bucket",
     key="dir/object.txt",
     secret=signing_secret,
