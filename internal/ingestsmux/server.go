@@ -172,10 +172,9 @@ func (s *Server) handleStream(stream *smux.Stream) error {
 		_ = stream.Close()
 		return fmt.Errorf("write ingest smux ack: %w", err)
 	}
-	if err := stream.CloseWrite(); err != nil {
-		_ = stream.Close()
-		return fmt.Errorf("close ingest smux write side: %w", err)
-	}
+	// The client closes the stream after reading the ack. Closing the server
+	// write side immediately can race smux stream cleanup against that read for
+	// unknown-length bodies, where the client already half-closed its writer.
 	return nil
 }
 
