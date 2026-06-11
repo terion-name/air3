@@ -12,7 +12,7 @@ The default and recommended architecture is built around the idea that **no inbo
 
 ## Request and Stream Flow
 
-In default single-server mode, public URLs use `/{bucket}/{key}` and tickets publish to `AIR3_NATS_SUBJECT` (default `air3.tickets`). This is the normal isolated edge/NATS/connector/S3 topology.
+In default single-server mode, tickets publish to `AIR3_NATS_SUBJECT` (default `air3.tickets`). Public URLs use legacy `/{bucket}/{key}` paths unless the Edge sets `AIR3_S3_BUCKET`; with `AIR3_S3_BUCKET=demo`, signed URLs generated with `cmd/signurl -default-bucket-path` can use short `/{key}` paths while signatures, tickets, and connector fetches still bind bucket `demo`. This is the normal isolated edge/NATS/connector/S3 topology.
 
 - Object bytes are transferred over the Private Connector-to-S3 path and the Private Connector-to-Edge ingest stream. That ingest stream is HTTPS by default; experimental HTTP/3, TCP, smux, or custom QUIC ingest can be enabled explicitly without changing the control plane or public client URL behavior.
 - The public client's response is held open by the Edge Gateway process until the Connector streams the data back.
@@ -37,6 +37,8 @@ sequenceDiagram
     Edge-->>Client: Forward stream to held response
     Edge->>Edge: Complete pending request
 ```
+
+When `AIR3_S3_BUCKET` is configured for single-server mode, short-form parsing wins. For example, `/demo/file.txt` means key `demo/file.txt` in default bucket `demo`, not key `file.txt`; leaving `AIR3_S3_BUCKET` unset preserves the legacy full-path interpretation. `AIR3_S3_BUCKET` is only a routing/signing default bucket name on the Edge, not an S3 credential.
 
 ## Multi-server routed flow
 
@@ -137,6 +139,7 @@ flowchart TB
 ## Operational behavior
 
 - NATS exclusively carries short-lived fetch tickets and control messages for connector-routed aliases. Queue-group semantics are unchanged: a ticket is delivered to one connector replica, and each connector uses a bounded local worker pool (`AIR3_CONNECTOR_WORKERS`) for concurrent ticket handling.
+- In single-server mode, `AIR3_S3_BUCKET` enables default-bucket short paths `/{key}`; the resolved bucket is still included in signed URL validation and connector-routed tickets.
 - With `AIR3_MULTI_SERVER=true`, the Edge parses `/{server}/{bucket}/{key}` or, for aliases with `S3_{SUFFIX}_BUCKET`, short-form `/{server}/{key}` paths. It publishes connector-routed tickets to `AIR3_NATS_SUBJECT_TEMPLATE` (default `air3.{server}`). Connectors set `AIR3_SERVER_NAME` to derive their subscription subject and reject mismatched tickets.
 - Direct-server aliases configured with `AIR3_DIRECT_SERVERS`/`DIRECT_SERVERS` bypass NATS and connector ingest for those aliases; the Edge enforces the direct alias bucket allowlist, validates any direct default bucket against that allowlist, and fetches from S3 itself.
 - Signatures bind the resolved server, bucket, and key. Omitting a configured default bucket from the public URL does not make the bucket implicit in the signature or ticket; tampering with the server alias, key, or resolved bucket still fails validation.

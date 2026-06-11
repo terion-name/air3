@@ -40,6 +40,7 @@ services:
       AIR3_EDGE_INGEST_QUIC_ADDR: "${AIR3_EDGE_INGEST_QUIC_ADDR:-:9445}"
       AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
       AIR3_ALLOWED_BUCKETS: "demo"
+      AIR3_S3_BUCKET: "demo"
       AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES: "connector-ingest-client"
       AIR3_PENDING_TTL: "5s"
       AIR3_STREAM_TIMEOUT: "30s"

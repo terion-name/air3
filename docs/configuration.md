@@ -17,7 +17,8 @@ The Edge Gateway is your public-facing entry point. In the default recommended t
 | `AIR3_EDGE_INGEST_QUIC_ADDR` | unset (Compose: `:9445`) | Edge QUIC ingest listener address. Required only when `AIR3_INGEST_TRANSPORT=quic`; Compose keeps this UDP listener on the internal network and does not publish it to the host by default. If you expose it on a host, use an explicit `/udp` port mapping. |
 | `AIR3_INGEST_URL` | `https://localhost:8443/ingest` | The HTTPS ingest URL the Edge embeds in tickets and uses as the HTTP ingest endpoint/fallback. The HTTP family (`http`, `http1`, `http2`, `http3`) uses this URL with the existing headers and body semantics. In custom stream modes (`tcp`, `smux`, `quic`) this remains the fallback/ticket URL. In the Compose demo, this is `https://edge-gateway:9443/ingest`. |
 | `AIR3_ALLOWED_BUCKETS` | `demo` | A strict comma-separated allowlist of bucket names. The Edge drops requests for unlisted buckets before even making a NATS ticket. |
-| `AIR3_MULTI_SERVER` | `false` | Opt-in public path mode. `false` keeps the default `/{bucket}/{key}` shape. `true` normally uses `/{server}/{bucket}/{key}` and routes connector tickets by server alias; aliases with `S3_{SUFFIX}_BUCKET` use short-form `/{server}/{key}`. |
+| `AIR3_S3_BUCKET` | unset | Optional single-server default bucket for short public paths. With `AIR3_S3_BUCKET=demo`, signed URLs generated with `cmd/signurl -default-bucket-path` use `/{key}` while signatures and connector tickets still bind bucket `demo`. This is a routing/signing default bucket name, not an S3 credential. |
+| `AIR3_MULTI_SERVER` | `false` | Opt-in public path mode. `false` uses legacy `/{bucket}/{key}` unless `AIR3_S3_BUCKET` enables single-server short paths. `true` normally uses `/{server}/{bucket}/{key}` and routes connector tickets by server alias; aliases with `S3_{SUFFIX}_BUCKET` use short-form `/{server}/{key}`. |
 | `AIR3_DIRECT_SERVERS` | unset | Edge-only comma-separated direct-server aliases. Each alias is served directly by the Edge from its `S3_{SUFFIX}_*` settings instead of via NATS/Connector. Requires `AIR3_MULTI_SERVER=true` to be routable. |
 | `S3_{SUFFIX}_BUCKET` | unset | Optional per-server default bucket for multi-server public paths. For alias `blue`, `S3_BLUE_BUCKET=demo` lets signed URLs use `/blue/{key}` instead of `/blue/demo/{key}`. |
 | `DIRECT_SERVERS` | unset | Bare fallback name for `AIR3_DIRECT_SERVERS`. If both are set, the values must match exactly or startup fails. |
@@ -56,7 +57,7 @@ NATS coordinates transfers between the Edge and the Connector. Object bytes **do
 
 ## S3-Compatible Storage (default Connector path)
 
-These highly sensitive settings belong **only** to the Private Connector in the recommended connector-routed topology. Direct-server aliases use separate Edge-side `S3_{SUFFIX}_*` settings below.
+These highly sensitive settings belong **only** to the Private Connector in the recommended connector-routed topology. Direct-server aliases use separate Edge-side `S3_{SUFFIX}_*` settings below. Do not confuse them with Edge `AIR3_S3_BUCKET`: despite its name, that variable is only a public-path routing/signing default bucket and is not an S3 access credential.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -68,11 +69,15 @@ These highly sensitive settings belong **only** to the Private Connector in the 
 | `AIR3_S3_USE_PATH_STYLE` | `true` | Use path-style addressing (great for self-hosted S3 alternatives). |
 | `AIR3_S3_INSECURE_SKIP_VERIFY` | `false` | Skip S3 TLS verification. (Use for local testing only!) |
 
+## Single-server default-bucket paths
+
+Single-server mode is the default and remains the recommended isolated topology: the Edge publishes tickets to `AIR3_NATS_SUBJECT` (default `air3.tickets`), and the Private Connector fetches from S3. Without `AIR3_S3_BUCKET`, public URLs keep the legacy `/{bucket}/{key}` shape.
+
+Set `AIR3_S3_BUCKET=demo` on the Edge to make bucket `demo` the single-server default bucket. Signed URLs generated with `cmd/signurl -default-bucket-path` omit the bucket from the public path, such as `/hello.txt`, but signatures, tickets, and connector fetches still use bucket `demo`. Short-form parsing wins when the default is configured: `/demo/file.txt` means key `demo/file.txt` in bucket `demo`, not key `file.txt` in bucket `demo`. Leave `AIR3_S3_BUCKET` unset when callers must continue using explicit `/{bucket}/{key}` paths.
+
 ## Multi-server routing
 
-Single-server mode is the default and remains the recommended isolated topology: public paths are `/{bucket}/{key}`, the Edge publishes tickets to `AIR3_NATS_SUBJECT` (default `air3.tickets`), and the Private Connector fetches from S3.
-
-With `AIR3_MULTI_SERVER=true`, public paths become `/{server}/{bucket}/{key}` unless that server alias has a default bucket. The server segment is part of the signed URL claims and must match the request path. For non-direct aliases, the Edge publishes the ticket to `AIR3_NATS_SUBJECT_TEMPLATE` with `{server}` replaced by the alias. The default template `air3.{server}` routes `/blue/demo/file.txt` to subject `air3.blue`; a connector with `AIR3_SERVER_NAME=blue` subscribes to that same derived subject and rejects tickets for other server aliases.
+Use `AIR3_MULTI_SERVER=true` only when one Edge must route multiple connector or direct aliases. Public paths become `/{server}/{bucket}/{key}` unless that server alias has a default bucket. The server segment is part of the signed URL claims and must match the request path. For non-direct aliases, the Edge publishes the ticket to `AIR3_NATS_SUBJECT_TEMPLATE` with `{server}` replaced by the alias. The default template `air3.{server}` routes `/blue/demo/file.txt` to subject `air3.blue`; a connector with `AIR3_SERVER_NAME=blue` subscribes to that same derived subject and rejects tickets for other server aliases.
 
 Set `S3_{SUFFIX}_BUCKET` on the Edge to give any multi-server alias a default bucket (`S3_BLUE_BUCKET=demo` for alias `blue`, `S3_BETA_SERVER_BUCKET=archive` for alias `beta-server`). Signed URLs generated with `cmd/signurl -default-bucket-path` then omit the bucket from the public path, such as `/blue/hello.txt`, while the signature and ticket still bind the real bucket `demo`. When a default bucket is configured, short-form parsing wins for that alias: every path segment after `/{server}/` is treated as the key, so `/blue/demo/hello.txt` targets key `demo/hello.txt` in default bucket `demo` rather than an explicit bucket named `demo`. Use aliases without `S3_{SUFFIX}_BUCKET` when you need full-path `/{server}/{bucket}/{key}` behavior.
 
@@ -192,7 +197,7 @@ AIR3_INGEST_TRANSPORT=http3 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PER
 
 ## Docker Compose Demo Network Map
 
-Our included `deploy/compose.yaml` demo clearly illustrates the required network isolation:
+Our included `deploy/compose.yaml` demo clearly illustrates the required network isolation. The base demo sets Edge `AIR3_S3_BUCKET=demo`, so `make smoke` exercises short single-server public paths while connector tickets and S3 fetches still use bucket `demo`:
 
 | Network | Services | Security Posture |
 | --- | --- | --- |

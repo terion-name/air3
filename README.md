@@ -42,7 +42,21 @@ If you have isolated Kubernetes clusters, locked-down microservices, or a heavil
 
 ### Public URL routing modes
 
-The default and recommended deployment is still the isolated single-server topology shown below: public URLs use `/{bucket}/{key}`, tickets publish to `AIR3_NATS_SUBJECT` (default `air3.tickets`), and only the Private Connector has S3 credentials or private S3 network access.
+The default and recommended deployment is still the isolated single-server topology shown below: tickets publish to `AIR3_NATS_SUBJECT` (default `air3.tickets`), and only the Private Connector has S3 credentials or private S3 network access. Public URLs use legacy full paths `/{bucket}/{key}` unless the Edge sets `AIR3_S3_BUCKET`. With `AIR3_S3_BUCKET=demo`, signed URLs generated with `cmd/signurl -default-bucket-path` use short paths such as `/hello.txt`; the signature and connector ticket still carry bucket `demo`, and the Connector fetches from that bucket.
+
+`AIR3_S3_BUCKET` is a routing/signing default bucket name, not an S3 credential and not a substitute for the Connector's `AIR3_S3_ACCESS_KEY_ID` or `AIR3_S3_SECRET_ACCESS_KEY`. When single-server default-bucket mode is enabled, short-form parsing wins: `/demo/file.txt` means key `demo/file.txt` in bucket `demo`, not key `file.txt` in bucket `demo`. Leave `AIR3_S3_BUCKET` unset when you need the legacy public `/{bucket}/{key}` shape.
+
+```sh
+# Single-server default bucket: emit /hello.txt while signing bucket demo.
+AIR3_S3_BUCKET=demo ./bin/edge-gateway
+
+go run ./cmd/signurl \
+  -base-url https://files.example.com \
+  -bucket demo \
+  -key hello.txt \
+  -secret "$AIR3_SIGNING_SECRET" \
+  -default-bucket-path
+```
 
 Multi-server mode is opt-in with `AIR3_MULTI_SERVER=true` on the Edge. In this mode, public URLs normally include a server alias and bucket: `/{server}/{bucket}/{key}`. The Edge verifies that the signed URL includes the same server alias, then publishes connector tickets to the routed NATS subject rendered from `AIR3_NATS_SUBJECT_TEMPLATE` (default `air3.{server}`). A connector for that alias sets `AIR3_SERVER_NAME=<server>` and subscribes to the same derived subject. For example, `server=blue` routes `/blue/demo-bucket/file.txt` to NATS subject `air3.blue` by default. If the Edge sets `S3_BLUE_BUCKET=demo-bucket`, signed URLs can use the short form `/blue/dir/object.txt`; the signature still binds the real bucket (`demo-bucket`) even though it is omitted from the path. For aliases with a default bucket, short-form parsing wins, so `/blue/demo-bucket/dir/object.txt` means key `demo-bucket/dir/object.txt` in the default bucket rather than an explicit bucket segment.
 
@@ -152,7 +166,7 @@ make e2e
 ```
 *(This is a shortcut for `make certs`, `make compose-up`, `make seed`, `make smoke`, and `make compose-down`)*
 
-The smoke tests (`make smoke`) automatically verify that signed `GET`/`HEAD` requests work, expired signatures are rejected, missing objects return `404`, and most importantly, that the Edge container *cannot* bypass the system to connect directly to the private S3 server.
+The base Compose demo sets `AIR3_S3_BUCKET=demo`, so `make smoke` signs short single-server URLs such as `/hello.txt` while tickets and connector fetches still target bucket `demo`. The smoke tests automatically verify that signed `GET`/`HEAD` requests work, short-form default-bucket parsing wins over legacy full-path parsing, expired signatures are rejected, missing objects return `404`, and most importantly, that the Edge container *cannot* bypass the system to connect directly to the private S3 server.
 
 For a runnable multi-server example, use `make e2e-multiserver`. It exercises `blue` as a routed alias through NATS plus a Private Connector, and `direct` as an Edge direct-S3 alias using the `deploy/compose.multiserver.yaml` overlay. Both aliases set a demo default bucket and the smoke harness signs short-form URLs for them, while retaining a full-path `green` request to show non-default aliases are unchanged.
 

@@ -11,6 +11,11 @@ KEY=${AIR3_DEMO_KEY:-hello.txt}
 MISSING_KEY=${AIR3_DEMO_MISSING_KEY:-missing.txt}
 SECRET=${AIR3_SIGNING_SECRET:-dev-signing-secret-change-me}
 EXPECTED=${AIR3_DEMO_CONTENT:-$'hello from air3 compose demo\n'}
+S3_ENDPOINT=${AIR3_DEMO_S3_ENDPOINT:-http://versitygw:10000}
+SHORT_FORM_COLLISION_KEY=${AIR3_DEMO_SHORT_FORM_KEY:-$BUCKET/file.txt}
+LEGACY_COLLISION_KEY=${AIR3_DEMO_LEGACY_COLLISION_KEY:-file.txt}
+SHORT_FORM_EXPECTED=${AIR3_DEMO_SHORT_FORM_CONTENT:-"short-form wins: key $SHORT_FORM_COLLISION_KEY"$'\n'}
+LEGACY_COLLISION_CONTENT=${AIR3_DEMO_LEGACY_COLLISION_CONTENT:-"legacy full-path sentinel: key $LEGACY_COLLISION_KEY"$'\n'}
 
 run_compose() {
   # shellcheck disable=SC2086
@@ -28,7 +33,13 @@ sign_url() {
   local method=$1
   local key=$2
   local expiration=${3:-2m}
-  go run ./cmd/signurl -method "$method" -base-url "$BASE_URL" -bucket "$BUCKET" -key "$key" -secret "$SECRET" -expiration "$expiration"
+  go run ./cmd/signurl -method "$method" -base-url "$BASE_URL" -bucket "$BUCKET" -key "$key" -secret "$SECRET" -expiration "$expiration" -default-bucket-path
+}
+
+put_object() {
+  local key=$1
+  local content=$2
+  printf '%s' "$content" | run_compose run --rm --no-deps -T aws-cli "cat > /tmp/air3-smoke-object && aws --endpoint-url '$S3_ENDPOINT' s3 cp /tmp/air3-smoke-object 's3://$BUCKET/$key' --content-type text/plain >/dev/null"
 }
 
 status_for() {
@@ -47,6 +58,20 @@ assert_status() {
     exit 1
   fi
   echo "ok: $label returned HTTP $expected"
+}
+
+assert_body() {
+  local label=$1
+  local expected=$2
+  local url=$3
+  local body
+  body=$(curl --silent --show-error --fail --cacert "$CERT_DIR/dev-ca.crt" "$url")
+  if [ "$body"$'\n' != "$expected" ] && [ "$body" != "$expected" ]; then
+    echo "error: $label body did not match expected content" >&2
+    printf 'expected: %q\nactual:   %q\n' "$expected" "$body" >&2
+    exit 1
+  fi
+  echo "ok: $label returned expected content"
 }
 
 wait_for_edge() {
@@ -77,13 +102,7 @@ fi
 wait_for_edge
 
 get_url=$(sign_url GET "$KEY" 2m)
-body=$(curl --silent --show-error --fail --cacert "$CERT_DIR/dev-ca.crt" "$get_url")
-if [ "$body"$'\n' != "$EXPECTED" ] && [ "$body" != "$EXPECTED" ]; then
-  echo "error: GET body did not match expected content" >&2
-  printf 'expected: %q\nactual:   %q\n' "$EXPECTED" "$body" >&2
-  exit 1
-fi
-echo "ok: signed GET returned expected content"
+assert_body "signed GET" "$EXPECTED" "$get_url"
 
 head_url=$(sign_url HEAD "$KEY" 2m)
 head_headers=$(mktemp)
@@ -100,6 +119,14 @@ if [ -s "$head_body" ]; then
   exit 1
 fi
 echo "ok: signed HEAD returned headers and no body"
+
+# With AIR3_S3_BUCKET=demo, signing key demo/file.txt emits /demo/file.txt;
+# this must fetch key demo/file.txt, not legacy full-path key file.txt.
+echo "Preparing short-form default-bucket collision objects..."
+put_object "$LEGACY_COLLISION_KEY" "$LEGACY_COLLISION_CONTENT"
+put_object "$SHORT_FORM_COLLISION_KEY" "$SHORT_FORM_EXPECTED"
+short_form_url=$(sign_url GET "$SHORT_FORM_COLLISION_KEY" 2m)
+assert_body "short-form /$SHORT_FORM_COLLISION_KEY default-bucket routing" "$SHORT_FORM_EXPECTED" "$short_form_url"
 
 bad_url=$(printf '%s' "$get_url" | sed 's/sig=[^&]*/sig=deadbeef/')
 assert_status "bad signature rejection" "403" "$bad_url"
