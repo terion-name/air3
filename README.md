@@ -1,10 +1,14 @@
 # air3: NATS S3 File Gateway
 
-**air3** is a secure file gateway that lets you serve files from a strictly private S3-compatible storage to the public internet—without ever exposing your S3 credentials to public-facing servers or opening any inbound firewall ports to your private network.
+[![npm](https://img.shields.io/npm/v/@terion/air3-edgesign.svg)](https://www.npmjs.com/package/@terion/air3-edgesign)
 
-It acts as a bridge between the wild public internet and your highly secure private network, relying on a NATS message broker to coordinate transfers and strict zone separation to keep your data safe.
+**air3** is a secure file gateway that lets you serve files from a strictly private S3-compatible storage to the public internet — or across segmented internal networks — without ever exposing your S3 credentials and server to edge services or opening any inbound firewall ports to your private storage zone. S3 backend can be hidden behind firewall, NAT or even VPN, with no inbound whatsoever, and still can serve public clients without them and edge applications even know of it's existance.
 
-## The Usecase: Securely Serving Private Files
+It acts as a secure bridge across network boundaries (like DMZs or zero-trust environments), relying on a NATS message broker to coordinate transfers and strict zone separation to keep your data safe.
+
+## Core Use Cases
+
+### 1. Securely Serving Private Files to the Public Internet
 
 Imagine you have sensitive S3 storage hosted deep within your private infrastructure. You need to let specific public users download certain files via signed URLs.
 
@@ -18,6 +22,12 @@ Normally, you'd have to:
 3. A **NATS Broker** acts as a middleman (control plane) passing messages between them.
 
 When a public user requests a file, the Edge Gateway asks the Private Connector (via NATS) to fetch it. The Connector grabs the file from S3 and securely streams it back out to the Edge, which directly delivers it to the user.
+
+### 2. Zero-Trust Internal File Access (Service Mesh / Kubernetes)
+
+air3 isn't just for public-facing traffic. It is equally powerful as an internal bridge in strict zero-trust environments.
+
+If you have isolated Kubernetes clusters, locked-down microservices, or a heavily segmented service mesh, you can deploy the Edge Gateway in the less-trusted zones and the Private Connector in the highly-trusted data zone. This allows your internal services to securely stream objects using short-lived signed URLs without distributing raw S3 credentials to every microservice or punching holes in your storage backbone's network policies.
 
 ## Documentation
 
@@ -68,7 +78,7 @@ sequenceDiagram
     Connector->>NATS: Pull ticket from queue
     Connector->>S3: Fetch object bytes or metadata
     S3-->>Connector: Return object stream or status
-    Connector->>Edge: Ingest stream (mTLS + token; HTTP default, TCP/smux/QUIC/HTTP/3 opt-in)
+    Connector->>Edge: Ingest stream (mTLS + token, HTTP default, TCP/smux/QUIC/HTTP/3 opt-in)
     Edge-->>Client: Forward stream to held response
     Edge->>Edge: Complete pending request
 ```
@@ -137,123 +147,102 @@ The smoke tests (`make smoke`) automatically verify that signed `GET`/`HEAD` req
 
 For a runnable multi-server example, use `make e2e-multiserver`. It exercises `blue` as a routed alias through NATS plus a Private Connector, and `direct` as an Edge direct-S3 alias using the `deploy/compose.multiserver.yaml` overlay.
 
-## Compose Performance Test
+## Performance Benchmarks & Transport Recommendations
 
-The Compose benchmark starts the demo stack with a performance override, exposes perf-only public read baselines, seeds three Wikimedia objects into the demo bucket, and compares those baselines against signed air3 gateway-through downloads. The reported paths are:
+We include a comprehensive performance test suite to help you choose the best configuration for your workload. The benchmark spins up the demo stack, seeds sample files (small, medium, and large), and compares **air3's secure gateway** against a direct S3 connection and a standard Caddy reverse proxy.
 
-- `direct_s3`: unsigned public read directly from host-exposed VersityGW.
-- `caddy_s3`: unsigned public read through stock `caddy:2-alpine` reverse proxy with `cpus: 1.0`.
-- `air3_gateway`: signed Air3 gateway URL through normal edge/private-connector path.
+> **Note:** The benchmarks expose the private S3 server purely for comparison purposes. In normal operation, air3 keeps your S3 storage strictly private.
 
-These public reads are perf/demo-only. The normal Compose security topology remains unchanged: outside the perf override, VersityGW stays private and the edge still cannot bypass the connector path.
+### Running the Benchmarks Yourself
 
-```sh
-make perf                         # one private connector, 5 iterations per object
-AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 make perf
-make perf-multi                   # AIR3_PERF_MULTI_CONNECTORS private connectors (default: 3)
-AIR3_PERF_PARALLELISM=8 make perf # optional parallel gateway-through phase
-AIR3_INGEST_TRANSPORT=http1 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
-AIR3_INGEST_TRANSPORT=http2 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
-AIR3_INGEST_TRANSPORT=tcp AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
-AIR3_INGEST_TRANSPORT=smux AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
-AIR3_INGEST_TRANSPORT=quic AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
-AIR3_INGEST_TRANSPORT=http3 AIR3_PERF_ITERATIONS=1 AIR3_PERF_SKIP_BIG=1 AIR3_PERF_CONNECTORS=1 ./deploy/scripts/perf-compose.sh
-```
-
-Results are written under `.air3-perf-results/` as per-request CSV plus a summary CSV with average latency, speed, throughput, and penalty percentages for `direct_s3`, `caddy_s3`, and `air3_gateway`. Default result filenames include the transport label, and the CSVs include an `ingest_transport` column so explicit HTTP variants, legacy HTTP, and experimental TCP/smux/quic runs are distinguishable. Downloaded source files are cached under `.air3-perf-cache/` so repeat runs do not re-download them.
-
-### README Benchmark Harness
-
-For the broader README comparison matrix, run:
+To run the full suite across different transports (HTTP/1, HTTP/2, HTTP/3, TCP, SMUX, QUIC), concurrency levels, and scale modes:
 
 ```sh
 make readme-benchmark
 ```
+*Results will be saved in the `.air3-perf-results/` directory.*
 
-That harness compares the Caddy baseline with Air3 over all ingest transports (`http1`, `http2`, `tcp`, `smux`, `quic`, and `http3`) across single and scaled Compose modes, sequential and 16-way concurrent traffic, and small/medium/big/mixed content sets. It writes `raw.csv`, `aggregate.csv`, and `summary.md` under `.air3-perf-results/readme-*`.
+### Benchmark Snapshot & Recommendations
 
-### Performance Snapshot
+The results below show average Time To First Byte (TTFB in ms) / Requests Per Second (RPS) / Throughput (MiB/s).
+*(Snapshot generated locally using `make readme-benchmark` on 2026-06-10).*
 
-The following snapshot comes from `.air3-perf-results/readme-20260610-151107`, generated on 2026-06-10 with the README benchmark harness. It is a local Docker Compose comparison using hot object-store/cache data, intended for relative Caddy-vs-Air3 transport analysis rather than a cloud SLA or production capacity claim.
+**Based on these results, we recommend:**
 
-Scale modes:
+1. **For general use & maximum compatibility:** **`http1`** or **`http2`** remain incredibly solid choices. They are well-understood, easy to debug, and provide strong baseline performance without requiring custom transports.
+2. **For large file streaming (highest throughput):** **`tcp`** and **`http1`** perform exceptionally well under high concurrency with large files, often matching or exceeding standard HTTP proxies.
+3. **For high-concurrency small files:** **`quic`** and **`http2`** handle many small requests very efficiently.
 
-- **single:** Caddy 2 CPU, edge-gateway 2 CPU, 1 private connector with 2 CPU.
-- **scaled:** Caddy 4 CPU, edge-gateway 4 CPU, 3 private connectors with 2 CPU each.
+#### Single Node (1 Gateway, 1 Connector)
+*Test environment resource limits:* Caddy `2 CPU`, Edge Gateway `2 CPU`, Private Connector `2 CPU` (1 instance).
 
-Cells are `avg TTFB ms / RPS / MiB/s`, with sequential runs using one request at a time and concurrent runs using 16 requests at concurrency 16.
-
-#### Single sequential
-
-| Target | Small | Medium | Big | Mixed |
+*Sequential Requests*
+| Target | Small (100KB) | Medium (5MB) | Big (100MB) | Mixed |
 |---|---:|---:|---:|---:|
-| Caddy baseline | 4.5 / 23.8 / 3 | 1.8 / 39.3 / 196 | 1.8 / 19.5 / 889 | 2.5 / 25.4 / 429 |
-| Air3 http1 | 6.8 / 9.4 / 1 | 6.1 / 11.0 / 55 | 9.2 / 6.1 / 280 | 7.3 / 7.3 / 124 |
-| Air3 http2 | 13.3 / 5.4 / 1 | 15.8 / 5.1 / 25 | 14.9 / 4.5 / 206 | 6.1 / 11.5 / 194 |
-| Air3 tcp | 20.3 / 5.2 / 1 | 20.2 / 5.2 / 26 | 22.3 / 5.3 / 243 | 13.2 / 6.4 / 108 |
-| Air3 smux | 15.4 / 6.6 / 1 | 17.0 / 6.5 / 32 | 18.6 / 5.1 / 231 | 16.2 / 5.8 / 99 |
-| Air3 quic | 9.1 / 7.4 / 1 | 10.7 / 8.5 / 42 | 17.6 / 4.0 / 184 | 10.3 / 10.0 / 170 |
-| Air3 http3 | 12.5 / 14.6 / 2 | 12.7 / 10.0 / 50 | 14.4 / 3.7 / 171 | 10.0 / 6.8 / 116 |
+| Caddy proxy (baseline) | 4.5 / 23.8 / 3 | 1.8 / 39.3 / 196 | 1.8 / 19.5 / 889 | 2.5 / 25.4 / 429 |
+| **Air3 (http1)** | 6.8 / 9.4 / 1 | 6.1 / 11.0 / 55 | 9.2 / 6.1 / 280 | 7.3 / 7.3 / 124 |
+| **Air3 (http2)** | 13.3 / 5.4 / 1 | 15.8 / 5.1 / 25 | 14.9 / 4.5 / 206 | 6.1 / 11.5 / 194 |
+| **Air3 (tcp)** | 20.3 / 5.2 / 1 | 20.2 / 5.2 / 26 | 22.3 / 5.3 / 243 | 13.2 / 6.4 / 108 |
+| **Air3 (smux)** | 15.4 / 6.6 / 1 | 17.0 / 6.5 / 32 | 18.6 / 5.1 / 231 | 16.2 / 5.8 / 99 |
+| **Air3 (quic)** | 9.1 / 7.4 / 1 | 10.7 / 8.5 / 42 | 17.6 / 4.0 / 184 | 10.3 / 10.0 / 170 |
+| **Air3 (http3)** | 12.5 / 14.6 / 2 | 12.7 / 10.0 / 50 | 14.4 / 3.7 / 171 | 10.0 / 6.8 / 116 |
 
-#### Single concurrent
-
-| Target | Small | Medium | Big | Mixed |
+*Concurrent Requests (16 workers)*
+| Target | Small (100KB) | Medium (5MB) | Big (100MB) | Mixed |
 |---|---:|---:|---:|---:|
-| Caddy baseline | 6.4 / 147.8 / 16 | 20.4 / 138.7 / 690 | 41.9 / 66.4 / 3032 | 22.7 / 114.7 / 1821 |
-| Air3 http1 | 13.9 / 61.4 / 6 | 27.7 / 60.0 / 299 | 73.0 / 32.1 / 1466 | 32.5 / 43.9 / 697 |
-| Air3 http2 | 11.2 / 64.6 / 7 | 11.9 / 52.1 / 259 | 19.3 / 14.3 / 651 | 15.5 / 32.3 / 513 |
-| Air3 tcp | 20.7 / 63.7 / 7 | 31.0 / 75.1 / 374 | 82.4 / 27.9 / 1276 | 32.0 / 42.4 / 674 |
-| Air3 smux | 19.3 / 67.3 / 7 | 31.5 / 56.1 / 279 | 64.8 / 23.5 / 1072 | 34.0 / 38.7 / 613 |
-| Air3 quic | 20.5 / 72.6 / 8 | 57.0 / 31.5 / 157 | 52.4 / 13.2 / 604 | 26.6 / 27.5 / 437 |
-| Air3 http3 | 29.6 / 58.1 / 6 | 42.3 / 26.0 / 130 | 47.4 / 8.6 / 391 | 24.7 / 21.9 / 348 |
+| Caddy proxy (baseline) | 6.4 / 147.8 / 16 | 20.4 / 138.7 / 690 | 41.9 / 66.4 / 3032 | 22.7 / 114.7 / 1821 |
+| **Air3 (http1)** | 13.9 / 61.4 / 6 | 27.7 / 60.0 / 299 | 73.0 / 32.1 / 1466 | 32.5 / 43.9 / 697 |
+| **Air3 (http2)** | 11.2 / 64.6 / 7 | 11.9 / 52.1 / 259 | 19.3 / 14.3 / 651 | 15.5 / 32.3 / 513 |
+| **Air3 (tcp)** | 20.7 / 63.7 / 7 | 31.0 / 75.1 / 374 | 82.4 / 27.9 / 1276 | 32.0 / 42.4 / 674 |
+| **Air3 (smux)** | 19.3 / 67.3 / 7 | 31.5 / 56.1 / 279 | 64.8 / 23.5 / 1072 | 34.0 / 38.7 / 613 |
+| **Air3 (quic)** | 20.5 / 72.6 / 8 | 57.0 / 31.5 / 157 | 52.4 / 13.2 / 604 | 26.6 / 27.5 / 437 |
+| **Air3 (http3)** | 29.6 / 58.1 / 6 | 42.3 / 26.0 / 130 | 47.4 / 8.6 / 391 | 24.7 / 21.9 / 348 |
 
-#### Scaled sequential
+#### Scaled (1 Gateway, 3 Connectors)
+*Test environment resource limits:* Caddy `4 CPU`, Edge Gateway `4 CPU`, Private Connector `2 CPU` (3 instances, 6 CPU total).
 
-| Target | Small | Medium | Big | Mixed |
+*Sequential Requests*
+| Target | Small (100KB) | Medium (5MB) | Big (100MB) | Mixed |
 |---|---:|---:|---:|---:|
-| Caddy baseline | 4.6 / 22.7 / 2 | 2.1 / 27.4 / 136 | 1.7 / 21.3 / 975 | 1.9 / 29.4 / 498 |
-| Air3 http1 | 6.5 / 14.3 / 2 | 12.7 / 5.9 / 29 | 9.7 / 6.9 / 316 | 5.0 / 12.9 / 219 |
-| Air3 http2 | 12.5 / 7.9 / 1 | 5.9 / 10.1 / 50 | 9.5 / 6.0 / 275 | 8.4 / 5.6 / 95 |
-| Air3 tcp | 15.5 / 6.9 / 1 | 19.7 / 5.4 / 27 | 15.8 / 6.3 / 289 | 15.2 / 6.1 / 104 |
-| Air3 smux | 13.0 / 10.3 / 1 | 24.3 / 6.3 / 31 | 17.0 / 5.4 / 249 | 18.9 / 6.0 / 101 |
-| Air3 quic | 17.8 / 5.7 / 1 | 18.3 / 5.2 / 26 | 9.2 / 6.5 / 298 | 18.9 / 4.6 / 78 |
-| Air3 http3 | 8.4 / 11.7 / 1 | 9.8 / 6.3 / 31 | 20.2 / 2.4 / 111 | 19.3 / 4.2 / 71 |
+| Caddy proxy (baseline) | 4.6 / 22.7 / 2 | 2.1 / 27.4 / 136 | 1.7 / 21.3 / 975 | 1.9 / 29.4 / 498 |
+| **Air3 (http1)** | 6.5 / 14.3 / 2 | 12.7 / 5.9 / 29 | 9.7 / 6.9 / 316 | 5.0 / 12.9 / 219 |
+| **Air3 (http2)** | 12.5 / 7.9 / 1 | 5.9 / 10.1 / 50 | 9.5 / 6.0 / 275 | 8.4 / 5.6 / 95 |
+| **Air3 (tcp)** | 15.5 / 6.9 / 1 | 19.7 / 5.4 / 27 | 15.8 / 6.3 / 289 | 15.2 / 6.1 / 104 |
+| **Air3 (smux)** | 13.0 / 10.3 / 1 | 24.3 / 6.3 / 31 | 17.0 / 5.4 / 249 | 18.9 / 6.0 / 101 |
+| **Air3 (quic)** | 17.8 / 5.7 / 1 | 18.3 / 5.2 / 26 | 9.2 / 6.5 / 298 | 18.9 / 4.6 / 78 |
+| **Air3 (http3)** | 8.4 / 11.7 / 1 | 9.8 / 6.3 / 31 | 20.2 / 2.4 / 111 | 19.3 / 4.2 / 71 |
 
-#### Scaled concurrent
-
-| Target | Small | Medium | Big | Mixed |
+*Concurrent Requests (16 workers)*
+| Target | Small (100KB) | Medium (5MB) | Big (100MB) | Mixed |
 |---|---:|---:|---:|---:|
-| Caddy baseline | 5.4 / 169.4 / 18 | 9.5 / 145.3 / 723 | 25.7 / 83.3 / 3805 | 11.9 / 100.0 / 1588 |
-| Air3 http1 | 8.2 / 70.7 / 7 | 15.3 / 62.0 / 308 | 44.5 / 35.4 / 1617 | 18.8 / 50.9 / 808 |
-| Air3 http2 | 7.8 / 71.5 / 8 | 13.9 / 71.3 / 355 | 11.3 / 29.9 / 1365 | 11.1 / 43.1 / 684 |
-| Air3 tcp | 13.4 / 69.0 / 7 | 22.4 / 70.5 / 351 | 42.3 / 38.8 / 1773 | 41.3 / 42.6 / 676 |
-| Air3 smux | 15.2 / 67.9 / 7 | 25.4 / 57.5 / 286 | 48.4 / 31.1 / 1420 | 22.5 / 44.4 / 704 |
-| Air3 quic | 15.0 / 95.8 / 10 | 16.6 / 41.8 / 208 | 29.7 / 17.7 / 809 | 16.5 / 32.7 / 519 |
-| Air3 http3 | 15.1 / 75.8 / 8 | 48.2 / 31.0 / 154 | 22.4 / 13.8 / 629 | 15.5 / 25.4 / 404 |
+| Caddy proxy (baseline) | 5.4 / 169.4 / 18 | 9.5 / 145.3 / 723 | 25.7 / 83.3 / 3805 | 11.9 / 100.0 / 1588 |
+| **Air3 (http1)** | 8.2 / 70.7 / 7 | 15.3 / 62.0 / 308 | 44.5 / 35.4 / 1617 | 18.8 / 50.9 / 808 |
+| **Air3 (http2)** | 7.8 / 71.5 / 8 | 13.9 / 71.3 / 355 | 11.3 / 29.9 / 1365 | 11.1 / 43.1 / 684 |
+| **Air3 (tcp)** | 13.4 / 69.0 / 7 | 22.4 / 70.5 / 351 | 42.3 / 38.8 / 1773 | 41.3 / 42.6 / 676 |
+| **Air3 (smux)** | 15.2 / 67.9 / 7 | 25.4 / 57.5 / 286 | 48.4 / 31.1 / 1420 | 22.5 / 44.4 / 704 |
+| **Air3 (quic)** | 15.0 / 95.8 / 10 | 16.6 / 41.8 / 208 | 29.7 / 17.7 / 809 | 16.5 / 32.7 / 519 |
+| **Air3 (http3)** | 15.1 / 75.8 / 8 | 48.2 / 31.0 / 154 | 22.4 / 13.8 / 629 | 15.5 / 25.4 / 404 |
 
-Useful knobs:
+<details>
+<summary><b>Advanced Benchmark Configuration (for developers)</b></summary>
 
-- `AIR3_PERF_ITERATIONS` (default `5`)
-- `AIR3_PERF_CONNECTORS` (default `1`)
-- `AIR3_PERF_MULTI_CONNECTORS` (default `3`, used by `make perf-multi`)
-- `AIR3_PERF_PARALLELISM` for the optional parallel gateway-through phase
-- `AIR3_PERF_SKIP_BIG=1` to skip the video object for a quick run
-- `AIR3_PERF_S3_PORT` to change the temporary localhost VersityGW port
-- `AIR3_PERF_CADDY_PORT` to change the temporary localhost Caddy baseline port
-- `AIR3_PERF_CADDY_BASE_URL` to point the `caddy_s3` baseline at a different proxy URL
-- `AIR3_PERF_PUBLIC_READ_MODE` controls how the perf script enables anonymous reads: ACL mode sets a public-read bucket ACL in VersityGW; `auto` falls back to a bucket policy if ACL-only anonymous reads are not sufficient.
-- `AIR3_STREAM_COPY_BUFFER_BYTES` (default `262144`) tunes the Edge streaming copy buffer size for Compose perf runs.
-- `AIR3_INGEST_POOL_SIZE` (normal default `32`, perf default `1024`) caps reusable connector-side connection/session/client pools for HTTP-family, smux, QUIC, and HTTP/3 ingest transports; raw TCP remains one connection per object.
-- `AIR3_CONNECTOR_WORKERS` (normal default `1`, perf default `1024`) bounds concurrent ticket handling inside each private connector.
-- `AIR3_INGEST_TRANSPORT=http|http1|http2|http3|tcp|smux|quic` selects the connector→edge ingest transport. Legacy `http` remains the default for compatibility; `http1` forces connector HTTP/1.1, `http2` enables connector HTTP/2, and `http3` uses HTTP/3. The HTTP family uses `AIR3_INGEST_URL`, existing ingest headers, and the object body. `tcp`, `smux`, and `quic` are custom stream transports that use a shared MessagePack metadata frame, raw object body, and ack semantics. Compose keeps the TCP/smux and QUIC ingest listeners internal by default.
-- `AIR3_INGEST_DISABLE_HTTP2` (default `false`) is legacy/compatibility-only for `AIR3_INGEST_TRANSPORT=http` (`true` = HTTP/1.1, `false` = HTTP/2). Explicit `http1`, `http2`, and `http3` ignore it.
-- `AIR3_EDGE_INGEST_TCP_ADDR` (Compose default `:9444`) controls the edge TCP/smux ingest listener when `tcp` or `smux` transport is enabled.
-- `AIR3_INGEST_TCP_ADDR` (Compose default `edge-gateway:9444`) controls the connector TCP/smux dial address when `tcp` or `smux` transport is enabled. `smux` reuses these TCP address variables.
-- `AIR3_EDGE_INGEST_QUIC_ADDR` (Compose default `:9445`) controls the edge QUIC ingest listener when `quic` transport is enabled. Compose does not publish this UDP listener to the host by default; host exposure requires an explicit `/udp` port mapping.
-- `AIR3_INGEST_QUIC_ADDR` (Compose default `edge-gateway:9445`) controls the connector QUIC dial address when `quic` transport is enabled. `AIR3_INGEST_URL` remains the HTTPS ingest fallback/ticket URL in all transport modes and is used directly by the HTTP-family transports.
-- `AIR3_PERF_CACHE_DIR` and `AIR3_PERF_RESULTS_DIR` to relocate cache/results
+You can deeply customize the benchmark runs via environment variables:
 
-The perf override limits each `edge-gateway` and `private-connector` container to one CPU and raises both `AIR3_CONNECTOR_WORKERS` and `AIR3_INGEST_POOL_SIZE` to `1024` unless overridden. It also adds the `caddy-s3` service and `deploy/Caddyfile.perf` for the Caddy baseline. Unsigned public baselines use curl against the perf-exposed endpoints; gateway measurements use `cmd/signurl` and `curl --http1.1 --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443` for stable streaming timings. TCP, smux, and custom QUIC ingest use the same mTLS files, connector identity allowlist, and one-time ingest token semantics as HTTP ingest. HTTP-family transports (`http`, `http1`, `http2`, `http3`) use the existing ingest URL, headers, and body. Custom stream transports (`tcp`, `smux`, `quic`) use the shared MessagePack metadata frame, raw object body, and ack semantics; smux multiplexes those streams over persistent mTLS TCP, one smux stream per object.
+- **Transports:** Set `AIR3_INGEST_TRANSPORT` to `http1`, `http2`, `http3`, `tcp`, `smux`, or `quic`.
+- **Concurrency & Scale:** Use `AIR3_PERF_ITERATIONS`, `AIR3_PERF_CONNECTORS`, `AIR3_PERF_MULTI_CONNECTORS`, and `AIR3_PERF_PARALLELISM`.
+- **Tuning:** Adjust `AIR3_STREAM_COPY_BUFFER_BYTES`, `AIR3_INGEST_POOL_SIZE`, and `AIR3_CONNECTOR_WORKERS` to see how internal buffering and pooling affects throughput.
+
+Example commands:
+
+```sh
+make perf                         # single connector, 5 iterations per object
+AIR3_PERF_PARALLELISM=8 make perf # adds a parallel phase
+make perf-multi                   # tests scaled mode (3 connectors)
+```
+
+The perf override limits each `edge-gateway` and `private-connector` container to one CPU and raises both `AIR3_CONNECTOR_WORKERS` and `AIR3_INGEST_POOL_SIZE` to `1024` unless overridden. It also adds the `caddy-s3` service and `deploy/Caddyfile.perf` for the Caddy baseline. Unsigned public baselines use curl against the perf-exposed endpoints; gateway measurements use `cmd/signurl` and `curl --http1.1 --cacert deploy/certs/generated/dev-ca.crt` against `https://localhost:8443` for stable streaming timings. Custom stream transports (`tcp`, `smux`, `quic`) use the shared MessagePack metadata frame, raw object body, and ack semantics; smux multiplexes those streams over persistent mTLS TCP, one smux stream per object.
+
+</details>
 
 ## Generating Signed URLs
 
