@@ -60,16 +60,37 @@ type ValidationConfig struct {
 	Disabled bool
 }
 
+// SignOptions controls opt-in signing behavior. The zero value preserves the
+// strict public path layout.
+type SignOptions struct {
+	DefaultBucketPath bool
+}
+
+// ValidationOptions controls opt-in signed URL validation behavior. The zero
+// value preserves strict public path parsing.
+type ValidationOptions struct {
+	DefaultBucket publicpath.DefaultBucketResolver
+}
+
 // SignURL returns BaseURL/{bucket}/{key}?expires=...&sig=... using the same
 // canonical form that ValidateURL verifies.
 func SignURL(input SignInput) (string, error) {
-	return SignURLForMode(input, publicpath.ModeSingle)
+	return SignURLForModeWithOptions(input, publicpath.ModeSingle, SignOptions{})
 }
 
 // SignURLForMode returns a signed URL using the public path layout for mode.
 func SignURLForMode(input SignInput, mode publicpath.Mode) (string, error) {
+	return SignURLForModeWithOptions(input, mode, SignOptions{})
+}
+
+// SignURLForModeWithOptions returns a signed URL using the public path layout
+// for mode and opt-in signing behavior.
+func SignURLForModeWithOptions(input SignInput, mode publicpath.Mode, opts SignOptions) (string, error) {
 	if err := validateMode(mode); err != nil {
 		return "", err
+	}
+	if opts.DefaultBucketPath && mode != publicpath.ModeMulti {
+		return "", errors.New("default-bucket-path requires multi-server mode")
 	}
 	if input.Secret == "" {
 		return "", errors.New("signing secret is required")
@@ -86,11 +107,15 @@ func SignURLForMode(input SignInput, mode publicpath.Mode) (string, error) {
 	if u.Scheme == "" || u.Host == "" {
 		return "", errors.New("base url must be absolute")
 	}
-	objectPath, err := appendObjectPath(u.Path, publicpath.Object{
+	object := publicpath.Object{
 		Server: claims.Server,
 		Bucket: claims.Bucket,
 		Key:    claims.Key,
-	}, mode)
+	}
+	objectPath, err := appendObjectPath(u.Path, object, mode)
+	if opts.DefaultBucketPath {
+		objectPath, err = appendDefaultBucketObjectPath(u.Path, object)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -127,16 +152,29 @@ func SignURLForMode(input SignInput, mode publicpath.Mode) (string, error) {
 // The signature is lowercase hex HMAC-SHA256 over that exact string. The
 // comparison uses hmac.Equal so callers do not leak timing information.
 func ValidateURL(method, rawURL string, cfg ValidationConfig, now time.Time) (Claims, error) {
-	return ValidateURLForMode(method, rawURL, cfg, now, publicpath.ModeSingle)
+	return ValidateURLForModeWithOptions(method, rawURL, cfg, now, publicpath.ModeSingle, ValidationOptions{})
+}
+
+// ValidateURLWithOptions verifies the HMAC signature embedded in rawURL for
+// method and opt-in validation behavior.
+func ValidateURLWithOptions(method, rawURL string, cfg ValidationConfig, now time.Time, opts ValidationOptions) (Claims, error) {
+	return ValidateURLForModeWithOptions(method, rawURL, cfg, now, publicpath.ModeSingle, opts)
 }
 
 // ValidateURLForMode verifies the HMAC signature embedded in rawURL for method
 // using the public path layout for mode.
 func ValidateURLForMode(method, rawURL string, cfg ValidationConfig, now time.Time, mode publicpath.Mode) (Claims, error) {
+	return ValidateURLForModeWithOptions(method, rawURL, cfg, now, mode, ValidationOptions{})
+}
+
+// ValidateURLForModeWithOptions verifies the HMAC signature embedded in rawURL
+// for method using the public path layout for mode and opt-in validation
+// behavior.
+func ValidateURLForModeWithOptions(method, rawURL string, cfg ValidationConfig, now time.Time, mode publicpath.Mode, opts ValidationOptions) (Claims, error) {
 	if err := validateMode(mode); err != nil {
 		return Claims{}, err
 	}
-	claims, sig, err := claimsFromURL(method, rawURL, mode)
+	claims, sig, err := claimsFromURL(method, rawURL, mode, opts)
 	if err != nil {
 		return Claims{}, err
 	}
@@ -199,7 +237,7 @@ func claimsFromInput(input SignInput, mode publicpath.Mode) (Claims, error) {
 	}, nil
 }
 
-func claimsFromURL(method, rawURL string, mode publicpath.Mode) (Claims, string, error) {
+func claimsFromURL(method, rawURL string, mode publicpath.Mode, opts ValidationOptions) (Claims, string, error) {
 	if err := validateMode(mode); err != nil {
 		return Claims{}, "", err
 	}
@@ -207,7 +245,7 @@ func claimsFromURL(method, rawURL string, mode publicpath.Mode) (Claims, string,
 	if err != nil {
 		return Claims{}, "", fmt.Errorf("parse signed url: %w", err)
 	}
-	object, err := objectFromEscapedPath(u.EscapedPath(), mode)
+	object, err := objectFromEscapedPath(u.EscapedPath(), mode, opts)
 	if err != nil {
 		return Claims{}, "", err
 	}
@@ -278,7 +316,10 @@ func appendObjectPath(basePath string, object publicpath.Object, mode publicpath
 	return "/" + strings.Join(nonEmpty(parts), "/"), nil
 }
 
-func objectFromEscapedPath(escapedPath string, mode publicpath.Mode) (publicpath.Object, error) {
+func objectFromEscapedPath(escapedPath string, mode publicpath.Mode, opts ValidationOptions) (publicpath.Object, error) {
+	if opts.DefaultBucket != nil && mode == publicpath.ModeMulti {
+		return publicpath.ParseEscapedPathWithDefaultBucket(escapedPath, mode, opts.DefaultBucket)
+	}
 	switch mode {
 	case publicpath.ModeSingle:
 		bucket, key, err := objectFromPath(escapedPath)
@@ -291,6 +332,14 @@ func objectFromEscapedPath(escapedPath string, mode publicpath.Mode) (publicpath
 	default:
 		return publicpath.Object{}, unknownModeError(mode)
 	}
+}
+
+func appendDefaultBucketObjectPath(basePath string, object publicpath.Object) (string, error) {
+	parts := []string{strings.Trim(basePath, "/"), url.PathEscape(object.Server)}
+	for _, segment := range strings.Split(object.Key, "/") {
+		parts = append(parts, url.PathEscape(segment))
+	}
+	return "/" + strings.Join(nonEmpty(parts), "/"), nil
 }
 
 func objectFromPath(escapedPath string) (string, string, error) {

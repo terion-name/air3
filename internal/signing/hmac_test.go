@@ -116,6 +116,152 @@ func TestSignURLForModeMultiValidates(t *testing.T) {
 	}
 }
 
+func TestSignURLForModeWithOptionsDefaultBucketPath(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	input := SignInput{
+		Method:  "GET",
+		BaseURL: "https://files.example.com",
+		Server:  "blue",
+		Bucket:  "demo",
+		Key:     "file.txt",
+		Expires: now.Add(time.Minute),
+		Secret:  "top-secret",
+	}
+
+	raw, err := SignURLForModeWithOptions(input, publicpath.ModeMulti, SignOptions{DefaultBucketPath: true})
+	if err != nil {
+		t.Fatalf("SignURLForModeWithOptions() error = %v", err)
+	}
+	u := mustParseURL(t, raw)
+	if got, want := u.EscapedPath(), "/blue/file.txt"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+
+	legacyRaw, err := SignURLForMode(input, publicpath.ModeMulti)
+	if err != nil {
+		t.Fatalf("SignURLForMode() error = %v", err)
+	}
+	legacyURL := mustParseURL(t, legacyRaw)
+	if got, want := legacyURL.EscapedPath(), "/blue/demo/file.txt"; got != want {
+		t.Fatalf("legacy path = %q, want %q", got, want)
+	}
+
+	resolver := func(server string) (string, bool) {
+		if server == "blue" {
+			return "demo", true
+		}
+		return "", false
+	}
+	claims, err := ValidateURLForModeWithOptions("GET", raw, ValidationConfig{Secret: "top-secret"}, now, publicpath.ModeMulti, ValidationOptions{DefaultBucket: resolver})
+	if err != nil {
+		t.Fatalf("ValidateURLForModeWithOptions() error = %v", err)
+	}
+	if claims.Server != "blue" || claims.Bucket != "demo" || claims.Key != "file.txt" {
+		t.Fatalf("claims = %#v", claims)
+	}
+
+	if _, err := ValidateURLForMode("GET", raw, ValidationConfig{Secret: "top-secret"}, now, publicpath.ModeMulti); err == nil {
+		t.Fatal("ValidateURLForMode() error = nil, want strict short-path rejection")
+	}
+}
+
+func TestValidateURLForModeWithOptionsDefaultBucketPathRejectsTampering(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	raw, err := SignURLForModeWithOptions(SignInput{
+		Method:  "GET",
+		BaseURL: "https://files.example.com",
+		Server:  "blue",
+		Bucket:  "demo",
+		Key:     "file.txt",
+		Expires: now.Add(time.Minute),
+		Secret:  "top-secret",
+	}, publicpath.ModeMulti, SignOptions{DefaultBucketPath: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blueOrGreenDemo := func(server string) (string, bool) {
+		switch server {
+		case "blue", "green":
+			return "demo", true
+		default:
+			return "", false
+		}
+	}
+
+	tests := []struct {
+		name     string
+		raw      string
+		resolver publicpath.DefaultBucketResolver
+	}{
+		{"server segment", strings.Replace(raw, "/blue/", "/green/", 1), blueOrGreenDemo},
+		{"key segment", strings.Replace(raw, "/file.txt", "/other.txt", 1), blueOrGreenDemo},
+		{"resolver bucket", raw, func(server string) (string, bool) { return "other", server == "blue" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ValidateURLForModeWithOptions("GET", tc.raw, ValidationConfig{Secret: "top-secret"}, now, publicpath.ModeMulti, ValidationOptions{DefaultBucket: tc.resolver})
+			if !errors.Is(err, ErrInvalidSignature) {
+				t.Fatalf("ValidateURLForModeWithOptions() error = %v, want ErrInvalidSignature", err)
+			}
+		})
+	}
+}
+
+func TestSignURLForModeWithOptionsDefaultBucketPathRejectsInvalidOptions(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	if _, err := SignURLForModeWithOptions(SignInput{Method: "GET", BaseURL: "https://files.example.com", Bucket: "demo", Key: "file.txt", Expires: now.Add(time.Minute), Secret: "secret"}, publicpath.ModeSingle, SignOptions{DefaultBucketPath: true}); err == nil || !strings.Contains(err.Error(), "multi-server") {
+		t.Fatalf("SignURLForModeWithOptions() error = %v, want multi-server mode error", err)
+	}
+
+	tests := []struct {
+		name  string
+		input SignInput
+	}{
+		{"missing server", SignInput{Method: "GET", BaseURL: "https://files.example.com", Bucket: "demo", Key: "file.txt", Expires: now.Add(time.Minute), Secret: "secret"}},
+		{"missing bucket", SignInput{Method: "GET", BaseURL: "https://files.example.com", Server: "blue", Key: "file.txt", Expires: now.Add(time.Minute), Secret: "secret"}},
+		{"missing key", SignInput{Method: "GET", BaseURL: "https://files.example.com", Server: "blue", Bucket: "demo", Expires: now.Add(time.Minute), Secret: "secret"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := SignURLForModeWithOptions(tc.input, publicpath.ModeMulti, SignOptions{DefaultBucketPath: true})
+			if err == nil {
+				t.Fatal("SignURLForModeWithOptions() error = nil, want validation error")
+			}
+		})
+	}
+}
+
+func TestDisabledValidationWithDefaultBucketPathParsesClaims(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	resolver := func(server string) (string, bool) {
+		if server == "blue" {
+			return "demo", true
+		}
+		return "", false
+	}
+	raw := "https://files.example.com/blue/file.txt?expires=1"
+	claims, err := ValidateURLForModeWithOptions("GET", raw, ValidationConfig{Disabled: true}, now, publicpath.ModeMulti, ValidationOptions{DefaultBucket: resolver})
+	if err != nil {
+		t.Fatalf("ValidateURLForModeWithOptions() error = %v", err)
+	}
+	if claims.Server != "blue" || claims.Bucket != "demo" || claims.Key != "file.txt" {
+		t.Fatalf("claims = %#v", claims)
+	}
+
+	malformedExpires := "https://files.example.com/blue/file.txt?expires=abc"
+	if _, err := ValidateURLForModeWithOptions("GET", malformedExpires, ValidationConfig{Disabled: true}, now, publicpath.ModeMulti, ValidationOptions{DefaultBucket: resolver}); err == nil {
+		t.Fatal("ValidateURLForModeWithOptions() error = nil, want malformed timestamp error")
+	}
+	malformedPath := "https://files.example.com//file.txt?expires=1"
+	if _, err := ValidateURLForModeWithOptions("GET", malformedPath, ValidationConfig{Disabled: true}, now, publicpath.ModeMulti, ValidationOptions{DefaultBucket: resolver}); err == nil {
+		t.Fatal("ValidateURLForModeWithOptions() error = nil, want malformed path error")
+	}
+	noDefaultBucket := func(string) (string, bool) { return "", false }
+	if _, err := ValidateURLForModeWithOptions("GET", raw, ValidationConfig{Disabled: true}, now, publicpath.ModeMulti, ValidationOptions{DefaultBucket: noDefaultBucket}); err == nil {
+		t.Fatal("ValidateURLForModeWithOptions() error = nil, want strict fallback path error")
+	}
+}
+
 func TestSignURLForModeMultiRejectsMissingOrInvalidServer(t *testing.T) {
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	for _, server := range []string{"", "bad.alias", "bad alias", "/bad"} {
