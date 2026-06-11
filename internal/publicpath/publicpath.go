@@ -19,6 +19,8 @@ type Object struct {
 	Key    string
 }
 
+type DefaultBucketResolver func(server string) (bucket string, ok bool)
+
 func ParseEscapedPath(escapedPath string, mode Mode) (Object, error) {
 	if !strings.HasPrefix(escapedPath, "/") {
 		return Object{}, fmt.Errorf("public path: missing leading slash")
@@ -96,6 +98,51 @@ func ParseEscapedPath(escapedPath string, mode Mode) (Object, error) {
 	default:
 		return Object{}, fmt.Errorf("public path: unknown mode %d", mode)
 	}
+}
+
+func ParseEscapedPathWithDefaultBucket(escapedPath string, mode Mode, defaultBucket DefaultBucketResolver) (Object, error) {
+	if mode != ModeMulti || defaultBucket == nil {
+		return ParseEscapedPath(escapedPath, mode)
+	}
+	if !strings.HasPrefix(escapedPath, "/") {
+		return Object{}, fmt.Errorf("public path: missing leading slash")
+	}
+
+	parts := strings.Split(escapedPath[1:], "/")
+	if len(parts) == 0 || (len(parts) == 1 && parts[0] == "") {
+		return Object{}, fmt.Errorf("public path: missing server")
+	}
+	if parts[0] == "" {
+		return Object{}, fmt.Errorf("public path: missing server")
+	}
+
+	server, err := unescapeSegment("server", parts[0])
+	if err != nil {
+		return Object{}, err
+	}
+	if err := ValidateAlias(server); err != nil {
+		return Object{}, fmt.Errorf("public path: invalid server alias %q: %w", server, err)
+	}
+
+	bucket, ok := defaultBucket(server)
+	if !ok {
+		return ParseEscapedPath(escapedPath, mode)
+	}
+	if bucket == "" {
+		return Object{}, fmt.Errorf("public path: empty default bucket for server %q", server)
+	}
+	if len(parts) < 2 {
+		return Object{}, fmt.Errorf("public path: missing key")
+	}
+
+	key, err := unescapeKey(parts[1:])
+	if err != nil {
+		return Object{}, err
+	}
+	if key == "" {
+		return Object{}, fmt.Errorf("public path: empty key")
+	}
+	return Object{Server: server, Bucket: bucket, Key: key}, nil
 }
 
 func ValidateAlias(alias string) error {

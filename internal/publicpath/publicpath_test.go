@@ -150,6 +150,107 @@ func TestParseEscapedPathMulti(t *testing.T) {
 	}
 }
 
+func TestParseEscapedPathWithDefaultBucketSingle(t *testing.T) {
+	resolver := func(server string) (string, bool) {
+		t.Fatalf("resolver should not be called for ModeSingle, got server %q", server)
+		return "", false
+	}
+
+	got, err := ParseEscapedPathWithDefaultBucket("/photos/cat.jpg", ModeSingle, resolver)
+	assertParseResult(t, got, err, Object{Bucket: "photos", Key: "cat.jpg"}, "")
+}
+
+func TestParseEscapedPathWithDefaultBucketMulti(t *testing.T) {
+	resolver := func(server string) (string, bool) {
+		if server == "blue" {
+			return "demo", true
+		}
+		return "", false
+	}
+
+	tests := []struct {
+		name    string
+		path    string
+		want    Object
+		wantErr string
+	}{
+		{
+			name: "default bucket single key segment",
+			path: "/blue/file.txt",
+			want: Object{Server: "blue", Bucket: "demo", Key: "file.txt"},
+		},
+		{
+			name: "default bucket nested key",
+			path: "/blue/archive/file.txt",
+			want: Object{Server: "blue", Bucket: "demo", Key: "archive/file.txt"},
+		},
+		{
+			name: "default bucket escaped key segments",
+			path: "/blue/dir%201/file%2Fname.txt",
+			want: Object{Server: "blue", Bucket: "demo", Key: "dir 1/file/name.txt"},
+		},
+		{
+			name:    "default bucket missing key",
+			path:    "/blue",
+			wantErr: "missing key",
+		},
+		{
+			name:    "default bucket empty key",
+			path:    "/blue/",
+			wantErr: "empty key",
+		},
+		{
+			name:    "no default still requires bucket and key",
+			path:    "/green/file.txt",
+			wantErr: "missing key",
+		},
+		{
+			name: "no default uses strict multi parsing",
+			path: "/green/photos/cat.jpg",
+			want: Object{Server: "green", Bucket: "photos", Key: "cat.jpg"},
+		},
+		{
+			name:    "invalid server alias",
+			path:    "/bad.alias/file.txt",
+			wantErr: "invalid server alias",
+		},
+		{
+			name:    "bad server escape",
+			path:    "/bad%ZZ/file.txt",
+			wantErr: "bad escape in server",
+		},
+		{
+			name:    "bad key escape",
+			path:    "/blue/bad%ZZ",
+			wantErr: "bad escape in key",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseEscapedPathWithDefaultBucket(tc.path, ModeMulti, resolver)
+			assertParseResult(t, got, err, tc.want, tc.wantErr)
+		})
+	}
+}
+
+func TestParseEscapedPathWithDefaultBucketRejectsEmptyDefault(t *testing.T) {
+	resolver := func(server string) (string, bool) {
+		if server == "blue" {
+			return "", true
+		}
+		return "", false
+	}
+
+	got, err := ParseEscapedPathWithDefaultBucket("/blue/file.txt", ModeMulti, resolver)
+	assertParseResult(t, got, err, Object{}, "empty default bucket")
+}
+
+func TestParseEscapedPathStrictMultiIgnoresDefaultBucketForm(t *testing.T) {
+	got, err := ParseEscapedPath("/blue/archive/file.txt", ModeMulti)
+	assertParseResult(t, got, err, Object{Server: "blue", Bucket: "archive", Key: "file.txt"}, "")
+}
+
 func TestValidateAlias(t *testing.T) {
 	valid63 := "a" + strings.Repeat("-", 62)
 	tooLong := "a" + strings.Repeat("b", 63)
