@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/terion-name/air3/internal/publicpath"
 	"github.com/terion-name/air3/internal/tickets"
 )
 
@@ -33,6 +34,7 @@ var (
 type SignInput struct {
 	Method                     string
 	BaseURL                    string
+	Server                     string
 	Bucket                     string
 	Key                        string
 	Range                      string
@@ -44,6 +46,7 @@ type SignInput struct {
 
 type Claims struct {
 	Method                     string
+	Server                     string
 	Bucket                     string
 	Key                        string
 	Range                      string
@@ -60,10 +63,18 @@ type ValidationConfig struct {
 // SignURL returns BaseURL/{bucket}/{key}?expires=...&sig=... using the same
 // canonical form that ValidateURL verifies.
 func SignURL(input SignInput) (string, error) {
+	return SignURLForMode(input, publicpath.ModeSingle)
+}
+
+// SignURLForMode returns a signed URL using the public path layout for mode.
+func SignURLForMode(input SignInput, mode publicpath.Mode) (string, error) {
+	if err := validateMode(mode); err != nil {
+		return "", err
+	}
 	if input.Secret == "" {
 		return "", errors.New("signing secret is required")
 	}
-	claims, err := claimsFromInput(input)
+	claims, err := claimsFromInput(input, mode)
 	if err != nil {
 		return "", err
 	}
@@ -75,7 +86,15 @@ func SignURL(input SignInput) (string, error) {
 	if u.Scheme == "" || u.Host == "" {
 		return "", errors.New("base url must be absolute")
 	}
-	u.Path = appendObjectPath(u.Path, input.Bucket, input.Key)
+	objectPath, err := appendObjectPath(u.Path, publicpath.Object{
+		Server: claims.Server,
+		Bucket: claims.Bucket,
+		Key:    claims.Key,
+	}, mode)
+	if err != nil {
+		return "", err
+	}
+	u.Path = objectPath
 
 	q := u.Query()
 	q.Set(ParamExpires, fmt.Sprintf("%d", input.Expires.Unix()))
@@ -108,7 +127,16 @@ func SignURL(input SignInput) (string, error) {
 // The signature is lowercase hex HMAC-SHA256 over that exact string. The
 // comparison uses hmac.Equal so callers do not leak timing information.
 func ValidateURL(method, rawURL string, cfg ValidationConfig, now time.Time) (Claims, error) {
-	claims, sig, err := claimsFromURL(method, rawURL)
+	return ValidateURLForMode(method, rawURL, cfg, now, publicpath.ModeSingle)
+}
+
+// ValidateURLForMode verifies the HMAC signature embedded in rawURL for method
+// using the public path layout for mode.
+func ValidateURLForMode(method, rawURL string, cfg ValidationConfig, now time.Time, mode publicpath.Mode) (Claims, error) {
+	if err := validateMode(mode); err != nil {
+		return Claims{}, err
+	}
+	claims, sig, err := claimsFromURL(method, rawURL, mode)
 	if err != nil {
 		return Claims{}, err
 	}
@@ -135,10 +163,20 @@ func ValidateURL(method, rawURL string, cfg ValidationConfig, now time.Time) (Cl
 	return claims, nil
 }
 
-func claimsFromInput(input SignInput) (Claims, error) {
+func claimsFromInput(input SignInput, mode publicpath.Mode) (Claims, error) {
+	if err := validateMode(mode); err != nil {
+		return Claims{}, err
+	}
 	method := strings.ToUpper(strings.TrimSpace(input.Method))
 	if method != "GET" && method != "HEAD" {
 		return Claims{}, errors.New("method must be GET or HEAD")
+	}
+	server := ""
+	if mode == publicpath.ModeMulti {
+		if err := publicpath.ValidateAlias(input.Server); err != nil {
+			return Claims{}, fmt.Errorf("server alias: %w", err)
+		}
+		server = input.Server
 	}
 	if err := tickets.ValidateBucket(input.Bucket); err != nil {
 		return Claims{}, err
@@ -151,6 +189,7 @@ func claimsFromInput(input SignInput) (Claims, error) {
 	}
 	return Claims{
 		Method:                     method,
+		Server:                     server,
 		Bucket:                     input.Bucket,
 		Key:                        input.Key,
 		Range:                      input.Range,
@@ -160,12 +199,15 @@ func claimsFromInput(input SignInput) (Claims, error) {
 	}, nil
 }
 
-func claimsFromURL(method, rawURL string) (Claims, string, error) {
+func claimsFromURL(method, rawURL string, mode publicpath.Mode) (Claims, string, error) {
+	if err := validateMode(mode); err != nil {
+		return Claims{}, "", err
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return Claims{}, "", fmt.Errorf("parse signed url: %w", err)
 	}
-	bucket, key, err := objectFromPath(u.EscapedPath())
+	object, err := objectFromEscapedPath(u.EscapedPath(), mode)
 	if err != nil {
 		return Claims{}, "", err
 	}
@@ -180,13 +222,14 @@ func claimsFromURL(method, rawURL string) (Claims, string, error) {
 	}
 	claims, err := claimsFromInput(SignInput{
 		Method:                     method,
-		Bucket:                     bucket,
-		Key:                        key,
+		Server:                     object.Server,
+		Bucket:                     object.Bucket,
+		Key:                        object.Key,
 		Range:                      q.Get(ParamRange),
 		ResponseContentType:        q.Get(ParamResponseContentType),
 		ResponseContentDisposition: q.Get(ParamResponseContentDisposition),
 		Expires:                    time.Unix(expiresUnix, 0).UTC(),
-	})
+	}, mode)
 	if err != nil {
 		return Claims{}, "", err
 	}
@@ -204,23 +247,50 @@ func signatureBytes(claims Claims, secret string) []byte {
 }
 
 func canonicalString(c Claims) string {
-	return strings.Join([]string{
-		strings.ToUpper(c.Method),
+	fields := []string{strings.ToUpper(c.Method)}
+	if c.Server != "" {
+		fields = append(fields, c.Server)
+	}
+	fields = append(fields,
 		c.Bucket,
 		c.Key,
 		fmt.Sprintf("%d", c.Expires.Unix()),
 		c.Range,
 		c.ResponseContentType,
 		c.ResponseContentDisposition,
-	}, "\n")
+	)
+	return strings.Join(fields, "\n")
 }
 
-func appendObjectPath(basePath, bucket, key string) string {
-	parts := []string{strings.Trim(basePath, "/"), url.PathEscape(bucket)}
-	for _, segment := range strings.Split(key, "/") {
+func appendObjectPath(basePath string, object publicpath.Object, mode publicpath.Mode) (string, error) {
+	parts := []string{strings.Trim(basePath, "/")}
+	switch mode {
+	case publicpath.ModeSingle:
+	case publicpath.ModeMulti:
+		parts = append(parts, url.PathEscape(object.Server))
+	default:
+		return "", unknownModeError(mode)
+	}
+	parts = append(parts, url.PathEscape(object.Bucket))
+	for _, segment := range strings.Split(object.Key, "/") {
 		parts = append(parts, url.PathEscape(segment))
 	}
-	return "/" + strings.Join(nonEmpty(parts), "/")
+	return "/" + strings.Join(nonEmpty(parts), "/"), nil
+}
+
+func objectFromEscapedPath(escapedPath string, mode publicpath.Mode) (publicpath.Object, error) {
+	switch mode {
+	case publicpath.ModeSingle:
+		bucket, key, err := objectFromPath(escapedPath)
+		if err != nil {
+			return publicpath.Object{}, err
+		}
+		return publicpath.Object{Bucket: bucket, Key: key}, nil
+	case publicpath.ModeMulti:
+		return publicpath.ParseEscapedPath(escapedPath, mode)
+	default:
+		return publicpath.Object{}, unknownModeError(mode)
+	}
 }
 
 func objectFromPath(escapedPath string) (string, string, error) {
@@ -255,6 +325,19 @@ func parseUnixSeconds(text string) (int64, error) {
 		return 0, errors.New("expires query parameter must be positive")
 	}
 	return n, nil
+}
+
+func validateMode(mode publicpath.Mode) error {
+	switch mode {
+	case publicpath.ModeSingle, publicpath.ModeMulti:
+		return nil
+	default:
+		return unknownModeError(mode)
+	}
+}
+
+func unknownModeError(mode publicpath.Mode) error {
+	return fmt.Errorf("unknown public path mode %d", mode)
 }
 
 func nonEmpty(parts []string) []string {
