@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/terion-name/air3/internal/publicpath"
 	"github.com/terion-name/air3/internal/signing"
 )
 
@@ -20,6 +21,7 @@ func run(args []string, stdout, stderr io.Writer, now func() time.Time) int {
 
 	method := fs.String("method", "GET", "HTTP method to sign: GET or HEAD")
 	baseURL := fs.String("base-url", "http://localhost:8080", "public base URL")
+	server := fs.String("server", "", "server alias for multi-server public URLs")
 	bucket := fs.String("bucket", "", "S3 bucket name")
 	key := fs.String("key", "", "S3 object key")
 	secret := fs.String("secret", "", "HMAC signing secret")
@@ -41,9 +43,10 @@ func run(args []string, stdout, stderr io.Writer, now func() time.Time) int {
 		return 2
 	}
 
-	raw, err := signing.SignURL(signing.SignInput{
+	input := signing.SignInput{
 		Method:                     *method,
 		BaseURL:                    *baseURL,
+		Server:                     *server,
 		Bucket:                     *bucket,
 		Key:                        *key,
 		Range:                      *rangeHeader,
@@ -51,7 +54,15 @@ func run(args []string, stdout, stderr io.Writer, now func() time.Time) int {
 		ResponseContentDisposition: *responseContentDisposition,
 		Expires:                    now().Add(*expiresIn),
 		Secret:                     *secret,
-	})
+	}
+
+	var raw string
+	var err error
+	if *server == "" {
+		raw, err = signing.SignURL(input)
+	} else {
+		raw, err = signing.SignURLForMode(input, publicpath.ModeMulti)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "signurl: %v\n", err)
 		return 1
