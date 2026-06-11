@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   canonicalString,
+  EdgeSignError,
   InvalidSignatureError,
   RangeMismatchError,
   signUrl,
@@ -160,6 +161,58 @@ test('multi-server verification rejects expected-server mismatch', () => {
   assert.throws(
     () => verifyUrl({ method: 'GET', url: raw, server: 'media-2', secret: 'secret', now: 1780934400 }),
     InvalidSignatureError,
+  );
+});
+
+test('default bucket short path signs real bucket and verifies explicitly', () => {
+  const raw = signUrl({
+    method: 'GET',
+    baseUrl: 'https://files.example.com',
+    server: 'blue',
+    bucket: 'demo-bucket',
+    key: 'archive/object.txt',
+    secret: 'secret',
+    expires: 1780938000,
+    defaultBucketPath: true,
+  });
+
+  const parsed = new URL(raw);
+  assert.equal(parsed.pathname, '/blue/archive/object.txt');
+
+  assert.throws(
+    () => verifyUrl({ method: 'GET', url: raw, server: 'blue', secret: 'secret', now: 1780934400 }),
+    InvalidSignatureError,
+  );
+
+  const claims = verifyUrl({
+    method: 'GET',
+    url: raw,
+    server: 'blue',
+    secret: 'secret',
+    now: 1780934400,
+    defaultBucket: 'demo-bucket',
+  });
+  assert.equal(claims.server, 'blue');
+  assert.equal(claims.bucket, 'demo-bucket');
+  assert.equal(claims.key, 'archive/object.txt');
+  assert.equal(
+    canonicalString(claims),
+    ['GET', 'blue', 'demo-bucket', 'archive/object.txt', '1780938000', '', '', ''].join('\n'),
+  );
+});
+
+test('default bucket path requires server', () => {
+  assert.throws(
+    () => signUrl({
+      method: 'GET',
+      baseUrl: 'https://files.example.com',
+      bucket: 'demo-bucket',
+      key: 'object.txt',
+      secret: 'secret',
+      expires: 1780938000,
+      defaultBucketPath: true,
+    }),
+    EdgeSignError,
   );
 });
 

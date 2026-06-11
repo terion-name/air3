@@ -13,6 +13,8 @@ export interface SignUrlInput {
   range?: string;
   responseContentType?: string;
   responseContentDisposition?: string;
+  /** Emit /{server}/{key} while signing the canonical claims with bucket. */
+  defaultBucketPath?: boolean;
 }
 
 export interface VerifyUrlInput {
@@ -22,6 +24,8 @@ export interface VerifyUrlInput {
   secret: string;
   now: Date | number;
   range?: string;
+  /** Accept /{server}/{key} paths and verify them against this real bucket. */
+  defaultBucket?: string;
 }
 
 export interface Claims {
@@ -74,13 +78,22 @@ export function signUrl(input: SignUrlInput): string {
   if (input.secret === '') {
     throw new EdgeSignError('signing secret is required');
   }
+  if (input.defaultBucketPath === true && (input.server ?? '') === '') {
+    throw new EdgeSignError('server is required for default bucket path');
+  }
   const claims = claimsFromInput(input);
   const parsed = parseUrl(input.baseUrl, 'base url');
   if (parsed.protocol === 'edge-relative:') {
     throw new EdgeSignError('base url must be absolute');
   }
 
-  const objectPath = appendObjectPath(decodePathname(parsed.pathname), claims.server ?? '', input.bucket, input.key);
+  const objectPath = appendObjectPath(
+    decodePathname(parsed.pathname),
+    claims.server ?? '',
+    input.bucket,
+    input.key,
+    input.defaultBucketPath === true,
+  );
   const query = collectQuery(parsed.searchParams);
   setQueryValue(query, 'expires', String(toUnixSeconds(input.expires)));
   if (input.range) setQueryValue(query, 'range', input.range);
@@ -97,10 +110,26 @@ export function signUrl(input: SignUrlInput): string {
 }
 
 export function verifyUrl(input: VerifyUrlInput): Claims {
-  const { claims, sig } = claimsFromUrl(input.method, input.url, input.server ?? '');
   if (input.secret === '') {
     throw new EdgeSignError('signing secret is required');
   }
+  try {
+    return verifyDecodedClaims(input, claimsFromUrl(input.method, input.url, input.server ?? ''));
+  } catch (error) {
+    if (
+      (input.server ?? '') === ''
+      || (input.defaultBucket ?? '') === ''
+      || error instanceof RangeMismatchError
+      || error instanceof UnsignedRangeError
+    ) {
+      throw error;
+    }
+    return verifyDecodedClaims(input, claimsFromUrl(input.method, input.url, input.server ?? '', input.defaultBucket ?? ''));
+  }
+}
+
+function verifyDecodedClaims(input: VerifyUrlInput, decoded: { claims: Claims; sig: string }): Claims {
+  const { claims, sig } = decoded;
   if (sig === '') {
     throw new InvalidSignatureError();
   }
@@ -163,14 +192,21 @@ function claimsFromInput(input: SignUrlInput): Claims {
   };
 }
 
-function claimsFromUrl(method: HttpMethod, rawUrl: string, expectedServer: string): { claims: Claims; sig: string } {
+function claimsFromUrl(
+  method: HttpMethod,
+  rawUrl: string,
+  expectedServer: string,
+  defaultBucket = '',
+): { claims: Claims; sig: string } {
   if (expectedServer !== '') {
     validateServerAlias(expectedServer);
   }
   const parsed = parseUrl(rawUrl, 'signed url');
   const [server, bucket, key] = expectedServer === ''
     ? ['', ...objectFromPath(parsed.pathname)]
-    : objectFromServerPath(parsed.pathname);
+    : defaultBucket === ''
+      ? objectFromServerPath(parsed.pathname)
+      : objectFromDefaultBucketPath(parsed.pathname, defaultBucket);
   if (expectedServer !== '' && server !== expectedServer) {
     throw new InvalidSignatureError();
   }
@@ -215,11 +251,11 @@ function constantTimeHexEqual(suppliedHex: string, expectedHex: string): boolean
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
-function appendObjectPath(basePath: string, server: string, bucket: string, key: string): string {
+function appendObjectPath(basePath: string, server: string, bucket: string, key: string, omitBucket = false): string {
   const parts = [
     trimSlashes(basePath),
     ...(server !== '' ? [goPathEscape(server)] : []),
-    goPathEscape(bucket),
+    ...(omitBucket ? [] : [goPathEscape(bucket)]),
     ...key.split('/').map(goPathEscape),
   ].filter((part) => part !== '');
   return `/${parts.join('/')}`;
@@ -251,6 +287,18 @@ function objectFromServerPath(escapedPath: string): [string, string, string] {
   const bucket = pathUnescape(cleaned.slice(firstSlash + 1, secondSlash), 'decode bucket path');
   const key = pathUnescape(cleaned.slice(secondSlash + 1), 'decode key path');
   return [server, bucket, key];
+}
+
+function objectFromDefaultBucketPath(escapedPath: string, defaultBucket: string): [string, string, string] {
+  const cleaned = cleanPath(`/${escapedPath}`).replace(/^\/+/, '');
+  const slash = cleaned.indexOf('/');
+  if (cleaned === '' || cleaned === '.' || slash <= 0 || slash === cleaned.length - 1) {
+    throw new EdgeSignError('signed url path must include server and key');
+  }
+  const server = pathUnescape(cleaned.slice(0, slash), 'decode server path');
+  validateServerAlias(server);
+  const key = pathUnescape(cleaned.slice(slash + 1), 'decode key path');
+  return [server, defaultBucket, key];
 }
 
 function cleanPath(pathname: string): string {
