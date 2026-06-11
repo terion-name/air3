@@ -10,6 +10,7 @@ export interface SignUrlInput {
     range?: string;
     responseContentType?: string;
     responseContentDisposition?: string;
+    defaultBucketPath?: boolean;
 }
 export interface VerifyUrlInput {
     method: HttpMethod;
@@ -18,6 +19,7 @@ export interface VerifyUrlInput {
     secret: string;
     now: Date | number;
     range?: string;
+    defaultBucket?: string;
 }
 export interface Claims {
     method: 'GET' | 'HEAD';
