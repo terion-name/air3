@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/terion-name/air3/internal/publicpath"
 	"github.com/terion-name/air3/internal/signing"
 )
 
@@ -28,6 +29,7 @@ var (
 type SignInput struct {
 	Method                     string
 	BaseURL                    string
+	Server                     string
 	Bucket                     string
 	Key                        string
 	Secret                     string
@@ -40,6 +42,7 @@ type SignInput struct {
 // Claims are the signed fields decoded from an edge URL.
 type Claims struct {
 	Method                     string
+	Server                     string
 	Bucket                     string
 	Key                        string
 	Expires                    time.Time
@@ -56,17 +59,20 @@ type Claims struct {
 type VerifyInput struct {
 	Method string
 	URL    string
+	Server string
 	Secret string
 	Now    time.Time
 	Range  string
 }
 
 // SignURL returns BaseURL/{bucket}/{key}?expires=...&sig=... using the edge
-// gateway HMAC canonical form.
+// gateway HMAC canonical form. When Server is set, it returns
+// BaseURL/{server}/{bucket}/{key}?expires=...&sig=... using multi-server mode.
 func SignURL(input SignInput) (string, error) {
-	return signing.SignURL(signing.SignInput{
+	signingInput := signing.SignInput{
 		Method:                     input.Method,
 		BaseURL:                    input.BaseURL,
+		Server:                     input.Server,
 		Bucket:                     input.Bucket,
 		Key:                        input.Key,
 		Range:                      input.Range,
@@ -74,14 +80,21 @@ func SignURL(input SignInput) (string, error) {
 		ResponseContentDisposition: input.ResponseContentDisposition,
 		Expires:                    input.Expires,
 		Secret:                     input.Secret,
-	})
+	}
+	if input.Server == "" {
+		return signing.SignURL(signingInput)
+	}
+	return signing.SignURLForMode(signingInput, publicpath.ModeMulti)
 }
 
 // VerifyURL validates the signature and expiration in input.URL for input.Method.
 func VerifyURL(input VerifyInput) (Claims, error) {
-	claims, err := signing.ValidateURL(input.Method, input.URL, signing.ValidationConfig{Secret: input.Secret}, input.Now)
+	claims, err := validateURL(input)
 	if err != nil {
 		return Claims{}, err
+	}
+	if input.Server != "" && claims.Server != input.Server {
+		return Claims{}, ErrInvalidSignature
 	}
 	if strings.TrimSpace(input.Range) != "" {
 		rangeHeader := strings.TrimSpace(input.Range)
@@ -94,6 +107,7 @@ func VerifyURL(input VerifyInput) (Claims, error) {
 	}
 	return Claims{
 		Method:                     claims.Method,
+		Server:                     claims.Server,
 		Bucket:                     claims.Bucket,
 		Key:                        claims.Key,
 		Expires:                    claims.Expires,
@@ -103,18 +117,30 @@ func VerifyURL(input VerifyInput) (Claims, error) {
 	}, nil
 }
 
+func validateURL(input VerifyInput) (signing.Claims, error) {
+	cfg := signing.ValidationConfig{Secret: input.Secret}
+	if input.Server == "" {
+		return signing.ValidateURL(input.Method, input.URL, cfg, input.Now)
+	}
+	return signing.ValidateURLForMode(input.Method, input.URL, cfg, input.Now, publicpath.ModeMulti)
+}
+
 // CanonicalString returns the exact newline-delimited text signed by the edge
 // gateway for these claims.
 func CanonicalString(claims Claims) string {
-	return strings.Join([]string{
-		strings.ToUpper(claims.Method),
+	fields := []string{strings.ToUpper(claims.Method)}
+	if claims.Server != "" {
+		fields = append(fields, claims.Server)
+	}
+	fields = append(fields,
 		claims.Bucket,
 		claims.Key,
 		formatUnixSeconds(claims.Expires),
 		claims.Range,
 		claims.ResponseContentType,
 		claims.ResponseContentDisposition,
-	}, "\n")
+	)
+	return strings.Join(fields, "\n")
 }
 
 func formatUnixSeconds(t time.Time) string {
