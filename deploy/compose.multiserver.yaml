@@ -1,0 +1,111 @@
+name: air3-multiserver-demo
+
+services:
+  nats:
+    volumes:
+      - ./nats/nats.multiserver.conf:/etc/nats/nats.conf:ro
+      - ./certs/generated:/etc/nats/certs:ro
+
+  edge-gateway:
+    depends_on:
+      direct-s3-proxy:
+        condition: service_started
+    networks:
+      - public
+      - broker
+      - direct
+    environment:
+      AIR3_MULTI_SERVER: "true"
+      AIR3_NATS_SUBJECT_TEMPLATE: "air3.{server}"
+      AIR3_DIRECT_SERVERS: "direct"
+      S3_DIRECT_ENDPOINT: "http://direct-s3-proxy:10080"
+      S3_DIRECT_REGION: "us-east-1"
+      S3_DIRECT_ALLOWED_BUCKETS: "demo"
+      S3_DIRECT_ACCESS_KEY_ID: "testuser"
+      S3_DIRECT_SECRET_ACCESS_KEY: "secret"
+      S3_DIRECT_USE_PATH_STYLE: "true"
+      AIR3_PENDING_TTL: "2s"
+
+  private-connector-blue:
+    build:
+      context: ..
+      args:
+        APP: private-connector
+    image: air3-private-connector:demo
+    depends_on:
+      nats:
+        condition: service_healthy
+      versitygw:
+        condition: service_started
+    networks:
+      - broker
+      - private
+    volumes:
+      - ./certs/generated:/certs:ro
+    environment:
+      AIR3_INGEST_URL: "https://edge-gateway:9443/ingest"
+      AIR3_INGEST_TRANSPORT: "${AIR3_INGEST_TRANSPORT:-http}"
+      AIR3_INGEST_TCP_ADDR: "${AIR3_INGEST_TCP_ADDR:-edge-gateway:9444}"
+      AIR3_INGEST_QUIC_ADDR: "${AIR3_INGEST_QUIC_ADDR:-edge-gateway:9445}"
+      AIR3_INGEST_POOL_SIZE: "${AIR3_INGEST_POOL_SIZE:-32}"
+      AIR3_CONNECTOR_WORKERS: "${AIR3_CONNECTOR_WORKERS:-1}"
+      AIR3_ALLOWED_BUCKETS: "demo"
+      AIR3_PENDING_TTL: "2s"
+      AIR3_STREAM_TIMEOUT: "30s"
+      AIR3_INGEST_DISABLE_HTTP2: "${AIR3_INGEST_DISABLE_HTTP2:-false}"
+      AIR3_CONNECTOR_MTLS_CA_FILE: "/certs/dev-ca.crt"
+      AIR3_CONNECTOR_MTLS_CERT_FILE: "/certs/connector-ingest-client.crt"
+      AIR3_CONNECTOR_MTLS_KEY_FILE: "/certs/connector-ingest-client.key"
+      AIR3_CONNECTOR_MTLS_SERVER_NAME: "edge-gateway"
+      AIR3_NATS_URL: "tls://nats:4222"
+      AIR3_SERVER_NAME: "blue"
+      AIR3_NATS_SUBJECT_TEMPLATE: "air3.{server}"
+      AIR3_NATS_QUEUE: "air3-connectors"
+      AIR3_NATS_USER: "connector"
+      AIR3_NATS_PASSWORD: "connector-demo-pass"
+      AIR3_NATS_TLS_CA_FILE: "/certs/dev-ca.crt"
+      AIR3_NATS_TLS_CERT_FILE: "/certs/connector-nats-client.crt"
+      AIR3_NATS_TLS_KEY_FILE: "/certs/connector-nats-client.key"
+      AIR3_NATS_TLS_SERVER_NAME: "nats"
+      AIR3_S3_ENDPOINT: "http://versitygw:10000"
+      AIR3_S3_REGION: "us-east-1"
+      AIR3_S3_ALLOWED_BUCKETS: "demo"
+      AIR3_S3_ACCESS_KEY_ID: "testuser"
+      AIR3_S3_SECRET_ACCESS_KEY: "secret"
+      AIR3_S3_USE_PATH_STYLE: "true"
+
+  direct-s3-proxy:
+    image: haproxy:2.9-alpine
+    depends_on:
+      versitygw:
+        condition: service_started
+    networks:
+      - direct
+      - private
+    command:
+      - sh
+      - -c
+      - |
+        cat >/tmp/haproxy.cfg <<'HAPROXY'
+        global
+          log stdout format raw local0
+
+        defaults
+          log global
+          mode tcp
+          timeout connect 5s
+          timeout client 30s
+          timeout server 30s
+
+        frontend s3
+          bind :10080
+          default_backend versitygw
+
+        backend versitygw
+          server versitygw versitygw:10000
+        HAPROXY
+        exec haproxy -f /tmp/haproxy.cfg
+
+networks:
+  direct:
+    internal: true
