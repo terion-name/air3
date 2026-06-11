@@ -14,7 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,21 +29,28 @@ import (
 	"github.com/terion-name/air3/internal/mtls"
 	"github.com/terion-name/air3/internal/natsclient"
 	"github.com/terion-name/air3/internal/pending"
+	"github.com/terion-name/air3/internal/publicpath"
+	"github.com/terion-name/air3/internal/s3fetch"
 	"github.com/terion-name/air3/internal/signing"
 	"github.com/terion-name/air3/internal/tickets"
 )
 
 type ticketPublisher interface {
-	PublishTicket(context.Context, tickets.Ticket) error
+	PublishTicketTo(context.Context, string, tickets.Ticket) error
+}
+
+type objectFetcher interface {
+	Fetch(context.Context, s3fetch.Request) (*s3fetch.Object, error)
 }
 
 type edgeServer struct {
-	cfg       config.EdgeConfig
-	registry  *pending.Registry
-	publisher ticketPublisher
-	logger    *slog.Logger
-	now       func() time.Time
-	newToken  func() (string, error)
+	cfg            config.EdgeConfig
+	registry       *pending.Registry
+	publisher      ticketPublisher
+	directFetchers map[string]objectFetcher
+	logger         *slog.Logger
+	now            func() time.Time
+	newToken       func() (string, error)
 }
 
 func main() {
@@ -70,8 +77,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	defer publisher.Close()
 
+	directFetchers, err := newDirectFetchers(ctx, cfg.DirectServers)
+	if err != nil {
+		return err
+	}
+
 	reg := pending.NewRegistry(pending.Options{})
-	edge := newEdgeServer(cfg, reg, publisher, logger)
+	edge := newEdgeServer(cfg, reg, publisher, logger, directFetchers)
 	ingestHandler, err := ingest.NewHandler(ingest.Options{Registry: reg, AllowedConnectorIdentities: cfg.AllowedConnectorIdentities, StreamCopyBufferBytes: cfg.StreamCopyBufferBytes})
 	if err != nil {
 		return err
@@ -132,11 +144,30 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 }
 
-func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, publisher ticketPublisher, logger *slog.Logger) *edgeServer {
+func newDirectFetchers(ctx context.Context, directServers map[string]config.S3Config) (map[string]objectFetcher, error) {
+	if len(directServers) == 0 {
+		return nil, nil
+	}
+	fetchers := make(map[string]objectFetcher, len(directServers))
+	for alias, s3cfg := range directServers {
+		fetcher, err := s3fetch.New(ctx, s3cfg)
+		if err != nil {
+			return nil, fmt.Errorf("create direct fetcher for %q: %w", alias, err)
+		}
+		fetchers[alias] = fetcher
+	}
+	return fetchers, nil
+}
+
+func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, publisher ticketPublisher, logger *slog.Logger, directFetchers ...map[string]objectFetcher) *edgeServer {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &edgeServer{cfg: cfg, registry: reg, publisher: publisher, logger: logger, now: time.Now, newToken: randomToken}
+	var fetchers map[string]objectFetcher
+	if len(directFetchers) > 0 {
+		fetchers = directFetchers[0]
+	}
+	return &edgeServer{cfg: cfg, registry: reg, publisher: publisher, directFetchers: fetchers, logger: logger, now: time.Now, newToken: randomToken}
 }
 
 func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -148,6 +179,14 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	object, err := s.validatePublicRequest(r)
 	if err != nil {
 		writePublicError(w, statusForValidationError(err), statusText(statusForValidationError(err)))
+		return
+	}
+	if fetcher, ok := s.directFetcherFor(object.server); ok {
+		s.serveDirect(w, r, object, fetcher)
+		return
+	}
+	if !bucketAllowed(object.bucket, s.cfg.AllowedBuckets) {
+		writePublicError(w, http.StatusForbidden, statusText(http.StatusForbidden))
 		return
 	}
 
@@ -176,9 +215,15 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.registry.Cancel(reqID, pending.ErrCanceled)
 
-	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: object.bucket, Key: object.key, Method: r.Method, Range: object.rangeHeader, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
+	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: object.bucket, Key: object.key, Method: r.Method, Range: object.rangeHeader, Server: object.server, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
+	subject, err := s.ticketSubject(object.server)
+	if err != nil {
+		s.registry.Cancel(reqID, err)
+		writePublicError(w, http.StatusInternalServerError, "request setup failed")
+		return
+	}
 	publishCtx, cancelPublish := context.WithDeadline(r.Context(), deadline)
-	err = s.publisher.PublishTicket(publishCtx, ticket)
+	err = s.publisher.PublishTicketTo(publishCtx, subject, ticket)
 	cancelPublish()
 	if err != nil {
 		s.logger.Warn("ticket publish failed", "request_id", reqID, "error", safeLogError(err))
@@ -205,27 +250,41 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type publicObject struct {
+	server      string
 	bucket      string
 	key         string
 	rangeHeader string
 }
 
-func (s *edgeServer) validatePublicRequest(r *http.Request) (publicObject, error) {
-	bucket, key, err := objectFromPath(r.URL.EscapedPath())
-	if err != nil {
-		return publicObject{}, err
+func edgeMode(cfg config.EdgeConfig) publicpath.Mode {
+	if cfg.MultiServer {
+		return publicpath.ModeMulti
 	}
-	if !bucketAllowed(bucket, s.cfg.AllowedBuckets) {
-		return publicObject{}, errForbidden
+	return publicpath.ModeSingle
+}
+
+func (s *edgeServer) validatePublicRequest(r *http.Request) (publicObject, error) {
+	parsed, err := publicpath.ParseEscapedPath(r.URL.EscapedPath(), edgeMode(s.cfg))
+	if err != nil {
+		return publicObject{}, errBadRequest
+	}
+	if err := tickets.ValidateBucket(parsed.Bucket); err != nil {
+		return publicObject{}, errBadRequest
+	}
+	if err := tickets.ValidateKey(parsed.Key); err != nil {
+		return publicObject{}, errBadRequest
 	}
 
 	queryRange := ""
 	if !s.cfg.Signing.Disabled {
-		claims, err := signing.ValidateURL(r.Method, r.URL.RequestURI(), signing.ValidationConfig{Secret: s.cfg.Signing.Secret}, s.now())
+		claims, err := signing.ValidateURLForMode(r.Method, r.URL.RequestURI(), signing.ValidationConfig{Secret: s.cfg.Signing.Secret}, s.now(), edgeMode(s.cfg))
 		if err != nil {
 			return publicObject{}, errUnauthorized
 		}
-		if claims.Bucket != bucket || claims.Key != key || claims.Method != r.Method {
+		if claims.Bucket != parsed.Bucket || claims.Key != parsed.Key || claims.Method != r.Method {
+			return publicObject{}, errUnauthorized
+		}
+		if s.cfg.MultiServer && claims.Server != parsed.Server {
 			return publicObject{}, errUnauthorized
 		}
 		queryRange = claims.Range
@@ -241,39 +300,95 @@ func (s *edgeServer) validatePublicRequest(r *http.Request) (publicObject, error
 		}
 		rangeHeader = queryRange
 	}
-	if rangeHeader != "" && !validRange(bucket, key, r.Method, rangeHeader, s.now()) {
+	if rangeHeader != "" && !validRange(parsed.Bucket, parsed.Key, r.Method, rangeHeader, s.now()) {
 		return publicObject{}, errBadRequest
 	}
-	return publicObject{bucket: bucket, key: key, rangeHeader: rangeHeader}, nil
+	return publicObject{server: parsed.Server, bucket: parsed.Bucket, key: parsed.Key, rangeHeader: rangeHeader}, nil
 }
 
 var (
 	errBadRequest   = errors.New("bad public request")
-	errForbidden    = errors.New("object not allowed")
 	errUnauthorized = errors.New("unauthorized public request")
 )
 
-func objectFromPath(escapedPath string) (string, string, error) {
-	cleaned := strings.TrimPrefix(path.Clean("/"+escapedPath), "/")
-	parts := strings.SplitN(cleaned, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", errBadRequest
+func (s *edgeServer) directFetcherFor(server string) (objectFetcher, bool) {
+	if !s.cfg.MultiServer || server == "" {
+		return nil, false
 	}
-	bucket, err := url.PathUnescape(parts[0])
+	if _, ok := s.cfg.DirectServers[server]; !ok {
+		return nil, false
+	}
+	return s.directFetchers[server], true
+}
+
+func (s *edgeServer) ticketSubject(server string) (string, error) {
+	if s.cfg.MultiServer {
+		return config.DeriveNATSSubject(s.cfg.NATS.SubjectTemplate, server)
+	}
+	return s.cfg.NATS.Subject, nil
+}
+
+func (s *edgeServer) serveDirect(w http.ResponseWriter, r *http.Request, object publicObject, fetcher objectFetcher) {
+	directCfg, ok := s.cfg.DirectServers[object.server]
+	if !ok || fetcher == nil {
+		writePublicError(w, http.StatusServiceUnavailable, "backend unavailable")
+		return
+	}
+	if !bucketAllowed(object.bucket, directCfg.AllowedBuckets) {
+		writePublicError(w, http.StatusForbidden, statusText(http.StatusForbidden))
+		return
+	}
+
+	fetched, err := fetcher.Fetch(r.Context(), s3fetch.Request{Method: r.Method, Bucket: object.bucket, Key: object.key, Range: object.rangeHeader})
 	if err != nil {
-		return "", "", errBadRequest
+		s.writeDirectFetchError(w, object.server, err)
+		return
 	}
-	key, err := url.PathUnescape(parts[1])
-	if err != nil {
-		return "", "", errBadRequest
+	if fetched == nil {
+		s.logger.Warn("direct fetch returned nil object", "server", object.server)
+		writePublicError(w, http.StatusServiceUnavailable, "backend unavailable")
+		return
 	}
-	if err := tickets.ValidateBucket(bucket); err != nil {
-		return "", "", errBadRequest
+	if fetched.Body != nil {
+		defer fetched.Body.Close()
 	}
-	if err := tickets.ValidateKey(key); err != nil {
-		return "", "", errBadRequest
+
+	metadata := directMetadata(fetched)
+	copyPublicMetadata(w.Header(), metadata)
+	w.WriteHeader(publicStatusCode(metadata))
+	if r.Method == http.MethodHead || fetched.Body == nil {
+		return
 	}
-	return bucket, key, nil
+	if _, err := io.Copy(w, fetched.Body); err != nil {
+		s.logger.Warn("direct response stream failed", "server", object.server, "error", safeLogError(err))
+	}
+}
+
+func (s *edgeServer) writeDirectFetchError(w http.ResponseWriter, server string, err error) {
+	switch {
+	case errors.Is(err, s3fetch.ErrNotFound):
+		writePublicError(w, http.StatusNotFound, statusText(http.StatusNotFound))
+	case errors.Is(err, s3fetch.ErrInvalidRequest):
+		writePublicError(w, http.StatusBadRequest, statusText(http.StatusBadRequest))
+	default:
+		s.logger.Warn("direct fetch failed", "server", server, "error", safeLogError(err))
+		writePublicError(w, http.StatusServiceUnavailable, "backend unavailable")
+	}
+}
+
+func directMetadata(object *s3fetch.Object) pending.Metadata {
+	metadata := pending.Metadata{
+		StatusCode:   object.StatusCode,
+		ContentType:  object.ContentType,
+		ContentRange: object.ContentRange,
+		ETag:         object.ETag,
+		LastModified: object.LastModified,
+		AcceptRanges: object.AcceptRanges,
+	}
+	if object.ContentLength >= 0 {
+		metadata.ContentLength = strconv.FormatInt(object.ContentLength, 10)
+	}
+	return metadata
 }
 
 func validRange(bucket, key, method, rangeHeader string, now time.Time) bool {
@@ -308,14 +423,10 @@ func ingestURLForRequest(base, requestID string) (string, error) {
 	return u.String(), nil
 }
 func statusForValidationError(err error) int {
-	switch {
-	case errors.Is(err, errForbidden):
+	if errors.Is(err, errUnauthorized) {
 		return http.StatusForbidden
-	case errors.Is(err, errUnauthorized):
-		return http.StatusForbidden
-	default:
-		return http.StatusBadRequest
 	}
+	return http.StatusBadRequest
 }
 
 func statusForWaitError(err error) int {
