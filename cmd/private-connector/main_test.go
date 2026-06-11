@@ -132,6 +132,19 @@ func validTicket(url, method string) tickets.Ticket {
 	return tickets.Ticket{Version: tickets.Version, RequestID: "req-1", Bucket: "demo-bucket", Key: "objects/file.txt", Method: method, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli(), IngestURL: url, IngestToken: "ingest-token"}
 }
 
+func testConfigOptions(values map[string]string) config.Options {
+	if values == nil {
+		values = map[string]string{}
+	}
+	return config.Options{
+		Lookup: func(name string) (string, bool) {
+			value, ok := values[name]
+			return value, ok
+		},
+		FileExists: func(string) bool { return false },
+	}
+}
+
 func mustTicketWorkerPool(t *testing.T, workers int, handle func(context.Context, tickets.Ticket) error, onError func(error)) *ticketWorkerPool {
 	t.Helper()
 	pool, err := newTicketWorkerPool(workers, handle, onError)
@@ -725,6 +738,114 @@ func TestConnectorUsesSenderForFetchedObject(t *testing.T) {
 	sent := sender.sends[0]
 	if sent.ticket.RequestID != ticket.RequestID || sent.metadata.StatusCode != http.StatusPartialContent || sent.metadata.ContentLength != 5 || sent.metadata.ContentRange != "bytes 0-4/11" || sent.body != "hello" {
 		t.Fatalf("sent ingest = %#v", sent)
+	}
+}
+
+func TestConnectorAcceptsMatchingServerTicket(t *testing.T) {
+	cfg := connectorConfig()
+	cfg.ServerName = "west-1"
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, ContentLength: 4, Body: io.NopCloser(strings.NewReader("body"))}}
+	sender := &fakeIngestSender{}
+	worker := newConnector(cfg, fetcher, sender, nil)
+	ticket := validTicket("https://edge.internal/_ingest/req-1", http.MethodGet)
+	ticket.Server = "west-1"
+
+	if err := worker.handleTicket(context.Background(), ticket); err != nil {
+		t.Fatalf("handleTicket() error = %v", err)
+	}
+	if len(fetcher.requests) != 1 {
+		t.Fatalf("fetch requests = %#v, want one", fetcher.requests)
+	}
+	if len(sender.sends) != 1 {
+		t.Fatalf("sender sends = %#v, want one", sender.sends)
+	}
+}
+
+func TestConnectorRejectsMissingServerTicketBeforeFetchOrSend(t *testing.T) {
+	cfg := connectorConfig()
+	cfg.ServerName = "west-1"
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("body"))}}
+	sender := &fakeIngestSender{}
+	worker := newConnector(cfg, fetcher, sender, nil)
+	ticket := validTicket("https://edge.internal/_ingest/req-1", http.MethodGet)
+
+	err := worker.handleTicket(context.Background(), ticket)
+	if err == nil || !strings.Contains(err.Error(), "server is required") {
+		t.Fatalf("handleTicket() error = %v, want missing server error", err)
+	}
+	if len(fetcher.requests) != 0 {
+		t.Fatalf("fetch requests = %#v, want none", fetcher.requests)
+	}
+	if len(sender.sends) != 0 {
+		t.Fatalf("sender sends = %#v, want none", sender.sends)
+	}
+}
+
+func TestConnectorRejectsMismatchedServerTicketBeforeFetchOrSend(t *testing.T) {
+	cfg := connectorConfig()
+	cfg.ServerName = "west-1"
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("body"))}}
+	sender := &fakeIngestSender{}
+	worker := newConnector(cfg, fetcher, sender, nil)
+	ticket := validTicket("https://edge.internal/_ingest/req-1", http.MethodGet)
+	ticket.Server = "east-1"
+
+	err := worker.handleTicket(context.Background(), ticket)
+	if err == nil || !strings.Contains(err.Error(), "does not match connector") {
+		t.Fatalf("handleTicket() error = %v, want mismatched server error", err)
+	}
+	if len(fetcher.requests) != 0 {
+		t.Fatalf("fetch requests = %#v, want none", fetcher.requests)
+	}
+	if len(sender.sends) != 0 {
+		t.Fatalf("sender sends = %#v, want none", sender.sends)
+	}
+}
+
+func TestConnectorAcceptsLegacyTicketWhenServerNameUnset(t *testing.T) {
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, ContentLength: 4, Body: io.NopCloser(strings.NewReader("body"))}}
+	sender := &fakeIngestSender{}
+	worker := newConnector(connectorConfig(), fetcher, sender, nil)
+	ticket := validTicket("https://edge.internal/_ingest/req-1", http.MethodGet)
+
+	if err := worker.handleTicket(context.Background(), ticket); err != nil {
+		t.Fatalf("handleTicket() error = %v", err)
+	}
+	if len(fetcher.requests) != 1 {
+		t.Fatalf("fetch requests = %#v, want one", fetcher.requests)
+	}
+	if len(sender.sends) != 1 {
+		t.Fatalf("sender sends = %#v, want one", sender.sends)
+	}
+}
+
+func TestLoadConnectorServerNameDerivesQueueSubscribeSubject(t *testing.T) {
+	cfg, err := config.LoadConnector(testConfigOptions(map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":     "access",
+		"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+		"AIR3_SERVER_NAME":          "west-1",
+	}))
+	if err != nil {
+		t.Fatalf("LoadConnector() error = %v", err)
+	}
+	if cfg.ServerName != "west-1" {
+		t.Fatalf("ServerName = %q, want west-1", cfg.ServerName)
+	}
+	if cfg.NATS.Subject != "air3.west-1" {
+		t.Fatalf("NATS subject = %q, want derived QueueSubscribeTickets subject air3.west-1", cfg.NATS.Subject)
+	}
+
+	cfg, err = config.LoadConnector(testConfigOptions(map[string]string{
+		"AIR3_S3_ACCESS_KEY_ID":      "access",
+		"AIR3_S3_SECRET_ACCESS_KEY":  "secret",
+		"AIR3_SERVER_NAME":           "west-1",
+		"AIR3_NATS_SUBJECT_TEMPLATE": "air3.{server}.tickets",
+	}))
+	if err != nil {
+		t.Fatalf("LoadConnector() with template error = %v", err)
+	}
+	if cfg.NATS.Subject != "air3.west-1.tickets" {
+		t.Fatalf("templated NATS subject = %q, want air3.west-1.tickets", cfg.NATS.Subject)
 	}
 }
 

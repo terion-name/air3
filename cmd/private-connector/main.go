@@ -264,6 +264,14 @@ func (c *connector) validateTicket(ticket tickets.Ticket) error {
 	if err := ticket.Validate(c.now()); err != nil {
 		return err
 	}
+	if c.cfg.ServerName != "" {
+		if ticket.Server == "" {
+			return fmt.Errorf("%w: server is required for connector %q", tickets.ErrInvalidTicket, c.cfg.ServerName)
+		}
+		if ticket.Server != c.cfg.ServerName {
+			return fmt.Errorf("%w: server %q does not match connector %q", tickets.ErrInvalidTicket, ticket.Server, c.cfg.ServerName)
+		}
+	}
 	if !bucketAllowed(ticket.Bucket, c.cfg.AllowedBuckets) || !bucketAllowed(ticket.Bucket, c.cfg.S3.AllowedBuckets) {
 		return errors.New("ticket bucket is not allowed")
 	}
