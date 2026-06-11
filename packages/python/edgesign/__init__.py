@@ -74,8 +74,6 @@ def sign_url(
     """Return an air3 edge signed object URL."""
     if secret == "":
         raise EdgeSignError("signing secret is required")
-    if default_bucket_path and not server:
-        raise EdgeSignError("server is required for default bucket path")
     claims = _claims_from_input(
         method=method,
         bucket=bucket,
@@ -212,7 +210,13 @@ def _claims_from_url(
             raise InvalidSignatureError()
     else:
         path_server = ""
-        bucket, key = _object_from_path(parsed.path)
+        if default_bucket:
+            bucket, key = _object_from_default_bucket_single_server_path(
+                parsed.path,
+                default_bucket,
+            )
+        else:
+            bucket, key = _object_from_path(parsed.path)
     query = parse_qsl(parsed.query, keep_blank_values=True)
     expires_text = _query_get(query, PARAM_EXPIRES)
     if not expires_text:
@@ -292,6 +296,16 @@ def _object_from_default_bucket_path(
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise EdgeSignError("signed url path must include server and key")
     return unquote(parts[0]), default_bucket, unquote(parts[1])
+
+
+def _object_from_default_bucket_single_server_path(
+    escaped_path: str,
+    default_bucket: str,
+) -> tuple[str, str]:
+    cleaned = normpath("/" + escaped_path).lstrip("/")
+    if cleaned in {"", "."}:
+        raise EdgeSignError("signed url path must include key")
+    return default_bucket, unquote(cleaned)
 
 
 def _query_get(values: list[tuple[str, str]], key: str) -> str:

@@ -133,6 +133,60 @@ class EdgeSignVectorTests(unittest.TestCase):
         with self.assertRaises(EdgeSignError):
             verify_url(method="GET", url=raw, secret="secret", now=now, server="blue")
 
+    def test_single_server_default_bucket_short_path_signs_real_bucket(self) -> None:
+        now = datetime.fromtimestamp(1780934400, tz=timezone.utc)
+        raw = sign_url(
+            method="GET",
+            base_url="https://files.example.com",
+            bucket="demo",
+            key="file.txt",
+            secret="secret",
+            expires=now + timedelta(minutes=1),
+            default_bucket_path=True,
+        )
+
+        self.assertEqual(urlsplit(raw).path, "/file.txt")
+        claims = verify_url(
+            method="GET",
+            url=raw,
+            secret="secret",
+            now=now,
+            default_bucket="demo",
+        )
+        self.assertEqual(claims.server, "")
+        self.assertEqual(claims.bucket, "demo")
+        self.assertEqual(claims.key, "file.txt")
+        self.assertEqual(
+            canonical_string(claims),
+            "GET\ndemo\nfile.txt\n1780934460\n\n\n",
+        )
+
+        with self.assertRaises(EdgeSignError):
+            verify_url(method="GET", url=raw, secret="secret", now=now)
+
+    def test_single_server_default_bucket_treats_whole_path_as_key(self) -> None:
+        now = datetime.fromtimestamp(1780934400, tz=timezone.utc)
+        raw = sign_url(
+            method="GET",
+            base_url="https://files.example.com",
+            bucket="demo",
+            key="demo/file.txt",
+            secret="secret",
+            expires=now + timedelta(minutes=1),
+            default_bucket_path=True,
+        )
+
+        self.assertEqual(urlsplit(raw).path, "/demo/file.txt")
+        claims = verify_url(
+            method="GET",
+            url=raw,
+            secret="secret",
+            now=now,
+            default_bucket="demo",
+        )
+        self.assertEqual(claims.bucket, "demo")
+        self.assertEqual(claims.key, "demo/file.txt")
+
     def test_multi_server_tamper_fails_signature_validation(self) -> None:
         now = datetime.fromtimestamp(1780934400, tz=timezone.utc)
         raw = sign_url(
