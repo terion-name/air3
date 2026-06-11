@@ -14,10 +14,12 @@ import (
 )
 
 type LookupFunc func(string) (string, bool)
+type EnvKeysFunc func() []string
 type FileExistsFunc func(string) bool
 
 type Options struct {
 	Lookup     LookupFunc
+	EnvKeys    EnvKeysFunc
 	FileExists FileExistsFunc
 }
 
@@ -76,10 +78,19 @@ type EdgeConfig struct {
 	AllowedConnectorIdentities []string
 	MultiServer                bool
 	DirectServers              map[string]S3Config
+	ServerDefaultBuckets       map[string]string
 	NATS                       NATSConfig
 	Signing                    SigningConfig
 	MTLS                       MTLSPaths
 	Timeouts                   TimeoutConfig
+}
+
+func (c EdgeConfig) DefaultBucketForServer(server string) (string, bool) {
+	if c.ServerDefaultBuckets == nil {
+		return "", false
+	}
+	bucket, ok := c.ServerDefaultBuckets[publicpath.EnvSuffix(server)]
+	return bucket, ok
 }
 
 type ConnectorConfig struct {
@@ -114,6 +125,7 @@ type S3Config struct {
 	Endpoint           string
 	Region             string
 	AllowedBuckets     []string
+	DefaultBucket      string
 	AccessKeyID        string
 	SecretAccessKey    string
 	UsePathStyle       bool
@@ -180,6 +192,10 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 		return EdgeConfig{}, err
 	}
 	cfg.DirectServers, err = loadDirectServers(env)
+	if err != nil {
+		return EdgeConfig{}, err
+	}
+	cfg.ServerDefaultBuckets, err = loadServerDefaultBuckets(env)
 	if err != nil {
 		return EdgeConfig{}, err
 	}
@@ -492,6 +508,57 @@ func rejectEnvSuffixCollisions(aliases []string) error {
 	return fmt.Errorf("direct server aliases %s collide on S3_%s_* env suffix", strings.Join(collisions[suffix], ","), suffix)
 }
 
+func loadServerDefaultBuckets(env envReader) (map[string]string, error) {
+	defaults := make(map[string]string)
+	for _, key := range env.keys() {
+		suffix, ok := defaultBucketEnvSuffix(key)
+		if !ok {
+			continue
+		}
+		if err := validateDefaultBucketSuffix(suffix); err != nil {
+			return nil, fmt.Errorf("%s has invalid server suffix %q: %w", key, suffix, err)
+		}
+		bucket, err := env.optionalBucket(key)
+		if err != nil {
+			return nil, err
+		}
+		if bucket == "" {
+			continue
+		}
+		normalizedSuffix := publicpath.EnvSuffix(suffix)
+		if existing, ok := defaults[normalizedSuffix]; ok && existing != bucket {
+			return nil, fmt.Errorf("default buckets for S3_%s_BUCKET conflict", normalizedSuffix)
+		}
+		defaults[normalizedSuffix] = bucket
+	}
+	if len(defaults) == 0 {
+		return nil, nil
+	}
+	return defaults, nil
+}
+
+func defaultBucketEnvSuffix(key string) (string, bool) {
+	const prefix = "S3_"
+	const suffix = "_BUCKET"
+	if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) || len(key) <= len(prefix)+len(suffix) {
+		return "", false
+	}
+	return key[len(prefix) : len(key)-len(suffix)], true
+}
+
+func validateDefaultBucketSuffix(suffix string) error {
+	return publicpath.ValidateAlias(suffix)
+}
+
+func bucketInList(bucket string, buckets []string) bool {
+	for _, allowed := range buckets {
+		if allowed == bucket {
+			return true
+		}
+	}
+	return false
+}
+
 func loadDirectServerS3(env envReader, alias string) (S3Config, error) {
 	suffix := publicpath.EnvSuffix(alias)
 	prefix := "S3_" + suffix
@@ -507,10 +574,15 @@ func loadDirectServerS3(env envReader, alias string) (S3Config, error) {
 	if err != nil {
 		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %w", alias, suffix, err)
 	}
+	defaultBucket, err := env.optionalBucket(prefix + "_BUCKET")
+	if err != nil {
+		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %w", alias, suffix, err)
+	}
 	cfg := S3Config{
 		Endpoint:           env.get(prefix+"_ENDPOINT", ""),
 		Region:             env.get(prefix+"_REGION", ""),
 		AllowedBuckets:     buckets,
+		DefaultBucket:      defaultBucket,
 		AccessKeyID:        env.get(prefix+"_ACCESS_KEY_ID", ""),
 		SecretAccessKey:    env.get(prefix+"_SECRET_ACCESS_KEY", ""),
 		UsePathStyle:       usePathStyle,
@@ -521,6 +593,9 @@ func loadDirectServerS3(env envReader, alias string) (S3Config, error) {
 	}
 	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
 		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %s_ACCESS_KEY_ID and %s_SECRET_ACCESS_KEY are required", alias, suffix, prefix, prefix)
+	}
+	if cfg.DefaultBucket != "" && len(cfg.AllowedBuckets) > 0 && !bucketInList(cfg.DefaultBucket, cfg.AllowedBuckets) {
+		return S3Config{}, fmt.Errorf("direct server %q (suffix %s): %s_BUCKET %q must be included in %s_ALLOWED_BUCKETS", alias, suffix, prefix, cfg.DefaultBucket, prefix)
 	}
 	return cfg, nil
 }
@@ -617,6 +692,7 @@ func loadMTLS(env envReader, prefix string) (MTLSPaths, error) {
 
 type envReader struct {
 	lookup     LookupFunc
+	envKeys    EnvKeysFunc
 	fileExists FileExistsFunc
 }
 
@@ -625,6 +701,18 @@ func normalizedOptions(opts Options) envReader {
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
+	envKeys := opts.EnvKeys
+	if envKeys == nil {
+		envKeys = func() []string {
+			environ := os.Environ()
+			keys := make([]string, 0, len(environ))
+			for _, entry := range environ {
+				name, _, _ := strings.Cut(entry, "=")
+				keys = append(keys, name)
+			}
+			return keys
+		}
+	}
 	fileExists := opts.FileExists
 	if fileExists == nil {
 		fileExists = func(path string) bool {
@@ -632,7 +720,7 @@ func normalizedOptions(opts Options) envReader {
 			return err == nil && !info.IsDir()
 		}
 	}
-	return envReader{lookup: lookup, fileExists: fileExists}
+	return envReader{lookup: lookup, envKeys: envKeys, fileExists: fileExists}
 }
 
 func (e envReader) get(name, fallback string) string {
@@ -648,6 +736,12 @@ func (e envReader) lookupTrimmed(name string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(value), true
+}
+
+func (e envReader) keys() []string {
+	keys := append([]string(nil), e.envKeys()...)
+	sort.Strings(keys)
+	return keys
 }
 
 func (e envReader) duration(name string, fallback time.Duration) (time.Duration, error) {
@@ -714,6 +808,17 @@ func (e envReader) list(name, fallback string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+func (e envReader) optionalBucket(name string) (string, error) {
+	bucket, ok := e.lookupTrimmed(name)
+	if !ok {
+		return "", nil
+	}
+	if err := validateBucket(bucket); err != nil {
+		return "", fmt.Errorf("%s contains invalid bucket %q: %w", name, bucket, err)
+	}
+	return bucket, nil
 }
 
 func (e envReader) optionalList(name string) ([]string, error) {

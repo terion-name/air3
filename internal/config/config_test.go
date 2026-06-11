@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -690,6 +691,7 @@ func TestLoadEdgeParsesDirectServers(t *testing.T) {
 		"S3_ALPHA_ENDPOINT":          "https://alpha.example",
 		"S3_ALPHA_REGION":            "us-east-1",
 		"S3_ALPHA_ALLOWED_BUCKETS":   "demo,logs,demo",
+		"S3_ALPHA_BUCKET":            "demo",
 		"S3_ALPHA_ACCESS_KEY_ID":     "alpha-access",
 		"S3_ALPHA_SECRET_ACCESS_KEY": "alpha-secret",
 
@@ -715,12 +717,38 @@ func TestLoadEdgeParsesDirectServers(t *testing.T) {
 	if !reflect.DeepEqual(alpha.AllowedBuckets, []string{"demo", "logs"}) {
 		t.Fatalf("alpha buckets = %#v, want demo/logs", alpha.AllowedBuckets)
 	}
+	if alpha.DefaultBucket != "demo" {
+		t.Fatalf("alpha default bucket = %q, want demo", alpha.DefaultBucket)
+	}
+	if bucket, ok := cfg.DefaultBucketForServer("alpha"); !ok || bucket != "demo" {
+		t.Fatalf("DefaultBucketForServer(alpha) = %q, %t; want demo, true", bucket, ok)
+	}
 	if !alpha.UsePathStyle || alpha.InsecureSkipVerify {
 		t.Fatalf("alpha bool defaults = path-style %t insecure %t, want true/false", alpha.UsePathStyle, alpha.InsecureSkipVerify)
 	}
 	beta := cfg.DirectServers["beta-server"]
 	if beta.Endpoint != "https://beta.example" || beta.UsePathStyle || !beta.InsecureSkipVerify {
 		t.Fatalf("beta direct S3 config = %#v", beta)
+	}
+}
+
+func TestLoadEdgeDiscoversRoutedOnlyDefaultBuckets(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED": "true",
+		"S3_BLUE_BUCKET":        "demo",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.DirectServers != nil {
+		t.Fatalf("DirectServers = %#v, want nil", cfg.DirectServers)
+	}
+	if got := cfg.ServerDefaultBuckets["BLUE"]; got != "demo" {
+		t.Fatalf("ServerDefaultBuckets[BLUE] = %q, want demo", got)
+	}
+	if bucket, ok := cfg.DefaultBucketForServer("blue"); !ok || bucket != "demo" {
+		t.Fatalf("DefaultBucketForServer(blue) = %q, %t; want demo, true", bucket, ok)
 	}
 }
 
@@ -791,6 +819,28 @@ func TestLoadEdgeRejectsDirectServerConfigErrors(t *testing.T) {
 				"AIR3_DIRECT_SERVERS":   "alpha",
 			},
 			want: "direct server \"alpha\" (suffix ALPHA): S3_ALPHA_ALLOWED_BUCKETS",
+		},
+		{
+			name: "invalid routed default bucket",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"S3_BLUE_BUCKET":        "BadBucket",
+			},
+			want: "S3_BLUE_BUCKET contains invalid bucket",
+		},
+		{
+			name: "direct default bucket must be allowed",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED":      "true",
+				"AIR3_DIRECT_SERVERS":        "alpha",
+				"S3_ALPHA_ENDPOINT":          "https://alpha.example",
+				"S3_ALPHA_REGION":            "us-east-1",
+				"S3_ALPHA_ALLOWED_BUCKETS":   "logs",
+				"S3_ALPHA_BUCKET":            "demo",
+				"S3_ALPHA_ACCESS_KEY_ID":     "access",
+				"S3_ALPHA_SECRET_ACCESS_KEY": "secret",
+			},
+			want: "S3_ALPHA_BUCKET \"demo\" must be included in S3_ALPHA_ALLOWED_BUCKETS",
 		},
 		{
 			name: "missing per-alias credentials",
@@ -945,10 +995,18 @@ func testOptions(values map[string]string, files map[string]bool) Options {
 	if values == nil {
 		values = map[string]string{}
 	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	return Options{
 		Lookup: func(name string) (string, bool) {
 			v, ok := values[name]
 			return v, ok
+		},
+		EnvKeys: func() []string {
+			return append([]string(nil), keys...)
 		},
 		FileExists: func(path string) bool {
 			if files == nil {
