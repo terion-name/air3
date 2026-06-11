@@ -6,7 +6,6 @@ import test from 'node:test';
 
 import {
   canonicalString,
-  EdgeSignError,
   InvalidSignatureError,
   RangeMismatchError,
   signUrl,
@@ -181,39 +180,4 @@ test('empty server keeps legacy signing and verification behavior', () => {
   const claims = verifyUrl({ method: 'GET', url: explicitEmpty, server: '', secret: 'secret', now: 1780934400 });
   assert.equal(claims.server, undefined);
   assert.equal(canonicalString(claims), ['GET', 'demo-bucket', 'object.txt', '1780938000', '', '', ''].join('\n'));
-});
-
-test('default-bucket short paths sign and verify with the real bucket in canonical claims', () => {
-  const raw = signUrl({
-    method: 'GET',
-    baseUrl: 'https://files.example.com',
-    server: 'blue',
-    bucket: 'demo',
-    key: 'file.txt',
-    secret: 'secret',
-    expires: 1780938000,
-    defaultBucketPath: true,
-  });
-
-  const parsed = new URL(raw);
-  assert.equal(parsed.pathname, '/blue/file.txt');
-
-  assert.throws(
-    () => verifyUrl({ method: 'GET', url: raw, server: 'blue', secret: 'secret', now: 1780934400 }),
-    EdgeSignError,
-  );
-
-  const claims = verifyUrl({
-    method: 'GET',
-    url: raw,
-    server: 'blue',
-    defaultBucket: 'demo',
-    secret: 'secret',
-    now: 1780934400,
-  });
-
-  assert.equal(claims.server, 'blue');
-  assert.equal(claims.bucket, 'demo');
-  assert.equal(claims.key, 'file.txt');
-  assert.equal(canonicalString(claims), ['GET', 'blue', 'demo', 'file.txt', '1780938000', '', '', ''].join('\n'));
 });
