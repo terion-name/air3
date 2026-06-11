@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -97,23 +98,41 @@ func TestRunPrintsDefaultBucketPathURLAcceptedByValidator(t *testing.T) {
 	}
 }
 
-func TestRunRejectsDefaultBucketPathWithoutServer(t *testing.T) {
+func TestRunPrintsSingleServerDefaultBucketPathURLAcceptedByValidator(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	var stdout, stderr bytes.Buffer
 	code := run([]string{
+		"-method", "GET",
 		"-base-url", "https://files.example.com",
 		"-default-bucket-path",
 		"-bucket", "demo",
 		"-key", "file.txt",
 		"-secret", "secret",
-	}, &stdout, &stderr, time.Now)
-	if code != 2 {
-		t.Fatalf("run() code = %d, want 2", code)
+		"-expiration", "1m",
+	}, &stdout, &stderr, func() time.Time { return now })
+	if code != 0 {
+		t.Fatalf("run() code = %d, stderr = %s", code, stderr.String())
 	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
+	raw := strings.TrimSpace(stdout.String())
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v for %s", err, raw)
 	}
-	if !strings.Contains(stderr.String(), "default-bucket-path requires -server") {
-		t.Fatalf("stderr = %q", stderr.String())
+	if got, want := u.EscapedPath(), "/file.txt"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	resolver := func(server string) (string, bool) {
+		if server == "" {
+			return "demo", true
+		}
+		return "", false
+	}
+	claims, err := signing.ValidateURLForModeWithOptions("GET", raw, signing.ValidationConfig{Secret: "secret"}, now, publicpath.ModeSingle, signing.ValidationOptions{DefaultBucket: resolver})
+	if err != nil {
+		t.Fatalf("ValidateURLForModeWithOptions() error = %v for %s", err, raw)
+	}
+	if claims.Server != "" || claims.Bucket != "demo" || claims.Key != "file.txt" {
+		t.Fatalf("claims = %#v", claims)
 	}
 }
 

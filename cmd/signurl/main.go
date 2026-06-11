@@ -34,11 +34,6 @@ func run(args []string, stdout, stderr io.Writer, now func() time.Time) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *defaultBucketPath && *server == "" {
-		fmt.Fprintln(stderr, "default-bucket-path requires -server")
-		fs.Usage()
-		return 2
-	}
 	if *bucket == "" || *key == "" || *secret == "" {
 		fmt.Fprintln(stderr, "bucket, key, and secret are required")
 		fs.Usage()
@@ -65,7 +60,11 @@ func run(args []string, stdout, stderr io.Writer, now func() time.Time) int {
 	var raw string
 	var err error
 	if *server == "" {
-		raw, err = signing.SignURL(input)
+		if *defaultBucketPath {
+			raw, err = signing.SignURLForModeWithOptions(input, publicpath.ModeSingle, signing.SignOptions{DefaultBucketPath: true})
+		} else {
+			raw, err = signing.SignURL(input)
+		}
 	} else {
 		raw, err = signing.SignURLForModeWithOptions(input, publicpath.ModeMulti, signing.SignOptions{DefaultBucketPath: *defaultBucketPath})
 	}
