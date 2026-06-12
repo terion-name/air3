@@ -40,9 +40,13 @@ sequenceDiagram
 
 When `AIR3_S3_BUCKET` is configured for single-server mode, short-form parsing wins. For example, `/demo/file.txt` means key `demo/file.txt` in default bucket `demo`, not key `file.txt`; leaving `AIR3_S3_BUCKET` unset preserves the legacy full-path interpretation. `AIR3_S3_BUCKET` is only a routing/signing default bucket name on the Edge, not an S3 credential.
 
-## Multi-server routed flow
+## Advanced Routing: Multi-Server Flow
 
-Multi-server mode is enabled with `AIR3_MULTI_SERVER=true`. Public URLs use `/{server}/{bucket}/{key}` unless an alias has an Edge-side default bucket from `S3_{SUFFIX}_BUCKET`. With a default such as `S3_BLUE_BUCKET=demo`, signed URLs may use `/blue/{key}`; the server alias and resolved bucket are still included in signed URL validation and ticket payloads. Short-form parsing wins for defaulted aliases, so every segment after `/{server}/` is treated as the key. For connector-routed aliases, the Edge renders the NATS subject from `AIR3_NATS_SUBJECT_TEMPLATE` (default `air3.{server}`), and each connector sets `AIR3_SERVER_NAME` to subscribe to its derived subject.
+If you need to connect to multiple disparate S3 storage backends, you can enable Multi-Server mode (`AIR3_MULTI_SERVER=true`).
+
+In this mode, URLs contain a **server alias** (e.g., `/blue/demo-bucket/file.txt`). The Edge Gateway dynamically derives a NATS subject from this alias (e.g., `air3.blue`). You run multiple Private Connectors, each configured with an `AIR3_SERVER_NAME` that tells it which queue to listen to. This allows the Edge to route requests to the correct storage backend seamlessly.
+
+*(You can also configure default buckets per alias (`S3_BLUE_BUCKET=demo`), which shortens the public URL to `/blue/file.txt` while keeping the internal routing intact.)*
 
 ```mermaid
 sequenceDiagram
@@ -64,9 +68,11 @@ sequenceDiagram
     Edge-->>Client: Stream response
 ```
 
-## Direct-server exception flow
+## Exception: Direct-Server Flow
 
-Direct-server aliases are configured on the Edge with `AIR3_DIRECT_SERVERS` or `DIRECT_SERVERS` and per-alias `S3_{SUFFIX}_*` settings. They require multi-server paths to select the alias, but they bypass NATS and the Private Connector for that alias. A direct alias may also set `S3_{SUFFIX}_BUCKET` for short-form paths, and startup validates that default bucket against `S3_{SUFFIX}_ALLOWED_BUCKETS`. This is useful only when you deliberately accept that the Edge has S3 credentials and network reachability for that storage. It is not the recommended private-storage boundary.
+Direct-server aliases (configured via `AIR3_DIRECT_SERVERS`) explicitly bypass NATS and the Private Connector entirely. The Edge Gateway fetches the object directly from the configured S3 endpoint.
+
+**This is a significant security exception.** It requires the Edge Gateway to hold S3 credentials and have direct network reachability to the storage backend. This breaks the core isolation boundary of air3. Only use direct servers when you deliberately accept exposing those credentials to your DMZ.
 
 ```mermaid
 sequenceDiagram

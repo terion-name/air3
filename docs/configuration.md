@@ -73,58 +73,56 @@ These highly sensitive settings belong **only** to the Private Connector in the 
 | `AIR3_S3_USE_PATH_STYLE` | `true` | Use path-style addressing (great for self-hosted S3 alternatives). |
 | `AIR3_S3_INSECURE_SKIP_VERIFY` | `false` | Skip S3 TLS verification. (Use for local testing only!) |
 
-## Single-server default-bucket paths
+## 1. Single-Server Short URLs (Default Bucket)
 
-Single-server mode is the default and remains the recommended isolated topology: the Edge publishes tickets to `AIR3_NATS_SUBJECT` (default `air3.tickets`), and the Private Connector fetches from S3. Without `AIR3_S3_BUCKET`, public URLs keep the legacy `/{bucket}/{key}` shape.
+Single-server mode is the default and recommended topology: the Edge publishes tickets to `air3.tickets` and the Private Connector fetches them.
 
-Set `AIR3_S3_BUCKET=demo` on the Edge to make bucket `demo` the single-server default bucket. Signed URLs generated with `cmd/signurl -default-bucket-path` omit the bucket from the public path, such as `/hello.txt`, but signatures, tickets, and connector fetches still use bucket `demo`. Short-form parsing wins when the default is configured: `/demo/file.txt` means key `demo/file.txt` in bucket `demo`, not key `file.txt` in bucket `demo`. Leave `AIR3_S3_BUCKET` unset when callers must continue using explicit `/{bucket}/{key}` paths.
+By default, public URLs look like `/{bucket}/{key}`. If you set `AIR3_S3_BUCKET=demo` on the Edge, it treats `demo` as the default bucket. This allows clients to use much shorter URLs like `/file.txt`.
 
-## Multi-server routing
+Under the hood, the Edge automatically maps the short URL to the `demo` bucket, so the signature validation and the Private Connector's S3 fetch still use the correct bucket name. (Leave `AIR3_S3_BUCKET` unset if you want clients to explicitly provide the bucket in the URL.)
 
-Use `AIR3_MULTI_SERVER=true` only when one Edge must route multiple connector or direct aliases. Public paths become `/{server}/{bucket}/{key}` unless that server alias has a default bucket. The server segment is part of the signed URL claims and must match the request path. For non-direct aliases, the Edge publishes the ticket to `AIR3_NATS_SUBJECT_TEMPLATE` with `{server}` replaced by the alias. The default template `air3.{server}` routes `/blue/demo/file.txt` to subject `air3.blue`; a connector with `AIR3_SERVER_NAME=blue` subscribes to that same derived subject and rejects tickets for other server aliases.
+## 2. Multi-Server Routing
 
-Set `S3_{SUFFIX}_BUCKET` on the Edge to give any multi-server alias a default bucket (`S3_BLUE_BUCKET=demo` for alias `blue`, `S3_BETA_SERVER_BUCKET=archive` for alias `beta-server`). Signed URLs generated with `cmd/signurl -default-bucket-path` then omit the bucket from the public path, such as `/blue/hello.txt`, while the signature and ticket still bind the real bucket `demo`. When a default bucket is configured, short-form parsing wins for that alias: every path segment after `/{server}/` is treated as the key, so `/blue/demo/hello.txt` targets key `demo/hello.txt` in default bucket `demo` rather than an explicit bucket named `demo`. Use aliases without `S3_{SUFFIX}_BUCKET` when you need full-path `/{server}/{bucket}/{key}` behavior.
+Use `AIR3_MULTI_SERVER=true` when a single Edge Gateway needs to route requests to multiple disparate S3 storage backends (e.g., "blue" vs. "green").
 
-`AIR3_NATS_SUBJECT` is still the single-server subject. On a connector, setting it explicitly overrides `AIR3_SERVER_NAME`/template derivation; leave it unset for the normal routed multi-server pattern.
+- **Public URLs:** Paths change to `/{server_alias}/{bucket}/{key}`.
+- **Routing:** The Edge derives a NATS subject from the alias. For example, a request to `/blue/demo/file.txt` is routed to the `air3.blue` NATS subject.
+- **Connectors:** A Private Connector with `AIR3_SERVER_NAME=blue` subscribes only to `air3.blue`, ensuring it only handles tickets meant for its specific backend.
 
-For a runnable Compose example, see the `deploy/compose.multiserver.yaml` overlay and `make e2e-multiserver`. The example covers `blue` as a connector-routed alias and `direct` as an Edge direct-S3 alias, both with default bucket `demo`, plus a full-path `green` request without a default bucket.
+**Combining Multi-Server with Short URLs:**
+You can assign default buckets to specific server aliases using `S3_{SUFFIX}_BUCKET`. For example, setting `S3_BLUE_BUCKET=demo` allows the Edge to serve `/blue/file.txt` and automatically map it to the `demo` bucket for the "blue" connector.
 
-## Optional read-only S3-compatible API
+## 3. Optional Read-Only S3-Compatible API
 
-The Edge can also expose an opt-in, public, read-only, path-style S3-compatible API for clients that already speak AWS SigV4. Enable it with `AIR3_S3_API_ENABLED=true` on the Edge and set `AIR3_S3_API_REGION`, `AIR3_S3_API_ACCESS_KEY_ID`, and `AIR3_S3_API_SECRET_ACCESS_KEY`. The access key and secret are **gateway verifier credentials only**: they authenticate client requests to air3, do not grant access to backend S3, are separate from Connector `AIR3_S3_ACCESS_KEY_ID`/`AIR3_S3_SECRET_ACCESS_KEY`, are separate from direct-server `S3_{SUFFIX}_*` credentials, and are separate from Air3 HMAC signed URL `AIR3_SIGNING_SECRET`.
+The Edge Gateway can expose a **read-only, path-style S3-compatible API** for clients and SDKs (like `aws-cli` or `boto3`) that natively speak AWS SigV4. Enable it with `AIR3_S3_API_ENABLED=true`.
 
-Air3 HMAC signed URLs remain supported. They authorize normal gateway `GET`/`HEAD` URLs and are not AWS SigV4 or S3 presigned URLs. When the S3-compatible API is enabled, AWS SigV4 header-authenticated requests and AWS SigV4 S3 presigned URLs are verified by the separate `AIR3_S3_API_*` credentials and strict `AIR3_S3_API_REGION`.
+### Security First
+You must provide a brand new set of *gateway verifier credentials*: `AIR3_S3_API_ACCESS_KEY_ID` and `AIR3_S3_API_SECRET_ACCESS_KEY`.
+- These credentials **only** live on the Edge and are used merely to authenticate incoming AWS SigV4 requests.
+- They **do not** grant access to backend S3 storage, and they are completely separate from your real S3 backend credentials.
+- The API is strictly read-only (`GetObject`, `HeadObject`, `ListObjectsV2`, `HeadBucket`). Writes, deletes, and complex bucket operations are forcefully rejected at the Edge.
 
-Supported v1 operations are intentionally narrow: `GetObject`, `HeadObject`, edge-only `HeadBucket` validation, and `ListObjectsV2`. Writes, deletes, multipart upload APIs, bucket creation/deletion, `ListBuckets` (`GET /`), bucket-level operations other than `HeadBucket`, and virtual-hosted-style requests are unsupported. Use path-style addressing only.
-
-Path-style mapping examples:
+### Path-Style Mapping Examples
 
 ```sh
-# Single-server standard object and list: public bucket is the backend bucket.
+# Single-server (bucket "demo" maps directly to backend "demo")
 aws --endpoint-url https://files.example.com s3api get-object \
   --bucket demo --key photos/cat.jpg cat.jpg
-aws --endpoint-url https://files.example.com s3api list-objects-v2 \
-  --bucket demo --prefix photos/
 
-# Multi-server standard mapping without a default bucket: public bucket is the
-# server alias; the first key/prefix segment selects the backend bucket.
+# Multi-server (bucket "blue" is the server alias, "demo" is the backend bucket)
 aws --endpoint-url https://files.example.com s3api get-object \
   --bucket blue --key demo/photos/cat.jpg cat.jpg
-aws --endpoint-url https://files.example.com s3api list-objects-v2 \
-  --bucket blue --prefix demo/photos/
 
-# Multi-server default-bucket/direct-prefix mapping (for example
-# AIR3_DIRECT_SERVERS=direct and S3_DIRECT_BUCKET=demo): public bucket is the
-# server alias; key and list prefix map directly into the default backend bucket.
+# Multi-server with Default Bucket (e.g., S3_BLUE_BUCKET=demo)
 aws --endpoint-url https://files.example.com s3api get-object \
-  --bucket direct --key photos/cat.jpg cat.jpg
-aws --endpoint-url https://files.example.com s3api list-objects-v2 \
-  --bucket direct --prefix photos/
+  --bucket blue --key photos/cat.jpg cat.jpg
 ```
 
-## Direct-server aliases (Edge S3 exception)
+## 4. Direct-Server Aliases (Security Exception)
 
-Direct servers are an explicit Edge trust-boundary exception for multi-server deployments. An alias listed in `AIR3_DIRECT_SERVERS` (or the compatible fallback `DIRECT_SERVERS`) is fetched directly by the Edge from S3 and bypasses NATS and the Private Connector for that alias. This means the Edge must hold S3 credentials and be able to reach that S3 endpoint. If `S3_{SUFFIX}_BUCKET` is set for a direct alias, startup verifies that default bucket is included in `S3_{SUFFIX}_ALLOWED_BUCKETS`. Do not use direct servers for storage that must remain private from the public edge.
+In advanced multi-server setups, you can configure the Edge to bypass NATS and the Private Connector entirely for specific aliases using `AIR3_DIRECT_SERVERS`.
+
+**Warning:** This is an explicit security exception. It requires placing real S3 credentials on the Edge Gateway and ensuring the Edge has direct network reachability to the backend S3 endpoint. Do not use this for storage that must remain strictly private from the public edge.
 
 Alias rules:
 
