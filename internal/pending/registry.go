@@ -28,9 +28,11 @@ type Request struct {
 	Deadline    time.Time
 	IngestToken string
 	Method      string
+	Operation   tickets.Operation
 	Bucket      string
 	Key         string
 	Range       string
+	List        *tickets.ListRequest
 }
 
 // Metadata is the small allowlisted response metadata accepted from the
@@ -290,23 +292,40 @@ func validateRequest(req Request, now time.Time) error {
 	if !safeToken(req.IngestToken) {
 		return fmt.Errorf("%w: ingest token is required and may contain only safe token characters", ErrInvalidRequest)
 	}
-	if req.Method != "GET" && req.Method != "HEAD" {
-		return fmt.Errorf("%w: method must be GET or HEAD", ErrInvalidRequest)
+	operation, err := tickets.ResolveOperation(req.Method, req.Operation)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	if err := tickets.ValidateBucket(req.Bucket); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	if err := tickets.ValidateKey(req.Key); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-	}
-	if req.Range != "" {
-		ticket := tickets.Ticket{Version: tickets.Version, RequestID: req.ID, Bucket: req.Bucket, Key: req.Key, Method: req.Method, Range: req.Range, DeadlineUnixMS: req.Deadline.UnixMilli(), IngestURL: "https://edge.invalid/_ingest/" + req.ID, IngestToken: req.IngestToken}
-		if err := ticket.Validate(now.Add(-time.Nanosecond)); err != nil {
-			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-		}
-	}
 	if req.Deadline.IsZero() || !req.Deadline.After(now) {
 		return ErrExpired
+	}
+
+	switch operation {
+	case tickets.OperationGetObject, tickets.OperationHeadObject:
+		if req.List != nil {
+			return fmt.Errorf("%w: list metadata must be omitted for object requests", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateKey(req.Key); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if err := tickets.ValidateByteRange(req.Range); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	case tickets.OperationListObjectsV2:
+		if req.Key != "" {
+			return fmt.Errorf("%w: key must be empty for ListObjectsV2", ErrInvalidRequest)
+		}
+		if req.Range != "" {
+			return fmt.Errorf("%w: range must be omitted for ListObjectsV2", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateListRequest(req.List); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported operation", ErrInvalidRequest)
 	}
 	return nil
 }

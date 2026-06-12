@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/terion-name/air3/internal/tickets"
 )
 
 func baseRequest(now time.Time, id string) Request {
@@ -18,6 +20,31 @@ func baseRequest(now time.Time, id string) Request {
 		Method:      "GET",
 		Bucket:      "demo-bucket",
 		Key:         "objects/" + id + ".txt",
+	}
+}
+
+func baseListRequest(now time.Time, id string) Request {
+	return Request{
+		ID:          id,
+		Deadline:    now.Add(time.Minute),
+		IngestToken: "token-" + id,
+		Method:      "GET",
+		Operation:   tickets.OperationListObjectsV2,
+		Bucket:      "demo-bucket",
+		List: &tickets.ListRequest{
+			Prefix:            "photos/2026",
+			Delimiter:         "/",
+			ContinuationToken: "opaque-token",
+			StartAfter:        "photos/2025/last.jpg",
+			MaxKeys:           50,
+			EncodingType:      "url",
+			FetchOwner:        true,
+			Rewrite: tickets.ListRewrite{
+				Bucket:    "public-bucket",
+				Prefix:    "shared/photos",
+				KeyPrefix: "cdn/photos",
+			},
+		},
 	}
 }
 
@@ -398,6 +425,60 @@ func TestStartIngestStreamsWithoutFullBuffering(t *testing.T) {
 	}
 }
 
+func TestRegisterPreservesOperationMetadata(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	reg := NewRegistry(Options{Now: func() time.Time { return now }})
+
+	objectReq := baseRequest(now, "req-object")
+	if err := reg.Register(objectReq, &fakeTarget{}); err != nil {
+		t.Fatalf("Register(object) error = %v", err)
+	}
+	if got := reg.entries[objectReq.ID].req; got.Operation != "" || got.List != nil {
+		t.Fatalf("stored object request = %#v, want empty operation and nil list", got)
+	}
+
+	listReq := baseListRequest(now, "req-list")
+	if err := reg.Register(listReq, &fakeTarget{}); err != nil {
+		t.Fatalf("Register(list) error = %v", err)
+	}
+	got := reg.entries[listReq.ID].req
+	if got.Operation != tickets.OperationListObjectsV2 || got.List == nil {
+		t.Fatalf("stored list request = %#v, want ListObjectsV2 metadata", got)
+	}
+	if got.List.Prefix != "photos/2026" || got.List.Rewrite.Bucket != "public-bucket" || !got.List.FetchOwner {
+		t.Fatalf("stored list metadata = %#v", got.List)
+	}
+}
+
+func TestRegisterRejectsInvalidListRequests(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	reg := NewRegistry(Options{Now: func() time.Time { return now }})
+	target := &fakeTarget{}
+	tests := []struct {
+		name string
+		edit func(*Request)
+	}{
+		{"non-empty key", func(r *Request) { r.Key = "objects/a.txt" }},
+		{"range", func(r *Request) { r.Range = "bytes=0-1" }},
+		{"nil list", func(r *Request) { r.List = nil }},
+		{"bad max keys", func(r *Request) { r.List.MaxKeys = 1001 }},
+		{"bad delimiter", func(r *Request) { r.List.Delimiter = "," }},
+		{"bad encoding", func(r *Request) { r.List.EncodingType = "xml" }},
+		{"bad rewrite bucket", func(r *Request) { r.List.Rewrite.Bucket = "Bad_Bucket" }},
+		{"bad method", func(r *Request) { r.Method = "HEAD" }},
+		{"unknown operation", func(r *Request) { r.Operation = tickets.Operation("PutObject") }},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := baseListRequest(now, "req-list-"+strconv.Itoa(i))
+			tc.edit(&req)
+			if err := reg.Register(req, target); !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("Register() error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+}
+
 func TestRegisterRejectsInvalidAndExpiredRequests(t *testing.T) {
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	reg := NewRegistry(Options{Now: func() time.Time { return now }})
@@ -414,6 +495,34 @@ func TestRegisterRejectsInvalidAndExpiredRequests(t *testing.T) {
 	}
 	if err := reg.Register(baseRequest(now, "req-nil-target"), nil); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("Register(nil target) error = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestRegisterRejectsInvalidObjectRequests(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	reg := NewRegistry(Options{Now: func() time.Time { return now }})
+	target := &fakeTarget{}
+	tests := []struct {
+		name string
+		edit func(*Request)
+	}{
+		{"empty key", func(r *Request) { r.Key = "" }},
+		{"bad key", func(r *Request) { r.Key = "../secret" }},
+		{"bad range", func(r *Request) { r.Range = "bytes=10-1" }},
+		{"list metadata", func(r *Request) {
+			r.List = &tickets.ListRequest{MaxKeys: 1, Rewrite: tickets.ListRewrite{Bucket: "public-bucket"}}
+		}},
+		{"get head mismatch", func(r *Request) { r.Method = "HEAD"; r.Operation = tickets.OperationGetObject }},
+		{"head get mismatch", func(r *Request) { r.Method = "GET"; r.Operation = tickets.OperationHeadObject }},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := baseRequest(now, "req-object-"+strconv.Itoa(i))
+			tc.edit(&req)
+			if err := reg.Register(req, target); !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("Register() error = %v, want ErrInvalidRequest", err)
+			}
+		})
 	}
 }
 

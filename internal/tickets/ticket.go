@@ -19,30 +19,60 @@ import (
 
 const Version = 1
 
+type Operation string
+
+const (
+	OperationGetObject     Operation = "GetObject"
+	OperationHeadObject    Operation = "HeadObject"
+	OperationListObjectsV2 Operation = "ListObjectsV2"
+)
+
 var (
 	ErrInvalidTicket = errors.New("invalid ticket")
 	bucketNameRE     = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
 	rangeRE          = regexp.MustCompile(`^bytes=(\d+)-(\d*)$|^bytes=-(\d+)$`)
 )
 
+// ListRequest carries the safe, normalized ListObjectsV2 parameters needed by a
+// connector to perform a bucket listing and rewrite the public response paths.
+type ListRequest struct {
+	Prefix            string      `json:"prefix,omitempty"`
+	Delimiter         string      `json:"delimiter,omitempty"`
+	ContinuationToken string      `json:"continuation_token,omitempty"`
+	StartAfter        string      `json:"start_after,omitempty"`
+	MaxKeys           int         `json:"max_keys"`
+	EncodingType      string      `json:"encoding_type,omitempty"`
+	FetchOwner        bool        `json:"fetch_owner,omitempty"`
+	Rewrite           ListRewrite `json:"rewrite"`
+}
+
+// ListRewrite describes the public bucket/prefix shape emitted for list results.
+type ListRewrite struct {
+	Bucket    string `json:"bucket"`
+	Prefix    string `json:"prefix,omitempty"`
+	KeyPrefix string `json:"key_prefix,omitempty"`
+}
+
 // Ticket is the NATS control-plane message for one live HTTP work item.
 //
 // The JSON schema is intentionally small and closed. Tickets carry only the
-// object identity, deadline, ingest callback, one-time ingest token, and safe
-// tracing metadata. They must never contain S3 credentials, object bytes,
+// object/list identity, deadline, ingest callback, one-time ingest token, and
+// safe tracing metadata. They must never contain S3 credentials, object bytes,
 // public client secrets, or raw untrusted request headers.
 type Ticket struct {
-	Version        int    `json:"version"`
-	RequestID      string `json:"request_id"`
-	Bucket         string `json:"bucket"`
-	Key            string `json:"key"`
-	Method         string `json:"method"`
-	Range          string `json:"range,omitempty"`
-	Server         string `json:"server,omitempty"`
-	DeadlineUnixMS int64  `json:"deadline_unix_ms"`
-	IngestURL      string `json:"ingest_url"`
-	IngestToken    string `json:"ingest_token"`
-	TraceID        string `json:"trace_id,omitempty"`
+	Version        int          `json:"version"`
+	RequestID      string       `json:"request_id"`
+	Bucket         string       `json:"bucket"`
+	Key            string       `json:"key"`
+	Method         string       `json:"method"`
+	Operation      Operation    `json:"operation,omitempty"`
+	Range          string       `json:"range,omitempty"`
+	List           *ListRequest `json:"list,omitempty"`
+	Server         string       `json:"server,omitempty"`
+	DeadlineUnixMS int64        `json:"deadline_unix_ms"`
+	IngestURL      string       `json:"ingest_url"`
+	IngestToken    string       `json:"ingest_token"`
+	TraceID        string       `json:"trace_id,omitempty"`
 }
 
 // Marshal validates t against now before returning its canonical JSON encoding.
@@ -87,14 +117,9 @@ func (t Ticket) Validate(now time.Time) error {
 	if err := ValidateBucket(t.Bucket); err != nil {
 		return err
 	}
-	if err := ValidateKey(t.Key); err != nil {
+	op, err := ResolveOperation(t.Method, t.Operation)
+	if err != nil {
 		return err
-	}
-	if t.Method != "GET" && t.Method != "HEAD" {
-		return fieldError("method", "must be GET or HEAD")
-	}
-	if t.Range != "" && !validRange(t.Range) {
-		return fieldError("range", "must be a single HTTP byte range")
 	}
 	if t.Server != "" {
 		if err := publicpath.ValidateAlias(t.Server); err != nil {
@@ -116,7 +141,68 @@ func (t Ticket) Validate(now time.Time) error {
 	if t.TraceID != "" && !saneTraceID(t.TraceID) {
 		return fieldError("trace_id", "contains unsafe characters")
 	}
-	return nil
+
+	switch op {
+	case OperationGetObject, OperationHeadObject:
+		return t.validateObjectOperation()
+	case OperationListObjectsV2:
+		return t.validateListOperation()
+	default:
+		return fieldError("operation", "is unsupported")
+	}
+}
+
+// ResolveOperation resolves the ticket operation from an explicit operation or,
+// for legacy object tickets, from the HTTP method.
+func ResolveOperation(method string, op Operation) (Operation, error) {
+	if op == "" {
+		switch method {
+		case "GET":
+			return OperationGetObject, nil
+		case "HEAD":
+			return OperationHeadObject, nil
+		default:
+			return "", fieldError("method", "must be GET or HEAD")
+		}
+	}
+
+	switch op {
+	case OperationGetObject:
+		if method != "GET" {
+			return "", fieldError("operation", "GetObject requires method GET")
+		}
+	case OperationHeadObject:
+		if method != "HEAD" {
+			return "", fieldError("operation", "HeadObject requires method HEAD")
+		}
+	case OperationListObjectsV2:
+		if method != "GET" {
+			return "", fieldError("operation", "ListObjectsV2 requires method GET")
+		}
+	default:
+		return "", fieldError("operation", "is unsupported")
+	}
+	return op, nil
+}
+
+func (t Ticket) validateObjectOperation() error {
+	if t.List != nil {
+		return fieldError("list", "must be omitted for object operations")
+	}
+	if err := ValidateKey(t.Key); err != nil {
+		return err
+	}
+	return ValidateByteRange(t.Range)
+}
+
+func (t Ticket) validateListOperation() error {
+	if t.Key != "" {
+		return fieldError("key", "must be empty for ListObjectsV2")
+	}
+	if t.Range != "" {
+		return fieldError("range", "must be omitted for ListObjectsV2")
+	}
+	return ValidateListRequest(t.List)
 }
 
 func ValidateBucket(bucket string) error {
@@ -133,23 +219,88 @@ func ValidateBucket(bucket string) error {
 }
 
 func ValidateKey(key string) error {
-	if key == "" {
-		return fieldError("key", "is required")
+	return validateKeyLike("key", key, true)
+}
+
+// ValidateByteRange checks an optional HTTP byte range value. Empty ranges are valid.
+func ValidateByteRange(byteRange string) error {
+	if byteRange == "" {
+		return nil
 	}
-	if len(key) > 1024 {
-		return fieldError("key", "is too long")
+	if !validRange(byteRange) {
+		return fieldError("range", "must be a single HTTP byte range")
 	}
-	if strings.HasPrefix(key, "/") || strings.HasSuffix(key, "/") {
-		return fieldError("key", "must not start or end with slash")
+	return nil
+}
+
+// ValidateListRequest checks the safe ListObjectsV2 subset carried by tickets.
+func ValidateListRequest(list *ListRequest) error {
+	if list == nil {
+		return fieldError("list", "is required for ListObjectsV2")
 	}
-	for _, part := range strings.Split(key, "/") {
+	if list.MaxKeys < 0 || list.MaxKeys > 1000 {
+		return fieldError("list.max_keys", "must be between 0 and 1000")
+	}
+	if list.Delimiter != "" && list.Delimiter != "/" {
+		return fieldError("list.delimiter", "must be empty or slash")
+	}
+	if list.EncodingType != "" && list.EncodingType != "url" {
+		return fieldError("list.encoding_type", "must be empty or url")
+	}
+	if err := validateKeyLike("list.prefix", list.Prefix, false); err != nil {
+		return err
+	}
+	if err := validateKeyLike("list.start_after", list.StartAfter, false); err != nil {
+		return err
+	}
+	if err := validateContinuationToken(list.ContinuationToken); err != nil {
+		return err
+	}
+	if err := ValidateBucket(list.Rewrite.Bucket); err != nil {
+		return fieldError("list.rewrite.bucket", "must be a valid DNS-style S3 bucket name")
+	}
+	if err := validateKeyLike("list.rewrite.prefix", list.Rewrite.Prefix, false); err != nil {
+		return err
+	}
+	if err := validateKeyLike("list.rewrite.key_prefix", list.Rewrite.KeyPrefix, false); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateKeyLike(field, value string, requireNonEmpty bool) error {
+	if value == "" {
+		if requireNonEmpty {
+			return fieldError(field, "is required")
+		}
+		return nil
+	}
+	if len(value) > 1024 {
+		return fieldError(field, "is too long")
+	}
+	if strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") {
+		return fieldError(field, "must not start or end with slash")
+	}
+	for _, part := range strings.Split(value, "/") {
 		if part == "" || part == "." || part == ".." {
-			return fieldError("key", "must not contain empty or traversal path segments")
+			return fieldError(field, "must not contain empty or traversal path segments")
 		}
 	}
-	for _, r := range key {
+	for _, r := range value {
 		if r == 0 || unicode.IsControl(r) {
-			return fieldError("key", "must not contain control characters")
+			return fieldError(field, "must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func validateContinuationToken(token string) error {
+	if len(token) > 2048 {
+		return fieldError("list.continuation_token", "is too long")
+	}
+	for _, r := range token {
+		if r == 0 || unicode.IsControl(r) {
+			return fieldError("list.continuation_token", "must not contain control characters")
 		}
 	}
 	return nil
@@ -220,7 +371,7 @@ func rejectForbiddenFields(data []byte) error {
 	for name := range raw {
 		normalized := strings.ToLower(strings.ReplaceAll(name, "-", "_"))
 		switch normalized {
-		case "access_key", "access_key_id", "secret_key", "secret_access_key", "session_token", "s3_credentials", "credentials", "object_bytes", "bytes", "body", "payload", "public_secret", "client_secret", "headers", "raw_headers":
+		case "access_key", "access_key_id", "secret_key", "secret_access_key", "session_token", "s3_credentials", "credentials", "object_bytes", "bytes", "body", "payload", "public_secret", "client_secret", "headers", "raw_headers", "authorization", "raw_authorization", "authorization_header", "signed_headers", "x_amz_signedheaders", "x_amz_signature", "x_amz_credential", "x_amz_security_token":
 			return fmt.Errorf("%w: forbidden ticket field %q", ErrInvalidTicket, name)
 		}
 	}
