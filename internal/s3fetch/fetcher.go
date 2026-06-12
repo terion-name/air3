@@ -1,6 +1,7 @@
 package s3fetch
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/aws/smithy-go"
 
 	"github.com/terion-name/air3/internal/config"
+	"github.com/terion-name/air3/internal/s3api"
 	"github.com/terion-name/air3/internal/tickets"
 )
 
@@ -26,10 +28,12 @@ var (
 )
 
 type Request struct {
-	Method string
-	Bucket string
-	Key    string
-	Range  string
+	Method    string
+	Operation tickets.Operation
+	Bucket    string
+	Key       string
+	Range     string
+	List      *tickets.ListRequest
 }
 
 type Object struct {
@@ -90,13 +94,18 @@ func (f *Fetcher) Fetch(ctx context.Context, req Request) (*Object, error) {
 	if f == nil || f.client == nil {
 		return nil, errors.New("s3 client is required")
 	}
-	if err := validateRequest(req); err != nil {
+	operation, err := validateRequest(req)
+	if err != nil {
 		return nil, err
 	}
-	if req.Method == http.MethodHead {
+	switch operation {
+	case tickets.OperationHeadObject:
 		return f.head(ctx, req)
+	case tickets.OperationListObjectsV2:
+		return f.list(ctx, req)
+	default:
+		return f.get(ctx, req)
 	}
-	return f.get(ctx, req)
 }
 
 func (f *Fetcher) get(ctx context.Context, req Request) (*Object, error) {
@@ -148,23 +157,113 @@ func (f *Fetcher) head(ctx context.Context, req Request) (*Object, error) {
 	}, nil
 }
 
-func validateRequest(req Request) error {
-	if req.Method != http.MethodGet && req.Method != http.MethodHead {
-		return fmt.Errorf("%w: method must be GET or HEAD", ErrInvalidRequest)
+func (f *Fetcher) list(ctx context.Context, req Request) (*Object, error) {
+	input := &s3.ListObjectsV2Input{
+		Bucket:  aws.String(req.Bucket),
+		MaxKeys: aws.Int32(int32(req.List.MaxKeys)),
+	}
+	if req.List.Prefix != "" {
+		input.Prefix = aws.String(req.List.Prefix)
+	}
+	if req.List.Delimiter != "" {
+		input.Delimiter = aws.String(req.List.Delimiter)
+	}
+	if req.List.ContinuationToken != "" {
+		input.ContinuationToken = aws.String(req.List.ContinuationToken)
+	}
+	if req.List.StartAfter != "" {
+		input.StartAfter = aws.String(req.List.StartAfter)
+	}
+	if req.List.EncodingType != "" {
+		input.EncodingType = types.EncodingType(req.List.EncodingType)
+	}
+	if req.List.FetchOwner {
+		input.FetchOwner = aws.Bool(true)
+	}
+
+	out, err := f.client.ListObjectsV2(ctx, input)
+	if err != nil {
+		return nil, mapError(err)
+	}
+
+	result := listBucketResult(req, out)
+	s3api.ApplyListPublicPrefix(&result, req.List.Rewrite.KeyPrefix)
+	xmlBody, err := s3api.RenderListBucketResult(result)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Object{
+		StatusCode:    http.StatusOK,
+		ContentType:   "application/xml",
+		ContentLength: int64(len(xmlBody)),
+		Body:          io.NopCloser(bytes.NewReader(xmlBody)),
+	}, nil
+}
+
+func listBucketResult(req Request, out *s3.ListObjectsV2Output) s3api.ListBucketResult {
+	result := s3api.ListBucketResult{
+		Name:                  firstNonEmpty(req.List.Rewrite.Bucket, req.Bucket),
+		Prefix:                firstNonEmpty(req.List.Rewrite.Prefix, value(out.Prefix), req.List.Prefix),
+		Delimiter:             firstNonEmpty(value(out.Delimiter), req.List.Delimiter),
+		KeyCount:              int32Value(out.KeyCount, 0),
+		MaxKeys:               int32Value(out.MaxKeys, req.List.MaxKeys),
+		IsTruncated:           boolValue(out.IsTruncated),
+		ContinuationToken:     firstNonEmpty(value(out.ContinuationToken), req.List.ContinuationToken),
+		NextContinuationToken: value(out.NextContinuationToken),
+		StartAfter:            firstNonEmpty(value(out.StartAfter), req.List.StartAfter),
+		EncodingType:          firstNonEmpty(string(out.EncodingType), req.List.EncodingType),
+	}
+
+	for _, object := range out.Contents {
+		result.Contents = append(result.Contents, s3api.ListObject{
+			Key:          value(object.Key),
+			LastModified: formatS3Time(object.LastModified),
+			ETag:         value(object.ETag),
+			Size:         int64Value(object.Size, 0),
+			StorageClass: string(object.StorageClass),
+		})
+	}
+	for _, prefix := range out.CommonPrefixes {
+		result.CommonPrefixes = append(result.CommonPrefixes, value(prefix.Prefix))
+	}
+	return result
+}
+
+func validateRequest(req Request) (tickets.Operation, error) {
+	operation, err := tickets.ResolveOperation(req.Method, req.Operation)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	if err := tickets.ValidateBucket(req.Bucket); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	if err := tickets.ValidateKey(req.Key); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-	}
-	if req.Range != "" {
-		t := tickets.Ticket{Version: tickets.Version, RequestID: "range-check", Bucket: req.Bucket, Key: req.Key, Method: req.Method, Range: req.Range, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli(), IngestURL: "https://edge.invalid/_ingest/range-check", IngestToken: "range-check-token"}
-		if err := t.Validate(time.Now()); err != nil {
-			return fmt.Errorf("%w: invalid range", ErrInvalidRequest)
+
+	switch operation {
+	case tickets.OperationGetObject, tickets.OperationHeadObject:
+		if req.List != nil {
+			return "", fmt.Errorf("%w: list metadata must be omitted for object requests", ErrInvalidRequest)
 		}
+		if err := tickets.ValidateKey(req.Key); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if err := tickets.ValidateByteRange(req.Range); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	case tickets.OperationListObjectsV2:
+		if req.Key != "" {
+			return "", fmt.Errorf("%w: key must be empty for ListObjectsV2", ErrInvalidRequest)
+		}
+		if req.Range != "" {
+			return "", fmt.Errorf("%w: range must be omitted for ListObjectsV2", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateListRequest(req.List); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	default:
+		return "", fmt.Errorf("%w: unsupported operation", ErrInvalidRequest)
 	}
-	return nil
+	return operation, nil
 }
 
 func mapError(err error) error {
@@ -198,6 +297,33 @@ func int64Value(n *int64, fallback int64) int64 {
 		return fallback
 	}
 	return *n
+}
+
+func int32Value(n *int32, fallback int) int {
+	if n == nil {
+		return fallback
+	}
+	return int(*n)
+}
+
+func boolValue(b *bool) bool {
+	return b != nil && *b
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func formatS3Time(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func formatHTTPTime(t *time.Time) string {
