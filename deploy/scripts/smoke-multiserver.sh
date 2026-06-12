@@ -142,6 +142,91 @@ check_optional_head() {
   esac
 }
 
+s3_api_smoke_ready() {
+  if [ "${AIR3_S3_API_ENABLED:-false}" != "true" ]; then
+    echo "skip: optional S3-compatible API smoke checks are disabled (set AIR3_S3_API_ENABLED=true to enable)"
+    return 1
+  fi
+  if [ -z "${AIR3_S3_API_ACCESS_KEY_ID:-}" ] || [ -z "${AIR3_S3_API_SECRET_ACCESS_KEY:-}" ]; then
+    echo "skip: optional S3-compatible API smoke checks need AIR3_S3_API_ACCESS_KEY_ID and AIR3_S3_API_SECRET_ACCESS_KEY"
+    return 1
+  fi
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "skip: optional S3-compatible API smoke checks need the aws CLI on PATH"
+    return 1
+  fi
+  return 0
+}
+
+aws_s3api() {
+  local aws_config rc
+  aws_config=$(mktemp)
+  temp_files+=("$aws_config")
+  printf '[default]\ns3 =\n    addressing_style = path\n' >"$aws_config"
+  AWS_CONFIG_FILE="$aws_config" \
+    AWS_ACCESS_KEY_ID="$AIR3_S3_API_ACCESS_KEY_ID" \
+    AWS_SECRET_ACCESS_KEY="$AIR3_S3_API_SECRET_ACCESS_KEY" \
+    AWS_DEFAULT_REGION="${AIR3_S3_API_REGION:-us-east-1}" \
+    AWS_PAGER="" \
+    aws --endpoint-url "$BASE_URL" --ca-bundle "$CERT_DIR/dev-ca.crt" s3api "$@"
+  rc=$?
+  rm -f "$aws_config"
+  return "$rc"
+}
+
+assert_s3_api_body() {
+  local label=$1
+  local bucket=$2
+  local key=$3
+  local body
+  body=$(mktemp)
+  temp_files+=("$body")
+  if ! aws_s3api get-object --bucket "$bucket" --key "$key" "$body" >/dev/null; then
+    echo "error: $label S3 API GetObject failed" >&2
+    exit 1
+  fi
+  if ! cmp -s "$body" <(printf '%s' "$EXPECTED"); then
+    echo "error: $label S3 API GetObject body did not match expected content" >&2
+    exit 1
+  fi
+  echo "ok: $label S3 API GetObject returned expected content"
+}
+
+assert_s3_api_list_contains() {
+  local label=$1
+  local bucket=$2
+  local prefix=$3
+  local expected_key=$4
+  local list_keys
+  if ! list_keys=$(aws_s3api list-objects-v2 --bucket "$bucket" --prefix "$prefix" --query 'Contents[].Key' --output text); then
+    echo "error: $label S3 API ListObjectsV2 failed" >&2
+    exit 1
+  fi
+  if [[ "$list_keys" != *"$expected_key"* ]]; then
+    echo "error: $label S3 API ListObjectsV2 did not include $expected_key" >&2
+    printf 'keys: %s\n' "$list_keys" >&2
+    exit 1
+  fi
+  echo "ok: $label S3 API ListObjectsV2 included $expected_key"
+}
+
+run_optional_s3_api_smoke() {
+  s3_api_smoke_ready || return 0
+
+  echo "Running optional multi-server S3-compatible API smoke checks..."
+  assert_s3_api_body "blue default-bucket mapping" "$BLUE_SERVER" "$KEY"
+  assert_s3_api_list_contains "blue default-bucket mapping" "$BLUE_SERVER" "$KEY" "$KEY"
+
+  if ! aws_s3api head-bucket --bucket "$BLUE_SERVER" >/dev/null; then
+    echo "error: blue S3 API HeadBucket validation failed" >&2
+    exit 1
+  fi
+  echo "ok: blue S3 API HeadBucket validation succeeded"
+
+  assert_s3_api_body "direct default-bucket mapping" "$DIRECT_SERVER" "$KEY"
+  assert_s3_api_list_contains "direct default-bucket mapping" "$DIRECT_SERVER" "$KEY" "$KEY"
+}
+
 wait_for_blue() {
   echo "Waiting for edge gateway at $BASE_URL with server '$BLUE_SERVER'..."
   local url
@@ -185,6 +270,8 @@ assert_body "direct signed GET" "$direct_get_url"
 
 direct_head_url=$(sign_default_bucket_url HEAD "$DIRECT_SERVER" "$KEY" 2m)
 check_optional_head "direct signed" "$direct_head_url"
+
+run_optional_s3_api_smoke
 
 mutated_url=${blue_get_url/\/$BLUE_SERVER\//\/$GREEN_SERVER\/$BUCKET\/}
 if [ "$mutated_url" = "$blue_get_url" ]; then

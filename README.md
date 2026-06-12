@@ -333,6 +333,37 @@ If you need to serve partial files (like for streaming video), `air3` fully supp
 
 If you're using signed URLs and expect clients to send `Range` headers, you must include the exact range claim when generating the URL (e.g., `cmd/signurl -range 'bytes=0-99'`). The Connector forwards authorized ranges to S3, seamlessly returning a `206 Partial Content` response to the client.
 
+## Optional Read-Only S3-Compatible API
+
+By default, air3 serves only its HMAC signed gateway URLs. You can opt in to a public, read-only, path-style S3-compatible API by setting `AIR3_S3_API_ENABLED=true` on the Edge and providing `AIR3_S3_API_REGION`, `AIR3_S3_API_ACCESS_KEY_ID`, and `AIR3_S3_API_SECRET_ACCESS_KEY`. These `AIR3_S3_API_*` values are public gateway AWS SigV4 verifier credentials only. They are separate from Connector backend S3 credentials, direct-server `S3_{SUFFIX}_*` credentials, and the Air3 HMAC `AIR3_SIGNING_SECRET`.
+
+S3-compatible API v1 supports `GetObject`, `HeadObject`, edge-only `HeadBucket` validation, and `ListObjectsV2`. It rejects writes, bucket listing/management, and virtual-hosted-style requests; clients must sign for the exact configured region. Air3 HMAC signed URLs remain supported and are not AWS SigV4 or S3 presigned URLs.
+
+Path-style examples:
+
+```sh
+# Single-server: backend bucket demo, key photos/cat.jpg.
+aws --endpoint-url https://files.example.com s3api get-object \
+  --bucket demo --key photos/cat.jpg cat.jpg
+aws --endpoint-url https://files.example.com s3api list-objects-v2 \
+  --bucket demo --prefix photos/
+
+# Multi-server standard: public bucket blue is the server alias; the first
+# key/prefix segment selects backend bucket demo.
+aws --endpoint-url https://files.example.com s3api get-object \
+  --bucket blue --key demo/photos/cat.jpg cat.jpg
+aws --endpoint-url https://files.example.com s3api list-objects-v2 \
+  --bucket blue --prefix demo/photos/
+
+# Multi-server default/direct prefix mapping, e.g. S3_DIRECT_BUCKET=demo.
+aws --endpoint-url https://files.example.com s3api get-object \
+  --bucket direct --key photos/cat.jpg cat.jpg
+aws --endpoint-url https://files.example.com s3api list-objects-v2 \
+  --bucket direct --prefix photos/
+```
+
+See `docs/configuration.md` for the full security model and Compose opt-in notes.
+
 ## Local Development & Validation
 
 ```sh

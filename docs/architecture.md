@@ -148,3 +148,4 @@ flowchart TB
 - The Edge Gateway holds the pending client response until the Connector finishes fetching the object.
 - If any internal piece (Connector, NATS, S3) goes down, the Edge cleanly returns a standard HTTP error to the client (`503 Service Unavailable` or `504 Gateway Timeout`).
 - Edge signed URLs only authorize requests against the air3 gateway itself. They are absolutely not S3 credentials and can never be reused against your direct S3 API.
+- The optional read-only S3-compatible API is disabled by default. When enabled, `AIR3_S3_API_*` credentials verify AWS SigV4-shaped public requests at the Edge only; they are separate from backend S3 credentials, direct-server credentials, and Air3 HMAC signed URL secrets. The v1 API is path-style only and supports only `GetObject`, `HeadObject`, `HeadBucket` validation, and `ListObjectsV2`.

@@ -23,6 +23,10 @@ The Edge Gateway is your public-facing entry point. In the default recommended t
 | `S3_{SUFFIX}_BUCKET` | unset | Optional per-server default bucket for multi-server public paths. For alias `blue`, `S3_BLUE_BUCKET=demo` lets signed URLs use `/blue/{key}` instead of `/blue/demo/{key}`. |
 | `DIRECT_SERVERS` | unset | Bare fallback name for `AIR3_DIRECT_SERVERS`. If both are set, the values must match exactly or startup fails. |
 | `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` | unset | (Optional) Comma-separated list of allowed Connector certificate identities for mTLS ingest connections. |
+| `AIR3_S3_API_ENABLED` | `false` | Opt in to the public read-only S3-compatible API for AWS SigV4-shaped requests. When `false`, normal air3 HMAC signed URLs continue unchanged and S3 API credentials are not required. |
+| `AIR3_S3_API_REGION` | `us-east-1` | Region clients must use in the AWS SigV4 credential scope. Region matching is strict. |
+| `AIR3_S3_API_ACCESS_KEY_ID` | unset | Public gateway SigV4 verifier access key ID. Required only when `AIR3_S3_API_ENABLED=true`; not a backend connector/direct S3 credential. |
+| `AIR3_S3_API_SECRET_ACCESS_KEY` | unset | Public gateway SigV4 verifier secret. Required only when `AIR3_S3_API_ENABLED=true`; not a backend connector/direct S3 credential and not `AIR3_SIGNING_SECRET`. |
 
 ## Private Connector
 
@@ -84,6 +88,39 @@ Set `S3_{SUFFIX}_BUCKET` on the Edge to give any multi-server alias a default bu
 `AIR3_NATS_SUBJECT` is still the single-server subject. On a connector, setting it explicitly overrides `AIR3_SERVER_NAME`/template derivation; leave it unset for the normal routed multi-server pattern.
 
 For a runnable Compose example, see the `deploy/compose.multiserver.yaml` overlay and `make e2e-multiserver`. The example covers `blue` as a connector-routed alias and `direct` as an Edge direct-S3 alias, both with default bucket `demo`, plus a full-path `green` request without a default bucket.
+
+## Optional read-only S3-compatible API
+
+The Edge can also expose an opt-in, public, read-only, path-style S3-compatible API for clients that already speak AWS SigV4. Enable it with `AIR3_S3_API_ENABLED=true` on the Edge and set `AIR3_S3_API_REGION`, `AIR3_S3_API_ACCESS_KEY_ID`, and `AIR3_S3_API_SECRET_ACCESS_KEY`. The access key and secret are **gateway verifier credentials only**: they authenticate client requests to air3, do not grant access to backend S3, are separate from Connector `AIR3_S3_ACCESS_KEY_ID`/`AIR3_S3_SECRET_ACCESS_KEY`, are separate from direct-server `S3_{SUFFIX}_*` credentials, and are separate from Air3 HMAC signed URL `AIR3_SIGNING_SECRET`.
+
+Air3 HMAC signed URLs remain supported. They authorize normal gateway `GET`/`HEAD` URLs and are not AWS SigV4 or S3 presigned URLs. When the S3-compatible API is enabled, AWS SigV4 header-authenticated requests and AWS SigV4 S3 presigned URLs are verified by the separate `AIR3_S3_API_*` credentials and strict `AIR3_S3_API_REGION`.
+
+Supported v1 operations are intentionally narrow: `GetObject`, `HeadObject`, edge-only `HeadBucket` validation, and `ListObjectsV2`. Writes, deletes, multipart upload APIs, bucket creation/deletion, `ListBuckets` (`GET /`), bucket-level operations other than `HeadBucket`, and virtual-hosted-style requests are unsupported. Use path-style addressing only.
+
+Path-style mapping examples:
+
+```sh
+# Single-server standard object and list: public bucket is the backend bucket.
+aws --endpoint-url https://files.example.com s3api get-object \
+  --bucket demo --key photos/cat.jpg cat.jpg
+aws --endpoint-url https://files.example.com s3api list-objects-v2 \
+  --bucket demo --prefix photos/
+
+# Multi-server standard mapping without a default bucket: public bucket is the
+# server alias; the first key/prefix segment selects the backend bucket.
+aws --endpoint-url https://files.example.com s3api get-object \
+  --bucket blue --key demo/photos/cat.jpg cat.jpg
+aws --endpoint-url https://files.example.com s3api list-objects-v2 \
+  --bucket blue --prefix demo/photos/
+
+# Multi-server default-bucket/direct-prefix mapping (for example
+# AIR3_DIRECT_SERVERS=direct and S3_DIRECT_BUCKET=demo): public bucket is the
+# server alias; key and list prefix map directly into the default backend bucket.
+aws --endpoint-url https://files.example.com s3api get-object \
+  --bucket direct --key photos/cat.jpg cat.jpg
+aws --endpoint-url https://files.example.com s3api list-objects-v2 \
+  --bucket direct --prefix photos/
+```
 
 ## Direct-server aliases (Edge S3 exception)
 
@@ -204,6 +241,15 @@ Our included `deploy/compose.yaml` demo clearly illustrates the required network
 | `public` | `edge-gateway` | The only network exposed to your host (via `https://localhost:8443`). |
 | `broker` | `edge-gateway`, `nats`, `private-connector` | The middle ground for NATS control messages and Edge ingest routing. |
 | `private` | `private-connector`, `versitygw`, `aws-cli` | Deeply isolated S3 access. Marked `internal: true`. The Edge Gateway cannot reach this. |
+
+The Compose demo wires the optional S3-compatible API variables through to the Edge with `AIR3_S3_API_ENABLED=false` and empty verifier credentials by default, so credentials are not required unless you explicitly enable the API:
+
+```sh
+AIR3_S3_API_ENABLED=true \
+AIR3_S3_API_ACCESS_KEY_ID=demo-gateway-access \
+AIR3_S3_API_SECRET_ACCESS_KEY=demo-gateway-secret \
+make compose-up
+```
 
 ## Release artifacts and images
 

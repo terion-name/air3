@@ -74,6 +74,80 @@ assert_body() {
   echo "ok: $label returned expected content"
 }
 
+s3_api_smoke_ready() {
+  if [ "${AIR3_S3_API_ENABLED:-false}" != "true" ]; then
+    echo "skip: optional S3-compatible API smoke checks are disabled (set AIR3_S3_API_ENABLED=true to enable)"
+    return 1
+  fi
+  if [ -z "${AIR3_S3_API_ACCESS_KEY_ID:-}" ] || [ -z "${AIR3_S3_API_SECRET_ACCESS_KEY:-}" ]; then
+    echo "skip: optional S3-compatible API smoke checks need AIR3_S3_API_ACCESS_KEY_ID and AIR3_S3_API_SECRET_ACCESS_KEY"
+    return 1
+  fi
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "skip: optional S3-compatible API smoke checks need the aws CLI on PATH"
+    return 1
+  fi
+  return 0
+}
+
+aws_s3api() {
+  local aws_config rc
+  aws_config=$(mktemp)
+  printf '[default]\ns3 =\n    addressing_style = path\n' >"$aws_config"
+  AWS_CONFIG_FILE="$aws_config" \
+    AWS_ACCESS_KEY_ID="$AIR3_S3_API_ACCESS_KEY_ID" \
+    AWS_SECRET_ACCESS_KEY="$AIR3_S3_API_SECRET_ACCESS_KEY" \
+    AWS_DEFAULT_REGION="${AIR3_S3_API_REGION:-us-east-1}" \
+    AWS_PAGER="" \
+    aws --endpoint-url "$BASE_URL" --ca-bundle "$CERT_DIR/dev-ca.crt" s3api "$@"
+  rc=$?
+  rm -f "$aws_config"
+  return "$rc"
+}
+
+run_optional_s3_api_smoke() {
+  s3_api_smoke_ready || return 0
+
+  echo "Running optional S3-compatible API smoke checks..."
+  local body list_keys
+  body=$(mktemp)
+  if ! aws_s3api get-object --bucket "$BUCKET" --key "$KEY" "$body" >/dev/null; then
+    rm -f "$body"
+    echo "error: S3 API GetObject failed" >&2
+    exit 1
+  fi
+  if ! cmp -s "$body" <(printf '%s' "$EXPECTED"); then
+    echo "error: S3 API GetObject body did not match expected content" >&2
+    rm -f "$body"
+    exit 1
+  fi
+  rm -f "$body"
+  echo "ok: S3 API GetObject returned expected content"
+
+  if ! aws_s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null; then
+    echo "error: S3 API HeadObject failed" >&2
+    exit 1
+  fi
+  echo "ok: S3 API HeadObject succeeded"
+
+  if ! aws_s3api head-bucket --bucket "$BUCKET" >/dev/null; then
+    echo "error: S3 API HeadBucket validation failed" >&2
+    exit 1
+  fi
+  echo "ok: S3 API HeadBucket validation succeeded"
+
+  if ! list_keys=$(aws_s3api list-objects-v2 --bucket "$BUCKET" --prefix "$KEY" --query 'Contents[].Key' --output text); then
+    echo "error: S3 API ListObjectsV2 failed" >&2
+    exit 1
+  fi
+  if [[ "$list_keys" != *"$KEY"* ]]; then
+    echo "error: S3 API ListObjectsV2 did not include $KEY" >&2
+    printf 'keys: %s\n' "$list_keys" >&2
+    exit 1
+  fi
+  echo "ok: S3 API ListObjectsV2 included $KEY"
+}
+
 wait_for_edge() {
   echo "Waiting for edge gateway at $BASE_URL..."
   local url
@@ -127,6 +201,8 @@ put_object "$LEGACY_COLLISION_KEY" "$LEGACY_COLLISION_CONTENT"
 put_object "$SHORT_FORM_COLLISION_KEY" "$SHORT_FORM_EXPECTED"
 short_form_url=$(sign_url GET "$SHORT_FORM_COLLISION_KEY" 2m)
 assert_body "short-form /$SHORT_FORM_COLLISION_KEY default-bucket routing" "$SHORT_FORM_EXPECTED" "$short_form_url"
+
+run_optional_s3_api_smoke
 
 bad_url=$(printf '%s' "$get_url" | sed 's/sig=[^&]*/sig=deadbeef/')
 assert_status "bad signature rejection" "403" "$bad_url"

@@ -45,6 +45,12 @@ services:
       AIR3_PENDING_TTL: "5s"
       AIR3_STREAM_TIMEOUT: "30s"
       AIR3_STREAM_COPY_BUFFER_BYTES: "${AIR3_STREAM_COPY_BUFFER_BYTES:-262144}"
+      # Optional public read-only path-style S3-compatible API. Disabled by default;
+      # AIR3_S3_API_* are gateway SigV4 verifier credentials, not backend S3 credentials.
+      AIR3_S3_API_ENABLED: "${AIR3_S3_API_ENABLED:-false}"
+      AIR3_S3_API_REGION: "${AIR3_S3_API_REGION:-us-east-1}"
+      AIR3_S3_API_ACCESS_KEY_ID: "${AIR3_S3_API_ACCESS_KEY_ID:-}"
+      AIR3_S3_API_SECRET_ACCESS_KEY: "${AIR3_S3_API_SECRET_ACCESS_KEY:-}"
       AIR3_SIGNING_SECRET: "dev-signing-secret-change-me"
       AIR3_EDGE_MTLS_CA_FILE: "/certs/dev-ca.crt"
       AIR3_EDGE_MTLS_CERT_FILE: "/certs/edge-server.crt"
