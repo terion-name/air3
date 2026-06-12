@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,6 +131,29 @@ func connectorConfig() config.ConnectorConfig {
 
 func validTicket(url, method string) tickets.Ticket {
 	return tickets.Ticket{Version: tickets.Version, RequestID: "req-1", Bucket: "demo-bucket", Key: "objects/file.txt", Method: method, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli(), IngestURL: url, IngestToken: "ingest-token"}
+}
+
+func validListTicket(url string) tickets.Ticket {
+	return tickets.Ticket{
+		Version:        tickets.Version,
+		RequestID:      "req-list",
+		Bucket:         "demo-bucket",
+		Method:         http.MethodGet,
+		Operation:      tickets.OperationListObjectsV2,
+		DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli(),
+		IngestURL:      url,
+		IngestToken:    "ingest-token",
+		List: &tickets.ListRequest{
+			Prefix:            "objects",
+			Delimiter:         "/",
+			ContinuationToken: "token-1",
+			StartAfter:        "objects/previous.txt",
+			MaxKeys:           25,
+			EncodingType:      "url",
+			FetchOwner:        true,
+			Rewrite:           tickets.ListRewrite{Bucket: "public-bucket", Prefix: "public", KeyPrefix: "public"},
+		},
+	}
 }
 
 func testConfigOptions(values map[string]string) config.Options {
@@ -559,6 +583,98 @@ func TestConnectorStreamsFetchedObjectToIngest(t *testing.T) {
 	}
 }
 
+func TestConnectorStreamsListObjectsV2XMLToIngest(t *testing.T) {
+	xmlBody := "<ListBucketResult><Name>public-bucket</Name></ListBucketResult>"
+	wantContentLength := int64(len(xmlBody))
+	wantMetadataLength := strconv.FormatInt(wantContentLength, 10)
+	var gotToken, gotStatus, gotContentType, gotMetadataLength, gotBody string
+	var gotContentLength int64
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotToken = r.Header.Get(ingest.TokenHeader)
+		gotStatus = r.Header.Get(ingest.StatusCodeHeader)
+		gotContentType = r.Header.Get("Content-Type")
+		gotMetadataLength = r.Header.Get(ingest.ObjectContentLengthHeader)
+		gotContentLength = r.ContentLength
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, ContentType: "application/xml", ContentLength: wantContentLength, Body: io.NopCloser(strings.NewReader(xmlBody))}}
+	worker := newConnector(connectorConfig(), fetcher, httpIngestSender{client: ts.Client()}, nil)
+	ticket := validListTicket(ts.URL)
+	if err := worker.handleTicket(context.Background(), ticket); err != nil {
+		t.Fatalf("handleTicket() error = %v", err)
+	}
+
+	if gotToken != "ingest-token" || gotStatus != "200" || gotContentType != "application/xml" || gotMetadataLength != wantMetadataLength || gotBody != xmlBody || gotContentLength != wantContentLength {
+		t.Fatalf("ingest token=%q status=%q content-type=%q metadata-length=%q content-length=%d body=%q", gotToken, gotStatus, gotContentType, gotMetadataLength, gotContentLength, gotBody)
+	}
+	if len(fetcher.requests) != 1 {
+		t.Fatalf("fetch requests = %#v, want one", fetcher.requests)
+	}
+	gotReq := fetcher.requests[0]
+	if gotReq.Method != http.MethodGet || gotReq.Operation != tickets.OperationListObjectsV2 || gotReq.Bucket != "demo-bucket" || gotReq.Key != "" || gotReq.Range != "" || gotReq.List == nil {
+		t.Fatalf("fetch request = %#v, want ListObjectsV2 bucket request", gotReq)
+	}
+	if *gotReq.List != *ticket.List {
+		t.Fatalf("fetch list request = %#v, want %#v", gotReq.List, ticket.List)
+	}
+}
+
+func TestConnectorRejectsInvalidListTicketBeforeFetchOrSend(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*tickets.Ticket)
+	}{
+		{
+			name: "missing list metadata",
+			mutate: func(ticket *tickets.Ticket) {
+				ticket.List = nil
+			},
+		},
+		{
+			name: "list key is forbidden",
+			mutate: func(ticket *tickets.Ticket) {
+				ticket.Key = "objects/file.txt"
+			},
+		},
+		{
+			name: "list range is forbidden",
+			mutate: func(ticket *tickets.Ticket) {
+				ticket.Range = "bytes=0-1"
+			},
+		},
+		{
+			name: "object list metadata is forbidden",
+			mutate: func(ticket *tickets.Ticket) {
+				ticket.Operation = tickets.OperationGetObject
+				ticket.Key = "objects/file.txt"
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("body"))}}
+			sender := &fakeIngestSender{}
+			worker := newConnector(connectorConfig(), fetcher, sender, nil)
+			ticket := validListTicket("https://edge.internal/_ingest/req-list")
+			tc.mutate(&ticket)
+
+			if err := worker.handleTicket(context.Background(), ticket); err == nil {
+				t.Fatal("handleTicket() error = nil, want invalid ticket error")
+			}
+			if len(fetcher.requests) != 0 {
+				t.Fatalf("fetch requests = %#v, want none", fetcher.requests)
+			}
+			if len(sender.sends) != 0 {
+				t.Fatalf("sender sends = %#v, want none", sender.sends)
+			}
+		})
+	}
+}
+
 func TestConnectorStreamsUnknownLengthObjectWithChunkedIngest(t *testing.T) {
 	var gotMetadataLength, gotBody string
 	var gotContentLength int64
@@ -702,6 +818,61 @@ func TestConnectorRejectsDisallowedBucketBeforeFetch(t *testing.T) {
 	}
 	if len(fetcher.requests) != 0 {
 		t.Fatalf("fetch requests = %#v, want none", fetcher.requests)
+	}
+}
+
+func TestConnectorRejectsListTicketsBlockedByAllowlistOrServerBeforeFetch(t *testing.T) {
+	tests := []struct {
+		name   string
+		cfg    config.ConnectorConfig
+		mutate func(*tickets.Ticket)
+	}{
+		{
+			name: "disallowed bucket",
+			cfg:  connectorConfig(),
+			mutate: func(ticket *tickets.Ticket) {
+				ticket.Bucket = "other-bucket"
+			},
+		},
+		{
+			name: "missing server",
+			cfg: func() config.ConnectorConfig {
+				cfg := connectorConfig()
+				cfg.ServerName = "west-1"
+				return cfg
+			}(),
+			mutate: func(ticket *tickets.Ticket) {},
+		},
+		{
+			name: "mismatched server",
+			cfg: func() config.ConnectorConfig {
+				cfg := connectorConfig()
+				cfg.ServerName = "west-1"
+				return cfg
+			}(),
+			mutate: func(ticket *tickets.Ticket) {
+				ticket.Server = "east-1"
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("body"))}}
+			sender := &fakeIngestSender{}
+			worker := newConnector(tc.cfg, fetcher, sender, nil)
+			ticket := validListTicket("https://edge.internal/_ingest/req-list")
+			tc.mutate(&ticket)
+
+			if err := worker.handleTicket(context.Background(), ticket); err == nil {
+				t.Fatal("handleTicket() error = nil, want rejected ticket error")
+			}
+			if len(fetcher.requests) != 0 {
+				t.Fatalf("fetch requests = %#v, want none", fetcher.requests)
+			}
+			if len(sender.sends) != 0 {
+				t.Fatalf("sender sends = %#v, want none", sender.sends)
+			}
+		})
 	}
 }
 

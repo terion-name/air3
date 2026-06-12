@@ -245,7 +245,7 @@ func (c *connector) handleTicket(ctx context.Context, ticket tickets.Ticket) err
 	ticketCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	obj, err := c.fetcher.Fetch(ticketCtx, s3fetch.Request{Method: ticket.Method, Bucket: ticket.Bucket, Key: ticket.Key, Range: ticket.Range})
+	obj, err := c.fetcher.Fetch(ticketCtx, s3fetch.Request{Method: ticket.Method, Operation: ticket.Operation, Bucket: ticket.Bucket, Key: ticket.Key, Range: ticket.Range, List: ticket.List})
 	if err != nil {
 		status := statusForFetchError(err)
 		return c.sender.Send(ticketCtx, ticket, metadataForStatus(status), http.NoBody)
