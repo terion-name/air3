@@ -30,6 +30,7 @@ import (
 	"github.com/terion-name/air3/internal/natsclient"
 	"github.com/terion-name/air3/internal/pending"
 	"github.com/terion-name/air3/internal/publicpath"
+	"github.com/terion-name/air3/internal/s3api"
 	"github.com/terion-name/air3/internal/s3fetch"
 	"github.com/terion-name/air3/internal/signing"
 	"github.com/terion-name/air3/internal/tickets"
@@ -171,6 +172,10 @@ func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, publisher ticke
 }
 
 func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.S3API.Enabled && s3api.IsSigV4Request(r) {
+		s.serveS3API(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -247,6 +252,337 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writePublicError(w, status, statusText(status))
 		return
 	}
+}
+
+type s3EdgeRequest struct {
+	server      string
+	bucket      string
+	key         string
+	rangeHeader string
+	operation   tickets.Operation
+	list        *tickets.ListRequest
+	headBucket  bool
+}
+
+func edgeS3APIMode(cfg config.EdgeConfig) s3api.RoutingMode {
+	if cfg.MultiServer {
+		return s3api.RoutingMultiServer
+	}
+	return s3api.RoutingSingleServer
+}
+
+func (s *edgeServer) serveS3API(w http.ResponseWriter, r *http.Request) {
+	req, err := s.resolveS3Request(r)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	if req.headBucket {
+		s.serveS3HeadBucket(w, r, req)
+		return
+	}
+	if fetcher, ok := s.directFetcherFor(req.server); ok {
+		s.serveS3Direct(w, r, req, fetcher)
+		return
+	}
+	if !bucketAllowed(req.bucket, s.cfg.AllowedBuckets) {
+		writeS3Error(w, r, s3HTTPError{status: http.StatusForbidden, code: "AccessDenied", message: "Access denied"})
+		return
+	}
+
+	reqID, err := s.newToken()
+	if err != nil {
+		writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
+		return
+	}
+	ingestToken, err := s.newToken()
+	if err != nil {
+		writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
+		return
+	}
+	deadline := s.now().Add(s.cfg.Timeouts.PendingRequestTTL)
+	ingestURL, err := ingestURLForRequest(s.cfg.IngestURL, reqID)
+	if err != nil {
+		writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
+		return
+	}
+
+	sink := newResponseSink(w, r.Method, r.Context())
+	pendingReq := pending.Request{ID: reqID, Deadline: deadline, IngestToken: ingestToken, Method: r.Method, Operation: req.operation, Bucket: req.bucket, Key: req.key, Range: req.rangeHeader, List: req.list}
+	if err := s.registry.Register(pendingReq, sink); err != nil {
+		writeS3Error(w, r, s3ErrorForSetup(err))
+		return
+	}
+	defer s.registry.Cancel(reqID, pending.ErrCanceled)
+
+	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: req.bucket, Key: req.key, Method: r.Method, Operation: req.operation, Range: req.rangeHeader, List: req.list, Server: req.server, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
+	subject, err := s.ticketSubject(req.server)
+	if err != nil {
+		s.registry.Cancel(reqID, err)
+		writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
+		return
+	}
+	publishCtx, cancelPublish := context.WithDeadline(r.Context(), deadline)
+	err = s.publisher.PublishTicketTo(publishCtx, subject, ticket)
+	cancelPublish()
+	if err != nil {
+		s.logger.Warn("ticket publish failed", "request_id", reqID, "error", safeLogError(err))
+		writeS3Error(w, r, s3HTTPError{status: http.StatusServiceUnavailable, code: "ServiceUnavailable", message: "Backend unavailable"})
+		return
+	}
+
+	waitCtx, cancelWait := context.WithDeadline(r.Context(), deadline)
+	defer cancelWait()
+	if err := sink.Wait(waitCtx); err != nil {
+		s.registry.Cancel(reqID, err)
+		if errors.Is(err, context.Canceled) {
+			s.logger.Info("s3 request canceled", "request_id", reqID)
+			return
+		}
+		if sink.Started() {
+			s.logger.Warn("s3 response stream failed", "request_id", reqID, "error", safeLogError(err))
+			return
+		}
+		writeS3Error(w, r, s3ErrorForWait(err))
+		return
+	}
+}
+
+func (s *edgeServer) resolveS3Request(r *http.Request) (s3EdgeRequest, error) {
+	if _, err := s3api.VerifySigV4(r, s3api.VerifyOptions{
+		Credentials: s3api.Credentials{AccessKeyID: s.cfg.S3API.AccessKeyID, SecretAccessKey: s.cfg.S3API.SecretAccessKey},
+		Region:      s.cfg.S3API.Region,
+		Now:         s.now,
+	}); err != nil {
+		return s3EdgeRequest{}, s3ErrorForAuth(err)
+	}
+
+	mapping, err := s3api.Classify(r, s3api.ClassifyOptions{
+		Mode:                   edgeS3APIMode(s.cfg),
+		DefaultBucketForServer: s.cfg.DefaultBucketForServer,
+		ValidateBucket:         tickets.ValidateBucket,
+		ValidateServer:         publicpath.ValidateAlias,
+	})
+	if err != nil {
+		return s3EdgeRequest{}, s3ErrorForClassify(err)
+	}
+
+	req := s3EdgeRequest{server: mapping.Server, bucket: mapping.BackendBucket, key: mapping.BackendKey}
+	switch mapping.Operation {
+	case s3api.OperationGetObject:
+		req.operation = tickets.OperationGetObject
+		req.rangeHeader = strings.TrimSpace(r.Header.Get("Range"))
+		if err := validateS3ObjectRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+	case s3api.OperationHeadObject:
+		req.operation = tickets.OperationHeadObject
+		req.rangeHeader = strings.TrimSpace(r.Header.Get("Range"))
+		if err := validateS3ObjectRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+	case s3api.OperationListObjectsV2:
+		req.operation = tickets.OperationListObjectsV2
+		req.list = s3ListRequest(mapping)
+		if err := validateS3ListRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+	case s3api.OperationHeadBucket:
+		req.headBucket = true
+		if req.bucket == "" {
+			req.bucket = s3HeadBucketBackend(s.cfg, mapping)
+		}
+		if err := tickets.ValidateBucket(req.bucket); err != nil {
+			return s3EdgeRequest{}, s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+		}
+	default:
+		return s3EdgeRequest{}, s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	return req, nil
+}
+
+func s3HeadBucketBackend(cfg config.EdgeConfig, mapping s3api.RequestMapping) string {
+	if mapping.BackendBucket != "" {
+		return mapping.BackendBucket
+	}
+	if bucket, ok := cfg.DefaultBucketForServer(mapping.Server); ok {
+		return bucket
+	}
+	return mapping.S3Bucket
+}
+
+func s3ListRequest(mapping s3api.RequestMapping) *tickets.ListRequest {
+	return &tickets.ListRequest{
+		Prefix:            mapping.List.BackendPrefix,
+		Delimiter:         mapping.List.Delimiter,
+		ContinuationToken: mapping.List.ContinuationToken,
+		StartAfter:        mapping.List.StartAfter,
+		MaxKeys:           mapping.List.MaxKeys,
+		EncodingType:      mapping.List.EncodingType,
+		FetchOwner:        mapping.List.FetchOwner,
+		Rewrite: tickets.ListRewrite{
+			Bucket:    mapping.S3Bucket,
+			Prefix:    mapping.List.Prefix,
+			KeyPrefix: strings.TrimSuffix(mapping.List.PublicKeyPrefix, "/"),
+		},
+	}
+}
+
+func validateS3ObjectRequest(req s3EdgeRequest) error {
+	if err := tickets.ValidateBucket(req.bucket); err != nil {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	if err := tickets.ValidateKey(req.key); err != nil {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	if err := tickets.ValidateByteRange(req.rangeHeader); err != nil {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRange", message: "Invalid range"}
+	}
+	return nil
+}
+
+func validateS3ListRequest(req s3EdgeRequest) error {
+	if err := tickets.ValidateBucket(req.bucket); err != nil {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	if err := tickets.ValidateListRequest(req.list); err != nil {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	return nil
+}
+
+func (s *edgeServer) serveS3HeadBucket(w http.ResponseWriter, r *http.Request, req s3EdgeRequest) {
+	allowlist := s.cfg.AllowedBuckets
+	if _, ok := s.directFetcherFor(req.server); ok {
+		directCfg, exists := s.cfg.DirectServers[req.server]
+		if !exists {
+			writeS3Error(w, r, s3HTTPError{status: http.StatusServiceUnavailable, code: "ServiceUnavailable", message: "Backend unavailable"})
+			return
+		}
+		allowlist = directCfg.AllowedBuckets
+	}
+	if !bucketAllowed(req.bucket, allowlist) {
+		writeS3Error(w, r, s3HTTPError{status: http.StatusForbidden, code: "AccessDenied", message: "Access denied"})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *edgeServer) serveS3Direct(w http.ResponseWriter, r *http.Request, req s3EdgeRequest, fetcher objectFetcher) {
+	directCfg, ok := s.cfg.DirectServers[req.server]
+	if !ok || fetcher == nil {
+		writeS3Error(w, r, s3HTTPError{status: http.StatusServiceUnavailable, code: "ServiceUnavailable", message: "Backend unavailable"})
+		return
+	}
+	if !bucketAllowed(req.bucket, directCfg.AllowedBuckets) {
+		writeS3Error(w, r, s3HTTPError{status: http.StatusForbidden, code: "AccessDenied", message: "Access denied"})
+		return
+	}
+
+	fetched, err := fetcher.Fetch(r.Context(), s3fetch.Request{Method: r.Method, Operation: req.operation, Bucket: req.bucket, Key: req.key, Range: req.rangeHeader, List: req.list})
+	if err != nil {
+		s.writeS3DirectFetchError(w, r, req.server, err)
+		return
+	}
+	if fetched == nil {
+		s.logger.Warn("direct fetch returned nil object", "server", req.server)
+		writeS3Error(w, r, s3HTTPError{status: http.StatusServiceUnavailable, code: "ServiceUnavailable", message: "Backend unavailable"})
+		return
+	}
+	if fetched.Body != nil {
+		defer fetched.Body.Close()
+	}
+
+	metadata := directMetadata(fetched)
+	copyPublicMetadata(w.Header(), metadata)
+	w.WriteHeader(publicStatusCode(metadata))
+	if r.Method == http.MethodHead || fetched.Body == nil {
+		return
+	}
+	if _, err := io.Copy(w, fetched.Body); err != nil {
+		s.logger.Warn("direct response stream failed", "server", req.server, "error", safeLogError(err))
+	}
+}
+
+func (s *edgeServer) writeS3DirectFetchError(w http.ResponseWriter, r *http.Request, server string, err error) {
+	switch {
+	case errors.Is(err, s3fetch.ErrNotFound):
+		writeS3Error(w, r, s3HTTPError{status: http.StatusNotFound, code: "NoSuchKey", message: "Not found"})
+	case errors.Is(err, s3fetch.ErrInvalidRequest):
+		writeS3Error(w, r, s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"})
+	default:
+		s.logger.Warn("direct fetch failed", "server", server, "error", safeLogError(err))
+		writeS3Error(w, r, s3HTTPError{status: http.StatusServiceUnavailable, code: "ServiceUnavailable", message: "Backend unavailable"})
+	}
+}
+
+type s3HTTPError struct {
+	status  int
+	code    string
+	message string
+}
+
+func (e s3HTTPError) Error() string {
+	return e.code
+}
+
+func writeS3Error(w http.ResponseWriter, r *http.Request, err error) {
+	s3err := s3ErrorFor(err)
+	if s3err.status == http.StatusMethodNotAllowed {
+		w.Header().Set("Allow", "GET, HEAD")
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(s3err.status)
+	if r != nil && r.Method == http.MethodHead {
+		return
+	}
+	body, renderErr := s3api.RenderErrorXML(s3api.ErrorResponse{Code: s3err.code, Message: s3err.message})
+	if renderErr != nil {
+		return
+	}
+	_, _ = w.Write(body)
+}
+
+func s3ErrorFor(err error) s3HTTPError {
+	var s3err s3HTTPError
+	if errors.As(err, &s3err) {
+		return s3err
+	}
+	return s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Internal error"}
+}
+
+func s3ErrorForAuth(err error) s3HTTPError {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "expired"):
+		return s3HTTPError{status: http.StatusForbidden, code: "AccessDenied", message: "Access denied"}
+	case strings.Contains(message, "malformed authorization"), strings.Contains(message, "missing authorization"), strings.Contains(message, "unsupported algorithm"), strings.Contains(message, "access key"):
+		return s3HTTPError{status: http.StatusForbidden, code: "AccessDenied", message: "Access denied"}
+	default:
+		return s3HTTPError{status: http.StatusForbidden, code: "SignatureDoesNotMatch", message: "Signature does not match"}
+	}
+}
+
+func s3ErrorForClassify(err error) s3HTTPError {
+	message := err.Error()
+	if strings.Contains(message, "unsupported method") {
+		return s3HTTPError{status: http.StatusMethodNotAllowed, code: "MethodNotAllowed", message: "Method not allowed"}
+	}
+	return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+}
+
+func s3ErrorForSetup(err error) s3HTTPError {
+	if errors.Is(err, pending.ErrExpired) || errors.Is(err, pending.ErrInvalidRequest) || errors.Is(err, tickets.ErrInvalidTicket) {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	return s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"}
+}
+
+func s3ErrorForWait(err error) s3HTTPError {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, pending.ErrExpired) {
+		return s3HTTPError{status: http.StatusGatewayTimeout, code: "RequestTimeout", message: "Request timeout"}
+	}
+	return s3HTTPError{status: http.StatusBadGateway, code: "BadGateway", message: "Backend response failed"}
 }
 
 type publicObject struct {

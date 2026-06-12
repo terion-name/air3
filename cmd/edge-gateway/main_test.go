@@ -3,12 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -151,6 +157,246 @@ func signedDefaultBucketSingleURL(t *testing.T, method, bucket, key string, now 
 	return signed
 }
 
+const (
+	s3TestAccessKey = "AKIDEXAMPLE"
+	s3TestSecretKey = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+	s3TestRegion    = "us-east-1"
+	s3TestHost      = "files.example"
+)
+
+var (
+	s3TestSignedAt = time.Date(2026, 6, 12, 10, 30, 45, 0, time.UTC)
+	s3TestNow      = s3TestSignedAt.Add(5 * time.Minute)
+)
+
+type s3TestRawParam struct {
+	key   string
+	value string
+}
+
+func testS3Edge(pub *fakePublisher, cfg config.EdgeConfig, fetchers map[string]objectFetcher) (*edgeServer, *pending.Registry) {
+	reg := pending.NewRegistry(pending.Options{Now: func() time.Time { return s3TestNow }})
+	cfg.IngestURL = "https://edge.internal/_ingest"
+	cfg.S3API = config.S3APIConfig{Enabled: true, Region: s3TestRegion, AccessKeyID: s3TestAccessKey, SecretAccessKey: s3TestSecretKey}
+	cfg.NATS.Subject = "air3.tickets"
+	if cfg.NATS.SubjectTemplate == "" {
+		cfg.NATS.SubjectTemplate = "air3.{server}"
+	}
+	if cfg.Timeouts.PendingRequestTTL == 0 {
+		cfg.Timeouts.PendingRequestTTL = time.Second
+	}
+	edge := newEdgeServer(cfg, reg, pub, nil, fetchers)
+	tokens := []string{"req-s3", "ingest-s3-token"}
+	edge.newToken = func() (string, error) {
+		v := tokens[0]
+		tokens = tokens[1:]
+		return v, nil
+	}
+	edge.now = func() time.Time { return s3TestNow }
+	return edge, reg
+}
+
+func s3SignHeaderRequest(t *testing.T, method, target string, headers map[string]string) *http.Request {
+	t.Helper()
+	r := s3NewRequest(t, method, target)
+	r.Header.Set("x-amz-date", s3TestSignedAt.Format("20060102T150405Z"))
+	for key, value := range headers {
+		r.Header.Set(key, value)
+	}
+	signedHeaders := []string{"host", "x-amz-date"}
+	if r.Header.Get("x-amz-content-sha256") != "" {
+		signedHeaders = []string{"host", "x-amz-content-sha256", "x-amz-date"}
+	}
+	payloadHash := s3HeaderPayloadHash(r, signedHeaders)
+	canonicalRequest := s3CanonicalRequest(r, signedHeaders, payloadHash, false)
+	date := s3TestSignedAt.Format("20060102")
+	scope := s3CredentialScope(date, s3TestRegion)
+	stringToSign := s3StringToSign(s3TestSignedAt.Format("20060102T150405Z"), scope, canonicalRequest)
+	signature := s3Signature(s3TestSecretKey, date, s3TestRegion, stringToSign)
+	r.Header.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s", s3TestAccessKey, scope, strings.Join(signedHeaders, ";"), signature))
+	return r
+}
+
+func s3SignPresignedRequest(t *testing.T, method, target string, extra []s3TestRawParam) *http.Request {
+	t.Helper()
+	r := s3NewRequest(t, method, target)
+	date := s3TestSignedAt.Format("20060102")
+	scope := s3CredentialScope(date, s3TestRegion)
+	params := []s3TestRawParam{
+		{key: "X-Amz-Algorithm", value: "AWS4-HMAC-SHA256"},
+		{key: "X-Amz-Credential", value: s3TestAccessKey + "/" + scope},
+		{key: "X-Amz-Date", value: s3TestSignedAt.Format("20060102T150405Z")},
+		{key: "X-Amz-Expires", value: "900"},
+		{key: "X-Amz-SignedHeaders", value: "host"},
+	}
+	params = append(params, extra...)
+	r.URL.RawQuery = s3RawQuery(params)
+	canonicalRequest := s3CanonicalRequest(r, []string{"host"}, "UNSIGNED-PAYLOAD", true)
+	stringToSign := s3StringToSign(s3TestSignedAt.Format("20060102T150405Z"), scope, canonicalRequest)
+	signature := s3Signature(s3TestSecretKey, date, s3TestRegion, stringToSign)
+	r.URL.RawQuery += "&X-Amz-Signature=" + signature
+	return r
+}
+
+func s3NewRequest(t *testing.T, method, target string) *http.Request {
+	t.Helper()
+	u, err := url.Parse("https://" + s3TestHost + target)
+	if err != nil {
+		t.Fatalf("parse URL: %v", err)
+	}
+	r := httptest.NewRequest(method, u.String(), nil)
+	r.URL = u
+	r.Host = s3TestHost
+	return r
+}
+
+func s3HeaderPayloadHash(r *http.Request, signedHeaders []string) string {
+	for _, header := range signedHeaders {
+		if header == "x-amz-content-sha256" {
+			return r.Header.Get("x-amz-content-sha256")
+		}
+	}
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	}
+	return "UNSIGNED-PAYLOAD"
+}
+
+func s3CanonicalRequest(r *http.Request, signedHeaders []string, payloadHash string, presigned bool) string {
+	return strings.Join([]string{
+		strings.ToUpper(r.Method),
+		s3CanonicalURI(r.URL.EscapedPath()),
+		s3CanonicalQuery(r.URL.RawQuery, presigned),
+		s3CanonicalHeaders(r, signedHeaders),
+		strings.Join(signedHeaders, ";"),
+		payloadHash,
+	}, "\n")
+}
+
+func s3CanonicalHeaders(r *http.Request, signedHeaders []string) string {
+	var b strings.Builder
+	for _, name := range signedHeaders {
+		value := r.Header.Get(name)
+		if name == "host" {
+			value = r.Host
+		}
+		b.WriteString(name)
+		b.WriteByte(':')
+		b.WriteString(s3NormalizeHeaderValue(value))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func s3CanonicalQuery(rawQuery string, presigned bool) string {
+	if rawQuery == "" {
+		return ""
+	}
+	type pair struct{ key, value string }
+	pairs := []pair{}
+	for _, part := range strings.Split(rawQuery, "&") {
+		key, value, _ := strings.Cut(part, "=")
+		if presigned {
+			decodedKey, err := url.QueryUnescape(key)
+			if err == nil && decodedKey == "X-Amz-Signature" {
+				continue
+			}
+		}
+		pairs = append(pairs, pair{key: s3URIEncode(key, false), value: s3URIEncode(value, false)})
+	}
+	sort.SliceStable(pairs, func(i, j int) bool {
+		if pairs[i].key == pairs[j].key {
+			return pairs[i].value < pairs[j].value
+		}
+		return pairs[i].key < pairs[j].key
+	})
+	parts := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		parts = append(parts, pair.key+"="+pair.value)
+	}
+	return strings.Join(parts, "&")
+}
+
+func s3StringToSign(amzDate, scope, canonicalRequest string) string {
+	sum := sha256.Sum256([]byte(canonicalRequest))
+	return strings.Join([]string{"AWS4-HMAC-SHA256", amzDate, scope, hex.EncodeToString(sum[:])}, "\n")
+}
+
+func s3CredentialScope(date, region string) string {
+	return date + "/" + region + "/s3/aws4_request"
+}
+
+func s3Signature(secret, date, region, stringToSign string) string {
+	dateKey := s3HMAC([]byte("AWS4"+secret), []byte(date))
+	regionKey := s3HMAC(dateKey, []byte(region))
+	serviceKey := s3HMAC(regionKey, []byte("s3"))
+	signingKey := s3HMAC(serviceKey, []byte("aws4_request"))
+	return hex.EncodeToString(s3HMAC(signingKey, []byte(stringToSign)))
+}
+
+func s3HMAC(key []byte, data []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(data)
+	return mac.Sum(nil)
+}
+
+func s3RawQuery(params []s3TestRawParam) string {
+	parts := make([]string, 0, len(params))
+	for _, param := range params {
+		parts = append(parts, s3URIEncode(param.key, false)+"="+s3URIEncode(param.value, false))
+	}
+	return strings.Join(parts, "&")
+}
+
+func s3CanonicalURI(path string) string {
+	if path == "" {
+		path = "/"
+	}
+	return s3URIEncode(path, true)
+}
+
+func s3URIEncode(value string, allowSlash bool) string {
+	var b strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c == '%' && i+2 < len(value) && isS3Hex(value[i+1]) && isS3Hex(value[i+2]) {
+			b.WriteByte('%')
+			b.WriteByte(s3UpperHex(value[i+1]))
+			b.WriteByte(s3UpperHex(value[i+2]))
+			i += 2
+			continue
+		}
+		if isS3Unreserved(c) || c == '/' && allowSlash {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte("0123456789ABCDEF"[c>>4])
+		b.WriteByte("0123456789ABCDEF"[c&0x0f])
+	}
+	return b.String()
+}
+
+func s3NormalizeHeaderValue(value string) string {
+	value = strings.TrimSpace(value)
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func isS3Unreserved(c byte) bool {
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '.' || c == '_' || c == '~'
+}
+
+func isS3Hex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func s3UpperHex(c byte) byte {
+	if c >= 'a' && c <= 'f' {
+		return c - 'a' + 'A'
+	}
+	return c
+}
+
 func testMultiEdge(pub *fakePublisher, cfg config.EdgeConfig, fetchers map[string]objectFetcher) (*edgeServer, *pending.Registry) {
 	reg := pending.NewRegistry(pending.Options{})
 	cfg.IngestURL = "https://edge.internal/_ingest"
@@ -169,6 +415,322 @@ func testMultiEdge(pub *fakePublisher, cfg config.EdgeConfig, fetchers map[strin
 		return v, nil
 	}
 	return edge, reg
+}
+
+func TestS3APIDisabledPreservesAir3PathForSigV4ShapedRequest(t *testing.T) {
+	pub := &fakePublisher{err: errors.New("stop after publish")}
+	edge, _ := testEdge(pub, time.Second)
+	req := s3SignPresignedRequest(t, http.MethodGet, "/demo-bucket/file.txt", nil)
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	if published[0].Bucket != "demo-bucket" || published[0].Key != "file.txt" || published[0].Operation != "" {
+		t.Fatalf("ticket = %#v, want legacy Air3 object ticket", published[0])
+	}
+}
+
+func TestS3APIPresignedGETPublishesObjectTicketWithoutAuthMaterial(t *testing.T) {
+	pub := &fakePublisher{err: errors.New("stop after publish")}
+	edge, _ := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}}, nil)
+	req := s3SignPresignedRequest(t, http.MethodGet, "/demo-bucket/photos/cat.jpg", nil)
+	req.Header.Set("Range", "bytes=0-9")
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	ticket := published[0]
+	if ticket.Bucket != "demo-bucket" || ticket.Key != "photos/cat.jpg" || ticket.Operation != tickets.OperationGetObject || ticket.Range != "bytes=0-9" || ticket.List != nil {
+		t.Fatalf("ticket = %#v, want GetObject demo-bucket/photos/cat.jpg with range and no list", ticket)
+	}
+	encoded, err := tickets.Marshal(ticket, s3TestNow)
+	if err != nil {
+		t.Fatalf("Marshal(ticket) error = %v", err)
+	}
+	for _, secret := range []string{"Authorization", "X-Amz", s3TestAccessKey, s3TestSecretKey, "Signature"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("ticket leaked auth material %q in %s", secret, encoded)
+		}
+	}
+}
+
+func TestS3APIHeaderHEADPublishesObjectTicketAndSuppressesBody(t *testing.T) {
+	pub := &fakePublisher{err: errors.New("stop after publish")}
+	edge, _ := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}}, nil)
+	req := s3SignHeaderRequest(t, http.MethodHead, "/demo-bucket/photos/cat.jpg", nil)
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	if published[0].Operation != tickets.OperationHeadObject || published[0].Bucket != "demo-bucket" || published[0].Key != "photos/cat.jpg" {
+		t.Fatalf("ticket = %#v, want HeadObject demo-bucket/photos/cat.jpg", published[0])
+	}
+	if resp.Body.Len() != 0 {
+		t.Fatalf("HEAD response body = %q, want empty", resp.Body.String())
+	}
+}
+
+func TestS3APIAuthAndClassificationFailuresHaveXMLNoSideEffects(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config.EdgeConfig
+		req  func(t *testing.T) *http.Request
+		code string
+	}{
+		{
+			name: "invalid signature",
+			cfg:  config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}},
+			req: func(t *testing.T) *http.Request {
+				r := s3SignPresignedRequest(t, http.MethodGet, "/demo-bucket/file.txt", nil)
+				r.URL.RawQuery = strings.TrimSuffix(r.URL.RawQuery, "0") + "1"
+				return r
+			},
+			code: "SignatureDoesNotMatch",
+		},
+		{
+			name: "malformed list query",
+			cfg:  config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}},
+			req: func(t *testing.T) *http.Request {
+				return s3SignPresignedRequest(t, http.MethodGet, "/demo-bucket", []s3TestRawParam{{key: "list-type", value: "2"}, {key: "max-keys", value: "abc"}})
+			},
+			code: "InvalidRequest",
+		},
+		{
+			name: "single default short object path",
+			cfg:  config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}, DefaultBucket: "demo-bucket"},
+			req: func(t *testing.T) *http.Request {
+				return s3SignPresignedRequest(t, http.MethodGet, "/lonely-key", nil)
+			},
+			code: "InvalidRequest",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &fakePublisher{}
+			edge, reg := testS3Edge(pub, tt.cfg, nil)
+			edge.newToken = func() (string, error) { t.Fatal("failure allocated a connector token"); return "", nil }
+
+			resp := httptest.NewRecorder()
+			edge.ServeHTTP(resp, tt.req(t))
+
+			if got := resp.Result().Header.Get("Content-Type"); got != "application/xml" {
+				t.Fatalf("Content-Type = %q, want application/xml", got)
+			}
+			if !strings.Contains(resp.Body.String(), "<Code>"+tt.code+"</Code>") {
+				t.Fatalf("body = %q, want S3 code %s", resp.Body.String(), tt.code)
+			}
+			if pub.count() != 0 {
+				t.Fatalf("published %d tickets, want 0", pub.count())
+			}
+			if _, err := reg.StartIngest("req-s3", "ingest-s3-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+				t.Fatalf("registered pending request: %v", err)
+			}
+		})
+	}
+}
+
+func TestS3APIUnsupportedWriteMethodReturnsXMLMethodNotAllowed(t *testing.T) {
+	pub := &fakePublisher{}
+	edge, _ := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}}, nil)
+	edge.newToken = func() (string, error) { t.Fatal("unsupported method allocated a connector token"); return "", nil }
+	req := s3SignHeaderRequest(t, http.MethodPut, "/demo-bucket/file.txt", map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	if got := resp.Result().StatusCode; got != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d; body=%q", got, http.StatusMethodNotAllowed, resp.Body.String())
+	}
+	if got := resp.Result().Header.Get("Allow"); got != "GET, HEAD" {
+		t.Fatalf("Allow = %q, want GET, HEAD", got)
+	}
+	if !strings.Contains(resp.Body.String(), "<Code>MethodNotAllowed</Code>") {
+		t.Fatalf("body = %q, want MethodNotAllowed XML", resp.Body.String())
+	}
+	if pub.count() != 0 {
+		t.Fatalf("published %d tickets, want 0", pub.count())
+	}
+}
+
+func TestS3APISingleServerListPublishesTicket(t *testing.T) {
+	pub := &fakePublisher{err: errors.New("stop after publish")}
+	edge, _ := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}}, nil)
+	req := s3SignPresignedRequest(t, http.MethodGet, "/demo-bucket", []s3TestRawParam{{key: "list-type", value: "2"}, {key: "prefix", value: "photos"}, {key: "delimiter", value: "/"}, {key: "max-keys", value: "10"}, {key: "start-after", value: "old"}, {key: "continuation-token", value: "token"}, {key: "encoding-type", value: "url"}, {key: "fetch-owner", value: "true"}})
+	req.Header.Set("Range", "bytes=0-9")
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	ticket := published[0]
+	if ticket.Operation != tickets.OperationListObjectsV2 || ticket.Key != "" || ticket.Range != "" || ticket.List == nil {
+		t.Fatalf("ticket = %#v, want ListObjectsV2 with empty key/range", ticket)
+	}
+	if ticket.List.Prefix != "photos" || ticket.List.Delimiter != "/" || ticket.List.MaxKeys != 10 || ticket.List.StartAfter != "old" || ticket.List.ContinuationToken != "token" || ticket.List.EncodingType != "url" || !ticket.List.FetchOwner {
+		t.Fatalf("list = %#v, want requested list fields", ticket.List)
+	}
+	if ticket.List.Rewrite.Bucket != "demo-bucket" || ticket.List.Rewrite.Prefix != "photos" || ticket.List.Rewrite.KeyPrefix != "" {
+		t.Fatalf("rewrite = %#v, want public bucket demo-bucket prefix photos", ticket.List.Rewrite)
+	}
+}
+
+func TestS3APISingleDefaultBucketShortObjectPathRejected(t *testing.T) {
+	pub := &fakePublisher{}
+	edge, _ := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}, DefaultBucket: "demo-bucket"}, nil)
+	edge.newToken = func() (string, error) { t.Fatal("short path allocated a connector token"); return "", nil }
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, s3SignPresignedRequest(t, http.MethodGet, "/file.txt", nil))
+
+	if got := resp.Result().StatusCode; got != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+	}
+	if pub.count() != 0 {
+		t.Fatalf("published %d tickets, want 0", pub.count())
+	}
+}
+
+func TestS3APIMultiStandardListPrefixRewrite(t *testing.T) {
+	pub := &fakePublisher{err: errors.New("stop after publish")}
+	edge, _ := testS3Edge(pub, config.EdgeConfig{MultiServer: true, AllowedBuckets: []string{"photos-bucket"}}, nil)
+	req := s3SignPresignedRequest(t, http.MethodGet, "/blue", []s3TestRawParam{{key: "list-type", value: "2"}, {key: "prefix", value: "photos-bucket/2024"}})
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	list := published[0].List
+	if published[0].Server != "blue" || published[0].Bucket != "photos-bucket" || list == nil || list.Prefix != "2024" || list.Rewrite.Bucket != "blue" || list.Rewrite.Prefix != "photos-bucket/2024" || list.Rewrite.KeyPrefix != "photos-bucket" {
+		t.Fatalf("ticket = %#v, want rewritten multi-standard list", published[0])
+	}
+}
+
+func TestS3APIMultiStandardListMissingBackendBucketPrefixRejected(t *testing.T) {
+	pub := &fakePublisher{}
+	edge, _ := testS3Edge(pub, config.EdgeConfig{MultiServer: true, AllowedBuckets: []string{"photos-bucket"}}, nil)
+	edge.newToken = func() (string, error) { t.Fatal("bad list allocated a connector token"); return "", nil }
+	req := s3SignPresignedRequest(t, http.MethodGet, "/blue", []s3TestRawParam{{key: "list-type", value: "2"}})
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	if got := resp.Result().StatusCode; got != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+	}
+	if pub.count() != 0 {
+		t.Fatalf("published %d tickets, want 0", pub.count())
+	}
+}
+
+func TestS3APIMultiDefaultListMapsToConfiguredBackendBucket(t *testing.T) {
+	pub := &fakePublisher{err: errors.New("stop after publish")}
+	edge, _ := testS3Edge(pub, config.EdgeConfig{MultiServer: true, AllowedBuckets: []string{"default-bucket"}, ServerDefaultBuckets: map[string]string{"BLUE": "default-bucket"}}, nil)
+	req := s3SignPresignedRequest(t, http.MethodGet, "/blue", []s3TestRawParam{{key: "list-type", value: "2"}, {key: "prefix", value: "2024"}})
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	published := pub.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("published tickets = %#v, want one", published)
+	}
+	list := published[0].List
+	if published[0].Bucket != "default-bucket" || list == nil || list.Prefix != "2024" || list.Rewrite.Bucket != "blue" || list.Rewrite.Prefix != "2024" || list.Rewrite.KeyPrefix != "" {
+		t.Fatalf("ticket = %#v, want multi-default list mapped to default-bucket", published[0])
+	}
+}
+
+func TestS3APIDirectAliasListBypassesNATSAndStreamsXML(t *testing.T) {
+	pub := &fakePublisher{}
+	fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, ContentType: "application/xml", ContentLength: 41, Body: io.NopCloser(strings.NewReader("<ListBucketResult></ListBucketResult>"))}}
+	edge, reg := testS3Edge(pub, config.EdgeConfig{
+		MultiServer:           true,
+		AllowedBuckets:        []string{"other-bucket"},
+		ServerDefaultBuckets:  map[string]string{"BLUE": "default-bucket"},
+		DirectServers:         map[string]config.S3Config{"blue": {AllowedBuckets: []string{"default-bucket"}}},
+		StreamCopyBufferBytes: 1024,
+	}, map[string]objectFetcher{"blue": fetcher})
+	edge.newToken = func() (string, error) { t.Fatal("direct list allocated a connector token"); return "", nil }
+	req := s3SignPresignedRequest(t, http.MethodGet, "/blue", []s3TestRawParam{{key: "list-type", value: "2"}, {key: "prefix", value: "2024"}})
+
+	resp := httptest.NewRecorder()
+	edge.ServeHTTP(resp, req)
+
+	if got := resp.Result().StatusCode; got != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", got, http.StatusOK, resp.Body.String())
+	}
+	if resp.Body.String() != "<ListBucketResult></ListBucketResult>" {
+		t.Fatalf("body = %q, want direct XML", resp.Body.String())
+	}
+	requests := fetcher.snapshot()
+	if len(requests) != 1 {
+		t.Fatalf("fetch requests = %#v, want one", requests)
+	}
+	if requests[0].Operation != tickets.OperationListObjectsV2 || requests[0].Bucket != "default-bucket" || requests[0].Key != "" || requests[0].Range != "" || requests[0].List == nil || requests[0].List.Prefix != "2024" {
+		t.Fatalf("fetch request = %#v, want direct ListObjectsV2 for default-bucket prefix 2024", requests[0])
+	}
+	if pub.count() != 0 {
+		t.Fatalf("published %d tickets, want 0", pub.count())
+	}
+	if _, err := reg.StartIngest("req-s3", "ingest-s3-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+		t.Fatalf("direct list registered pending request: %v", err)
+	}
+}
+
+func TestS3APIHeadBucketIsEdgeOnly(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		allowlist  []string
+		wantStatus int
+	}{
+		{name: "success", allowlist: []string{"demo-bucket"}, wantStatus: http.StatusOK},
+		{name: "failure", allowlist: []string{"other-bucket"}, wantStatus: http.StatusForbidden},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &fakePublisher{}
+			fetcher := &fakeFetcher{object: &s3fetch.Object{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("unused"))}}
+			edge, reg := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: tt.allowlist}, map[string]objectFetcher{"unused": fetcher})
+			edge.newToken = func() (string, error) { t.Fatal("HeadBucket allocated a connector token"); return "", nil }
+			req := s3SignHeaderRequest(t, http.MethodHead, "/demo-bucket", nil)
+
+			resp := httptest.NewRecorder()
+			edge.ServeHTTP(resp, req)
+
+			if got := resp.Result().StatusCode; got != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", got, tt.wantStatus)
+			}
+			if resp.Body.Len() != 0 {
+				t.Fatalf("HeadBucket body = %q, want empty", resp.Body.String())
+			}
+			if pub.count() != 0 {
+				t.Fatalf("published %d tickets, want 0", pub.count())
+			}
+			if got := len(fetcher.snapshot()); got != 0 {
+				t.Fatalf("fetch calls = %d, want 0", got)
+			}
+			if _, err := reg.StartIngest("req-s3", "ingest-s3-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+				t.Fatalf("HeadBucket registered pending request: %v", err)
+			}
+		})
+	}
 }
 
 func TestTCPIngestListenerDisabledForHTTPTransports(t *testing.T) {
