@@ -38,6 +38,9 @@ func TestLoadEdgeDefaultsWithDisabledSigning(t *testing.T) {
 	if cfg.NATS.Subject != "air3.tickets" || cfg.NATS.SubjectTemplate != "air3.{server}" {
 		t.Fatalf("NATS subject defaults = %q/%q, want air3.tickets/air3.{server}", cfg.NATS.Subject, cfg.NATS.SubjectTemplate)
 	}
+	if cfg.S3API.Enabled || cfg.S3API.Region != "us-east-1" || cfg.S3API.AccessKeyID != "" || cfg.S3API.SecretAccessKey != "" {
+		t.Fatalf("S3API defaults = %#v, want disabled us-east-1 with no credentials", cfg.S3API)
+	}
 }
 
 func TestLoadEdgeParsesSingleServerDefaultBucket(t *testing.T) {
@@ -63,6 +66,103 @@ func TestLoadEdgeParsesSingleServerDefaultBucket(t *testing.T) {
 func TestLoadEdgeRequiresSigningSecretWhenEnabled(t *testing.T) {
 	if _, err := LoadEdge(testOptions(nil, nil)); err == nil || !strings.Contains(err.Error(), "signing secret") {
 		t.Fatalf("LoadEdge() error = %v, want signing secret error", err)
+	}
+}
+
+func TestLoadEdgeParsesS3APIConfig(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED":         "true",
+		"AIR3_S3_API_ENABLED":           "true",
+		"AIR3_S3_API_REGION":            "us-west-2",
+		"AIR3_S3_API_ACCESS_KEY_ID":     "api-access",
+		"AIR3_S3_API_SECRET_ACCESS_KEY": "api-secret",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if !cfg.S3API.Enabled || cfg.S3API.Region != "us-west-2" || cfg.S3API.AccessKeyID != "api-access" || cfg.S3API.SecretAccessKey != "api-secret" {
+		t.Fatalf("S3API config = %#v", cfg.S3API)
+	}
+}
+
+func TestLoadEdgeParsesS3APIConfigDefaultRegion(t *testing.T) {
+	env := map[string]string{
+		"AIR3_SIGNING_DISABLED":         "true",
+		"AIR3_S3_API_ENABLED":           "true",
+		"AIR3_S3_API_ACCESS_KEY_ID":     "api-access",
+		"AIR3_S3_API_SECRET_ACCESS_KEY": "api-secret",
+	}
+	cfg, err := LoadEdge(testOptions(env, nil))
+	if err != nil {
+		t.Fatalf("LoadEdge() error = %v", err)
+	}
+	if cfg.S3API.Region != "us-east-1" {
+		t.Fatalf("S3API region = %q, want us-east-1", cfg.S3API.Region)
+	}
+}
+
+func TestLoadEdgeRejectsS3APIConfigErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "invalid enabled boolean",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED": "true",
+				"AIR3_S3_API_ENABLED":   "sometimes",
+			},
+			want: "AIR3_S3_API_ENABLED must be a boolean",
+		},
+		{
+			name: "empty region",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED":         "true",
+				"AIR3_S3_API_ENABLED":           "true",
+				"AIR3_S3_API_REGION":            " ",
+				"AIR3_S3_API_ACCESS_KEY_ID":     "api-access",
+				"AIR3_S3_API_SECRET_ACCESS_KEY": "api-secret",
+			},
+			want: "AIR3_S3_API_REGION",
+		},
+		{
+			name: "missing access key",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED":         "true",
+				"AIR3_S3_API_ENABLED":           "true",
+				"AIR3_S3_API_SECRET_ACCESS_KEY": "api-secret",
+			},
+			want: "AIR3_S3_API_ACCESS_KEY_ID",
+		},
+		{
+			name: "empty access key",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED":         "true",
+				"AIR3_S3_API_ENABLED":           "true",
+				"AIR3_S3_API_ACCESS_KEY_ID":     " ",
+				"AIR3_S3_API_SECRET_ACCESS_KEY": "api-secret",
+			},
+			want: "AIR3_S3_API_ACCESS_KEY_ID",
+		},
+		{
+			name: "missing secret key",
+			env: map[string]string{
+				"AIR3_SIGNING_DISABLED":     "true",
+				"AIR3_S3_API_ENABLED":       "true",
+				"AIR3_S3_API_ACCESS_KEY_ID": "api-access",
+			},
+			want: "AIR3_S3_API_SECRET_ACCESS_KEY",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadEdge(testOptions(tc.env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadEdge() error = %v, want containing %q", err, tc.want)
+			}
+		})
 	}
 }
 

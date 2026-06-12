@@ -81,6 +81,7 @@ type EdgeConfig struct {
 	DirectServers              map[string]S3Config
 	ServerDefaultBuckets       map[string]string
 	NATS                       NATSConfig
+	S3API                      S3APIConfig
 	Signing                    SigningConfig
 	MTLS                       MTLSPaths
 	Timeouts                   TimeoutConfig
@@ -134,6 +135,13 @@ type S3Config struct {
 	SecretAccessKey    string
 	UsePathStyle       bool
 	InsecureSkipVerify bool
+}
+
+type S3APIConfig struct {
+	Enabled         bool
+	Region          string
+	AccessKeyID     string
+	SecretAccessKey string
 }
 
 type SigningConfig struct {
@@ -211,6 +219,10 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 		return EdgeConfig{}, err
 	}
 	cfg.NATS, err = loadNATS(env, true, "")
+	if err != nil {
+		return EdgeConfig{}, err
+	}
+	cfg.S3API, err = loadS3API(env)
 	if err != nil {
 		return EdgeConfig{}, err
 	}
@@ -646,6 +658,29 @@ func loadS3(env envReader) (S3Config, error) {
 	}
 	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
 		return S3Config{}, errors.New("connector s3 access key id and secret access key are required")
+	}
+	return cfg, nil
+}
+
+func loadS3API(env envReader) (S3APIConfig, error) {
+	enabled, err := env.bool("AIR3_S3_API_ENABLED", false)
+	if err != nil {
+		return S3APIConfig{}, err
+	}
+	cfg := S3APIConfig{
+		Enabled:         enabled,
+		Region:          env.get("AIR3_S3_API_REGION", "us-east-1"),
+		AccessKeyID:     env.get("AIR3_S3_API_ACCESS_KEY_ID", ""),
+		SecretAccessKey: env.get("AIR3_S3_API_SECRET_ACCESS_KEY", ""),
+	}
+	if !cfg.Enabled {
+		return cfg, nil
+	}
+	if cfg.Region == "" {
+		return S3APIConfig{}, errors.New("AIR3_S3_API_REGION is required when AIR3_S3_API_ENABLED=true")
+	}
+	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
+		return S3APIConfig{}, errors.New("AIR3_S3_API_ACCESS_KEY_ID and AIR3_S3_API_SECRET_ACCESS_KEY are required when AIR3_S3_API_ENABLED=true")
 	}
 	return cfg, nil
 }
