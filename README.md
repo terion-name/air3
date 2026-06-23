@@ -343,14 +343,15 @@ If you need to serve partial files (like for streaming video), `air3` fully supp
 
 If you're using signed URLs and expect clients to send `Range` headers, you must include the exact range claim when generating the URL (e.g., `cmd/signurl -range 'bytes=0-99'`). The Connector forwards authorized ranges to S3, seamlessly returning a `206 Partial Content` response to the client.
 
-## Optional: Read-Only S3-Compatible API
+## Optional: S3-Compatible API
 
-While air3 primarily relies on its highly-secure HMAC signed URLs, you can optionally enable a **read-only S3-compatible API** (`AIR3_S3_API_ENABLED=true`). This is extremely useful if your clients or internal tools already use standard S3 SDKs (like `aws-cli` or `boto3`) and you want them to fetch files without modifying their code.
+While air3 primarily relies on its highly-secure HMAC signed URLs, you can optionally enable a **path-style S3-compatible API** (`AIR3_S3_API_ENABLED=true`). It is read-only by default and is useful if your clients or internal tools already use standard S3 SDKs (like `aws-cli` or `boto3`) and you want them to fetch files without modifying their code.
 
 ### Security First
 
 - **No Real S3 Credentials at the Edge:** You must define a *brand new, gateway-only* set of credentials (`AIR3_S3_API_ACCESS_KEY_ID` and `AIR3_S3_API_SECRET_ACCESS_KEY`). The Edge Gateway only uses these to verify incoming AWS SigV4 requests. It **does not** give the Edge access to the backend storage. These are completely separate from your real, private S3 credentials and your HMAC `AIR3_SIGNING_SECRET`.
-- **Mutations Off by Default:** The API defaults to safe read operations: `GetObject`, `HeadObject`, `ListObjectsV2`, and `HeadBucket`. S3-compatible `PUT`/`DELETE` handling must be explicitly gated with `MUTATIONS_ENABLED=true`.
+- **Supported v1 Operations:** The API supports read paths `GET`/`GetObject`, `HEAD`/`HeadObject`, `ListObjectsV2`, and `HeadBucket`, plus gated `PutObject` and `DeleteObject`.
+- **Mutations Off by Default:** S3-compatible `PUT`/`DELETE` handling must be explicitly gated with `MUTATIONS_ENABLED=true`. `PutObject` requires `Content-Length` and `x-amz-content-sha256: UNSIGNED-PAYLOAD`; multipart upload, ACLs, tagging, versioning, AWS chunked/streaming payloads, and signed-payload `PUT` requests are unsupported.
 - **Independent Edge/Connector Gates:** Routed mutations require `MUTATIONS_ENABLED=true` on both the Edge and the target Connector. Direct-server aliases bypass the Connector, so direct alias mutations require only the Edge gate. `AIR3_MUTATIONS_ENABLED` remains as a compatibility alias; if both names are non-empty, their boolean values must match.
 
 ### Using the API (Path-Style)

@@ -80,17 +80,24 @@ assert_status() {
   echo "ok: $label returned HTTP $expected"
 }
 
-assert_body() {
+assert_body_equals() {
   local label=$1
-  local url=$2
+  local expected=$2
+  local url=$3
   local body
   body=$(curl --silent --show-error --fail --cacert "$CERT_DIR/dev-ca.crt" "$url")
-  if [ "$body"$'\n' != "$EXPECTED" ] && [ "$body" != "$EXPECTED" ]; then
+  if [ "$body"$'\n' != "$expected" ] && [ "$body" != "$expected" ]; then
     echo "error: $label body did not match expected content" >&2
-    printf 'expected: %q\nactual:   %q\n' "$EXPECTED" "$body" >&2
+    printf 'expected: %q\nactual:   %q\n' "$expected" "$body" >&2
     exit 1
   fi
   echo "ok: $label returned expected content"
+}
+
+assert_body() {
+  local label=$1
+  local url=$2
+  assert_body_equals "$label" "$EXPECTED" "$url"
 }
 
 assert_head_no_body() {
@@ -162,16 +169,40 @@ aws_s3api() {
   local aws_config rc
   aws_config=$(mktemp)
   temp_files+=("$aws_config")
-  printf '[default]\ns3 =\n    addressing_style = path\n' >"$aws_config"
+  printf '[default]\ns3 =\n    addressing_style = path\n    payload_signing_enabled = false\n' >"$aws_config"
   AWS_CONFIG_FILE="$aws_config" \
     AWS_ACCESS_KEY_ID="$AIR3_S3_API_ACCESS_KEY_ID" \
     AWS_SECRET_ACCESS_KEY="$AIR3_S3_API_SECRET_ACCESS_KEY" \
     AWS_DEFAULT_REGION="${AIR3_S3_API_REGION:-us-east-1}" \
     AWS_PAGER="" \
+    AWS_REQUEST_CHECKSUM_CALCULATION="when_required" \
+    AWS_RESPONSE_CHECKSUM_VALIDATION="when_required" \
     aws --endpoint-url "$BASE_URL" --ca-bundle "$CERT_DIR/dev-ca.crt" s3api "$@"
   rc=$?
   rm -f "$aws_config"
   return "$rc"
+}
+
+mutation_gate_enabled() {
+  local primary=${MUTATIONS_ENABLED:-}
+  local alias=${AIR3_MUTATIONS_ENABLED:-}
+  if [ -n "$primary" ] && [ -n "$alias" ] && [ "$primary" != "$alias" ]; then
+    return 1
+  fi
+  if [ -n "$primary" ]; then
+    [ "$primary" = "true" ]
+    return
+  fi
+  [ "$alias" = "true" ]
+}
+
+mutation_smoke_ready() {
+  s3_api_smoke_ready || return 1
+  if ! mutation_gate_enabled; then
+    echo "skip: optional multi-server S3-compatible mutation smoke checks need MUTATIONS_ENABLED=true (or matching AIR3_MUTATIONS_ENABLED=true)"
+    return 1
+  fi
+  return 0
 }
 
 assert_s3_api_body() {
@@ -227,6 +258,39 @@ run_optional_s3_api_smoke() {
   assert_s3_api_list_contains "direct default-bucket mapping" "$DIRECT_SERVER" "$KEY" "$KEY"
 }
 
+run_optional_s3_mutation_smoke() {
+  mutation_smoke_ready || return 0
+
+  echo "Running optional multi-server S3-compatible mutation smoke checks..."
+  local mutation_key mutation_content mutation_body get_url head_url deleted_url
+  mutation_key=${AIR3_DEMO_MUTATION_KEY:-"air3-smoke-mutation-$(date +%s)-$$.txt"}
+  mutation_content=${AIR3_DEMO_MUTATION_CONTENT:-$'air3 routed mutation smoke\n'}
+  mutation_body=$(mktemp)
+  temp_files+=("$mutation_body")
+  printf '%s' "$mutation_content" >"$mutation_body"
+
+  if ! aws_s3api put-object --bucket "$BLUE_SERVER" --key "$mutation_key" --body "$mutation_body" --content-type text/plain >/dev/null; then
+    echo "error: blue routed S3 API PutObject failed" >&2
+    exit 1
+  fi
+  echo "ok: blue routed S3 API PutObject created temporary object"
+
+  get_url=$(sign_default_bucket_url GET "$BLUE_SERVER" "$mutation_key" 2m)
+  assert_body_equals "blue signed GET after routed S3 API PutObject" "$mutation_content" "$get_url"
+
+  head_url=$(sign_default_bucket_url HEAD "$BLUE_SERVER" "$mutation_key" 2m)
+  assert_head_no_body "blue signed HEAD after routed S3 API PutObject" "$head_url"
+
+  if ! aws_s3api delete-object --bucket "$BLUE_SERVER" --key "$mutation_key" >/dev/null; then
+    echo "error: blue routed S3 API DeleteObject failed" >&2
+    exit 1
+  fi
+  echo "ok: blue routed S3 API DeleteObject removed temporary object"
+
+  deleted_url=$(sign_default_bucket_url GET "$BLUE_SERVER" "$mutation_key" 2m)
+  assert_status "blue signed GET after routed S3 API DeleteObject" "404" "$deleted_url"
+}
+
 wait_for_blue() {
   echo "Waiting for edge gateway at $BASE_URL with server '$BLUE_SERVER'..."
   local url
@@ -272,6 +336,7 @@ direct_head_url=$(sign_default_bucket_url HEAD "$DIRECT_SERVER" "$KEY" 2m)
 check_optional_head "direct signed" "$direct_head_url"
 
 run_optional_s3_api_smoke
+run_optional_s3_mutation_smoke
 
 mutated_url=${blue_get_url/\/$BLUE_SERVER\//\/$GREEN_SERVER\/$BUCKET\/}
 if [ "$mutated_url" = "$blue_get_url" ]; then

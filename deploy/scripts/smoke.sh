@@ -93,16 +93,40 @@ s3_api_smoke_ready() {
 aws_s3api() {
   local aws_config rc
   aws_config=$(mktemp)
-  printf '[default]\ns3 =\n    addressing_style = path\n' >"$aws_config"
+  printf '[default]\ns3 =\n    addressing_style = path\n    payload_signing_enabled = false\n' >"$aws_config"
   AWS_CONFIG_FILE="$aws_config" \
     AWS_ACCESS_KEY_ID="$AIR3_S3_API_ACCESS_KEY_ID" \
     AWS_SECRET_ACCESS_KEY="$AIR3_S3_API_SECRET_ACCESS_KEY" \
     AWS_DEFAULT_REGION="${AIR3_S3_API_REGION:-us-east-1}" \
     AWS_PAGER="" \
+    AWS_REQUEST_CHECKSUM_CALCULATION="when_required" \
+    AWS_RESPONSE_CHECKSUM_VALIDATION="when_required" \
     aws --endpoint-url "$BASE_URL" --ca-bundle "$CERT_DIR/dev-ca.crt" s3api "$@"
   rc=$?
   rm -f "$aws_config"
   return "$rc"
+}
+
+mutation_gate_enabled() {
+  local primary=${MUTATIONS_ENABLED:-}
+  local alias=${AIR3_MUTATIONS_ENABLED:-}
+  if [ -n "$primary" ] && [ -n "$alias" ] && [ "$primary" != "$alias" ]; then
+    return 1
+  fi
+  if [ -n "$primary" ]; then
+    [ "$primary" = "true" ]
+    return
+  fi
+  [ "$alias" = "true" ]
+}
+
+mutation_smoke_ready() {
+  s3_api_smoke_ready || return 1
+  if ! mutation_gate_enabled; then
+    echo "skip: optional S3-compatible mutation smoke checks need MUTATIONS_ENABLED=true (or matching AIR3_MUTATIONS_ENABLED=true)"
+    return 1
+  fi
+  return 0
 }
 
 run_optional_s3_api_smoke() {
@@ -146,6 +170,43 @@ run_optional_s3_api_smoke() {
     exit 1
   fi
   echo "ok: S3 API ListObjectsV2 included $KEY"
+}
+
+run_optional_s3_mutation_smoke() {
+  mutation_smoke_ready || return 0
+
+  echo "Running optional S3-compatible mutation smoke checks..."
+  local mutation_key mutation_content mutation_body get_url deleted_url
+  mutation_key=${AIR3_DEMO_MUTATION_KEY:-"air3-smoke-mutation-$(date +%s)-$$.txt"}
+  mutation_content=${AIR3_DEMO_MUTATION_CONTENT:-$'air3 mutation smoke\n'}
+  mutation_body=$(mktemp)
+  printf '%s' "$mutation_content" >"$mutation_body"
+
+  if ! aws_s3api put-object --bucket "$BUCKET" --key "$mutation_key" --body "$mutation_body" --content-type text/plain >/dev/null; then
+    rm -f "$mutation_body"
+    echo "error: S3 API PutObject failed" >&2
+    exit 1
+  fi
+  rm -f "$mutation_body"
+  echo "ok: S3 API PutObject created temporary object"
+
+  get_url=$(sign_url GET "$mutation_key" 2m)
+  assert_body "signed GET after S3 API PutObject" "$mutation_content" "$get_url"
+
+  if ! aws_s3api head-object --bucket "$BUCKET" --key "$mutation_key" >/dev/null; then
+    echo "error: S3 API HeadObject after PutObject failed" >&2
+    exit 1
+  fi
+  echo "ok: S3 API HeadObject found temporary object"
+
+  if ! aws_s3api delete-object --bucket "$BUCKET" --key "$mutation_key" >/dev/null; then
+    echo "error: S3 API DeleteObject failed" >&2
+    exit 1
+  fi
+  echo "ok: S3 API DeleteObject removed temporary object"
+
+  deleted_url=$(sign_url GET "$mutation_key" 2m)
+  assert_status "signed GET after S3 API DeleteObject" "404" "$deleted_url"
 }
 
 wait_for_edge() {
@@ -203,6 +264,7 @@ short_form_url=$(sign_url GET "$SHORT_FORM_COLLISION_KEY" 2m)
 assert_body "short-form /$SHORT_FORM_COLLISION_KEY default-bucket routing" "$SHORT_FORM_EXPECTED" "$short_form_url"
 
 run_optional_s3_api_smoke
+run_optional_s3_mutation_smoke
 
 bad_url=$(printf '%s' "$get_url" | sed 's/sig=[^&]*/sig=deadbeef/')
 assert_status "bad signature rejection" "403" "$bad_url"
