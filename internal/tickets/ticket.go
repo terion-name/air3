@@ -25,6 +25,8 @@ const (
 	OperationGetObject     Operation = "GetObject"
 	OperationHeadObject    Operation = "HeadObject"
 	OperationListObjectsV2 Operation = "ListObjectsV2"
+	OperationPutObject     Operation = "PutObject"
+	OperationDeleteObject  Operation = "DeleteObject"
 )
 
 var (
@@ -56,23 +58,28 @@ type ListRewrite struct {
 // Ticket is the NATS control-plane message for one live HTTP work item.
 //
 // The JSON schema is intentionally small and closed. Tickets carry only the
-// object/list identity, deadline, ingest callback, one-time ingest token, and
-// safe tracing metadata. They must never contain S3 credentials, object bytes,
-// public client secrets, or raw untrusted request headers.
+// object/list identity, mutation upload envelope, deadline, ingest callback,
+// one-time ingest token, and safe tracing metadata. They must never contain S3
+// credentials, object bytes, public client secrets, or raw untrusted request
+// headers.
 type Ticket struct {
-	Version        int          `json:"version"`
-	RequestID      string       `json:"request_id"`
-	Bucket         string       `json:"bucket"`
-	Key            string       `json:"key"`
-	Method         string       `json:"method"`
-	Operation      Operation    `json:"operation,omitempty"`
-	Range          string       `json:"range,omitempty"`
-	List           *ListRequest `json:"list,omitempty"`
-	Server         string       `json:"server,omitempty"`
-	DeadlineUnixMS int64        `json:"deadline_unix_ms"`
-	IngestURL      string       `json:"ingest_url"`
-	IngestToken    string       `json:"ingest_token"`
-	TraceID        string       `json:"trace_id,omitempty"`
+	Version         int          `json:"version"`
+	RequestID       string       `json:"request_id"`
+	Bucket          string       `json:"bucket"`
+	Key             string       `json:"key"`
+	Method          string       `json:"method"`
+	Operation       Operation    `json:"operation,omitempty"`
+	Range           string       `json:"range,omitempty"`
+	List            *ListRequest `json:"list,omitempty"`
+	UploadSourceURL string       `json:"upload_source_url,omitempty"`
+	UploadToken     string       `json:"upload_token,omitempty"`
+	ContentLength   *int64       `json:"content_length,omitempty"`
+	ContentType     string       `json:"content_type,omitempty"`
+	Server          string       `json:"server,omitempty"`
+	DeadlineUnixMS  int64        `json:"deadline_unix_ms"`
+	IngestURL       string       `json:"ingest_url"`
+	IngestToken     string       `json:"ingest_token"`
+	TraceID         string       `json:"trace_id,omitempty"`
 }
 
 // Marshal validates t against now before returning its canonical JSON encoding.
@@ -147,6 +154,10 @@ func (t Ticket) Validate(now time.Time) error {
 		return t.validateObjectOperation()
 	case OperationListObjectsV2:
 		return t.validateListOperation()
+	case OperationPutObject:
+		return t.validatePutObjectOperation()
+	case OperationDeleteObject:
+		return t.validateDeleteObjectOperation()
 	default:
 		return fieldError("operation", "is unsupported")
 	}
@@ -179,6 +190,14 @@ func ResolveOperation(method string, op Operation) (Operation, error) {
 		if method != "GET" {
 			return "", fieldError("operation", "ListObjectsV2 requires method GET")
 		}
+	case OperationPutObject:
+		if method != "PUT" {
+			return "", fieldError("operation", "PutObject requires method PUT")
+		}
+	case OperationDeleteObject:
+		if method != "DELETE" {
+			return "", fieldError("operation", "DeleteObject requires method DELETE")
+		}
 	default:
 		return "", fieldError("operation", "is unsupported")
 	}
@@ -188,6 +207,9 @@ func ResolveOperation(method string, op Operation) (Operation, error) {
 func (t Ticket) validateObjectOperation() error {
 	if t.List != nil {
 		return fieldError("list", "must be omitted for object operations")
+	}
+	if err := t.validateUploadEnvelopeOmitted(); err != nil {
+		return err
 	}
 	if err := ValidateKey(t.Key); err != nil {
 		return err
@@ -202,7 +224,64 @@ func (t Ticket) validateListOperation() error {
 	if t.Range != "" {
 		return fieldError("range", "must be omitted for ListObjectsV2")
 	}
+	if err := t.validateUploadEnvelopeOmitted(); err != nil {
+		return err
+	}
 	return ValidateListRequest(t.List)
+}
+
+func (t Ticket) validatePutObjectOperation() error {
+	if t.List != nil {
+		return fieldError("list", "must be omitted for PutObject")
+	}
+	if t.Range != "" {
+		return fieldError("range", "must be omitted for PutObject")
+	}
+	if err := ValidateKey(t.Key); err != nil {
+		return err
+	}
+	if err := validateUploadSourceURL(t.UploadSourceURL); err != nil {
+		return err
+	}
+	if !saneToken(t.UploadToken) {
+		return fieldError("upload_token", "is required and may contain only safe token characters")
+	}
+	if t.ContentLength == nil {
+		return fieldError("content_length", "is required for PutObject")
+	}
+	if *t.ContentLength < 0 {
+		return fieldError("content_length", "must be non-negative")
+	}
+	return validateContentType(t.ContentType)
+}
+
+func (t Ticket) validateDeleteObjectOperation() error {
+	if t.List != nil {
+		return fieldError("list", "must be omitted for DeleteObject")
+	}
+	if t.Range != "" {
+		return fieldError("range", "must be omitted for DeleteObject")
+	}
+	if err := t.validateUploadEnvelopeOmitted(); err != nil {
+		return err
+	}
+	return ValidateKey(t.Key)
+}
+
+func (t Ticket) validateUploadEnvelopeOmitted() error {
+	if t.UploadSourceURL != "" {
+		return fieldError("upload_source_url", "must be omitted")
+	}
+	if t.UploadToken != "" {
+		return fieldError("upload_token", "must be omitted")
+	}
+	if t.ContentLength != nil {
+		return fieldError("content_length", "must be omitted")
+	}
+	if t.ContentType != "" {
+		return fieldError("content_type", "must be omitted")
+	}
+	return nil
 }
 
 func ValidateBucket(bucket string) error {
@@ -359,6 +438,32 @@ func validateIngestURL(raw string) error {
 	}
 	if u.User != nil {
 		return fieldError("ingest_url", "must not contain credentials")
+	}
+	return nil
+}
+
+func validateUploadSourceURL(raw string) error {
+	if raw == "" {
+		return fieldError("upload_source_url", "is required for PutObject")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return fieldError("upload_source_url", "must be an absolute https URL")
+	}
+	if u.User != nil {
+		return fieldError("upload_source_url", "must not contain credentials")
+	}
+	return nil
+}
+
+func validateContentType(contentType string) error {
+	if len(contentType) > 255 {
+		return fieldError("content_type", "is too long")
+	}
+	for _, r := range contentType {
+		if r == 0 || unicode.IsControl(r) {
+			return fieldError("content_type", "must not contain control characters")
+		}
 	}
 	return nil
 }
