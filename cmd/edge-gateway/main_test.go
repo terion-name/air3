@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/terion-name/air3/internal/config"
+	"github.com/terion-name/air3/internal/ingest"
 	"github.com/terion-name/air3/internal/ingestquic"
 	"github.com/terion-name/air3/internal/ingestsmux"
 	"github.com/terion-name/air3/internal/ingesttcp"
@@ -29,6 +30,7 @@ import (
 	"github.com/terion-name/air3/internal/s3fetch"
 	"github.com/terion-name/air3/internal/signing"
 	"github.com/terion-name/air3/internal/tickets"
+	"github.com/terion-name/air3/internal/uploadsource"
 )
 
 type fakePublisher struct {
@@ -97,7 +99,7 @@ func testEdge(pub *fakePublisher, ttl time.Duration) (*edgeServer, *pending.Regi
 		Signing:        config.SigningConfig{Disabled: true},
 		Timeouts:       config.TimeoutConfig{PendingRequestTTL: ttl, StreamTimeout: time.Minute},
 	}
-	edge := newEdgeServer(cfg, reg, pub, nil)
+	edge := newEdgeServer(cfg, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 	tokens := []string{"req-test", "ingest-token"}
 	edge.newToken = func() (string, error) {
 		v := tokens[0]
@@ -185,8 +187,8 @@ func testS3Edge(pub *fakePublisher, cfg config.EdgeConfig, fetchers map[string]o
 	if cfg.Timeouts.PendingRequestTTL == 0 {
 		cfg.Timeouts.PendingRequestTTL = time.Second
 	}
-	edge := newEdgeServer(cfg, reg, pub, nil, fetchers)
-	tokens := []string{"req-s3", "ingest-s3-token"}
+	edge := newEdgeServer(cfg, reg, uploadsource.NewRegistry(uploadsource.Options{Now: func() time.Time { return s3TestNow }}), pub, nil, fetchers)
+	tokens := []string{"req-s3", "ingest-s3-token", "upload-s3-token"}
 	edge.newToken = func() (string, error) {
 		v := tokens[0]
 		tokens = tokens[1:]
@@ -199,6 +201,27 @@ func testS3Edge(pub *fakePublisher, cfg config.EdgeConfig, fetchers map[string]o
 func s3SignHeaderRequest(t *testing.T, method, target string, headers map[string]string) *http.Request {
 	t.Helper()
 	r := s3NewRequest(t, method, target)
+	r.Header.Set("x-amz-date", s3TestSignedAt.Format("20060102T150405Z"))
+	for key, value := range headers {
+		r.Header.Set(key, value)
+	}
+	signedHeaders := []string{"host", "x-amz-date"}
+	if r.Header.Get("x-amz-content-sha256") != "" {
+		signedHeaders = []string{"host", "x-amz-content-sha256", "x-amz-date"}
+	}
+	payloadHash := s3HeaderPayloadHash(r, signedHeaders)
+	canonicalRequest := s3CanonicalRequest(r, signedHeaders, payloadHash, false)
+	date := s3TestSignedAt.Format("20060102")
+	scope := s3CredentialScope(date, s3TestRegion)
+	stringToSign := s3StringToSign(s3TestSignedAt.Format("20060102T150405Z"), scope, canonicalRequest)
+	signature := s3Signature(s3TestSecretKey, date, s3TestRegion, stringToSign)
+	r.Header.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s", s3TestAccessKey, scope, strings.Join(signedHeaders, ";"), signature))
+	return r
+}
+
+func s3SignHeaderRequestWithBody(t *testing.T, method, target string, body io.ReadCloser, contentLength int64, headers map[string]string) *http.Request {
+	t.Helper()
+	r := s3NewRequestWithBody(t, method, target, body, contentLength)
 	r.Header.Set("x-amz-date", s3TestSignedAt.Format("20060102T150405Z"))
 	for key, value := range headers {
 		r.Header.Set(key, value)
@@ -247,6 +270,24 @@ func s3NewRequest(t *testing.T, method, target string) *http.Request {
 	r := httptest.NewRequest(method, u.String(), nil)
 	r.URL = u
 	r.Host = s3TestHost
+	return r
+}
+
+func s3NewRequestWithBody(t *testing.T, method, target string, body io.ReadCloser, contentLength int64) *http.Request {
+	t.Helper()
+	u, err := url.Parse("https://" + s3TestHost + target)
+	if err != nil {
+		t.Fatalf("parse URL: %v", err)
+	}
+	r := httptest.NewRequest(method, u.String(), body)
+	r.URL = u
+	r.Host = s3TestHost
+	r.ContentLength = contentLength
+	if contentLength >= 0 {
+		r.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	} else {
+		r.Header.Del("Content-Length")
+	}
 	return r
 }
 
@@ -407,7 +448,7 @@ func testMultiEdge(pub *fakePublisher, cfg config.EdgeConfig, fetchers map[strin
 	if cfg.Timeouts.PendingRequestTTL == 0 {
 		cfg.Timeouts.PendingRequestTTL = time.Second
 	}
-	edge := newEdgeServer(cfg, reg, pub, nil, fetchers)
+	edge := newEdgeServer(cfg, reg, uploadsource.NewRegistry(uploadsource.Options{Now: func() time.Time { return s3TestNow }}), pub, nil, fetchers)
 	tokens := []string{"req-multi", "ingest-multi-token"}
 	edge.newToken = func() (string, error) {
 		v := tokens[0]
@@ -541,26 +582,115 @@ func TestS3APIAuthAndClassificationFailuresHaveXMLNoSideEffects(t *testing.T) {
 	}
 }
 
-func TestS3APIUnsupportedWriteMethodReturnsXMLMethodNotAllowed(t *testing.T) {
-	pub := &fakePublisher{}
-	edge, _ := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}}, nil)
-	edge.newToken = func() (string, error) { t.Fatal("unsupported method allocated a connector token"); return "", nil }
-	req := s3SignHeaderRequest(t, http.MethodPut, "/demo-bucket/file.txt", map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+func TestS3APIMutationsDisabledBeforeSideEffects(t *testing.T) {
+	tests := []struct {
+		name     string
+		method   string
+		direct   bool
+		body     string
+		headers  map[string]string
+		wantCode int
+	}{
+		{name: "routed put", method: http.MethodPut, body: "hello", headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}, wantCode: http.StatusMethodNotAllowed},
+		{name: "routed delete", method: http.MethodDelete, headers: map[string]string{"x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}, wantCode: http.StatusMethodNotAllowed},
+		{name: "direct put", method: http.MethodPut, direct: true, body: "hello", headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}, wantCode: http.StatusMethodNotAllowed},
+		{name: "direct delete", method: http.MethodDelete, direct: true, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}, wantCode: http.StatusMethodNotAllowed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &fakePublisher{}
+			fetcher := &fakeFetcher{object: &s3fetch.Object{}}
+			cfg := config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}}
+			fetchers := map[string]objectFetcher(nil)
+			target := "/demo-bucket/file.txt"
+			if tt.direct {
+				cfg.MultiServer = true
+				cfg.DirectServers = map[string]config.S3Config{"blue": {AllowedBuckets: []string{"demo-bucket"}}}
+				fetchers = map[string]objectFetcher{"blue": fetcher}
+				target = "/blue/demo-bucket/file.txt"
+			}
+			edge, reg := testS3Edge(pub, cfg, fetchers)
+			edge.newToken = func() (string, error) { t.Fatal("disabled mutation allocated a connector token"); return "", nil }
+			var body io.ReadCloser = http.NoBody
+			if tt.body != "" {
+				body = io.NopCloser(strings.NewReader(tt.body))
+			}
+			req := s3SignHeaderRequestWithBody(t, tt.method, target, body, int64(len(tt.body)), tt.headers)
 
-	resp := httptest.NewRecorder()
-	edge.ServeHTTP(resp, req)
+			resp := httptest.NewRecorder()
+			edge.ServeHTTP(resp, req)
 
-	if got := resp.Result().StatusCode; got != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want %d; body=%q", got, http.StatusMethodNotAllowed, resp.Body.String())
+			if got := resp.Result().StatusCode; got != tt.wantCode {
+				t.Fatalf("status = %d, want %d; body=%q", got, tt.wantCode, resp.Body.String())
+			}
+			if got := resp.Result().Header.Get("Allow"); got != "GET, HEAD" {
+				t.Fatalf("Allow = %q, want GET, HEAD", got)
+			}
+			if pub.count() != 0 {
+				t.Fatalf("published %d tickets, want 0", pub.count())
+			}
+			if got := len(fetcher.snapshot()); got != 0 {
+				t.Fatalf("fetch calls = %d, want 0", got)
+			}
+			if _, err := reg.StartIngest("req-s3", "ingest-s3-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+				t.Fatalf("registered pending request: %v", err)
+			}
+			if _, err := edge.uploadSources.Claim("req-s3", "upload-s3-token"); !errors.Is(err, uploadsource.ErrNotFound) {
+				t.Fatalf("registered upload source: %v", err)
+			}
+		})
 	}
-	if got := resp.Result().Header.Get("Allow"); got != "GET, HEAD" {
-		t.Fatalf("Allow = %q, want GET, HEAD", got)
+}
+
+func TestS3APIMutationPolicyRejectsBeforeSideEffects(t *testing.T) {
+	signedPayload := sha256.Sum256([]byte("hello"))
+	tests := []struct {
+		name    string
+		method  string
+		body    string
+		length  int64
+		headers map[string]string
+		mutate  func(*http.Request)
+	}{
+		{name: "signed sha256 put", method: http.MethodPut, body: "hello", length: 5, headers: map[string]string{"x-amz-content-sha256": hex.EncodeToString(signedPayload[:])}},
+		{name: "aws chunked put", method: http.MethodPut, body: "hello", length: 5, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD", "Content-Encoding": "aws-chunked"}},
+		{name: "unknown length put", method: http.MethodPut, body: "hello", length: -1, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}},
+		{name: "delete body", method: http.MethodDelete, body: "x", length: 1, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}},
+		{name: "delete chunked marker", method: http.MethodDelete, length: 0, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}, mutate: func(r *http.Request) { r.TransferEncoding = []string{"chunked"} }},
+		{name: "delete streaming marker", method: http.MethodDelete, length: 0, headers: map[string]string{"x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER"}},
+		{name: "range put", method: http.MethodPut, body: "hello", length: 5, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD", "Range": "bytes=0-1"}},
+		{name: "range delete", method: http.MethodDelete, length: 0, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD", "Range": "bytes=0-1"}},
 	}
-	if !strings.Contains(resp.Body.String(), "<Code>MethodNotAllowed</Code>") {
-		t.Fatalf("body = %q, want MethodNotAllowed XML", resp.Body.String())
-	}
-	if pub.count() != 0 {
-		t.Fatalf("published %d tickets, want 0", pub.count())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &fakePublisher{}
+			edge, reg := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}, MutationsEnabled: true}, nil)
+			edge.newToken = func() (string, error) { t.Fatal("invalid mutation allocated a connector token"); return "", nil }
+			var body io.ReadCloser = http.NoBody
+			if tt.body != "" {
+				body = io.NopCloser(strings.NewReader(tt.body))
+			}
+			req := s3SignHeaderRequestWithBody(t, tt.method, "/demo-bucket/file.txt", body, tt.length, tt.headers)
+			if tt.mutate != nil {
+				tt.mutate(req)
+			}
+
+			resp := httptest.NewRecorder()
+			edge.ServeHTTP(resp, req)
+
+			if got := resp.Result().StatusCode; got != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%q", got, http.StatusBadRequest, resp.Body.String())
+			}
+			if pub.count() != 0 {
+				t.Fatalf("published %d tickets, want 0", pub.count())
+			}
+			if _, err := reg.StartIngest("req-s3", "ingest-s3-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+				t.Fatalf("registered pending request: %v", err)
+			}
+			if _, err := edge.uploadSources.Claim("req-s3", "upload-s3-token"); !errors.Is(err, uploadsource.ErrNotFound) {
+				t.Fatalf("registered upload source: %v", err)
+			}
+		})
 	}
 }
 
@@ -695,6 +825,237 @@ func TestS3APIDirectAliasListBypassesNATSAndStreamsXML(t *testing.T) {
 	}
 }
 
+func TestS3APIDirectAliasMutationsBypassNATSAndUploadSource(t *testing.T) {
+	pub := &fakePublisher{}
+	fetcher := &fakeFetcher{object: &s3fetch.Object{ETag: "\"put-etag\""}}
+	edge, reg := testS3Edge(pub, config.EdgeConfig{
+		MultiServer:      true,
+		MutationsEnabled: true,
+		DirectServers:    map[string]config.S3Config{"blue": {AllowedBuckets: []string{"demo-bucket"}}},
+	}, map[string]objectFetcher{"blue": fetcher})
+	edge.newToken = func() (string, error) { t.Fatal("direct mutation allocated a connector token"); return "", nil }
+	body := io.NopCloser(strings.NewReader("direct body"))
+	putReq := s3SignHeaderRequestWithBody(t, http.MethodPut, "/blue/demo-bucket/file.txt", body, int64(len("direct body")), map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD", "Content-Type": "text/plain"})
+
+	putResp := httptest.NewRecorder()
+	edge.ServeHTTP(putResp, putReq)
+
+	if got := putResp.Result().StatusCode; got != http.StatusOK {
+		t.Fatalf("PUT status = %d, want %d; body=%q", got, http.StatusOK, putResp.Body.String())
+	}
+	if got := putResp.Result().Header.Get("ETag"); got != "\"put-etag\"" {
+		t.Fatalf("PUT ETag = %q, want put-etag", got)
+	}
+	requests := fetcher.snapshot()
+	if len(requests) != 1 {
+		t.Fatalf("fetch requests after PUT = %#v, want one", requests)
+	}
+	if requests[0].Operation != tickets.OperationPutObject || requests[0].Body != putReq.Body || requests[0].ContentLength == nil || *requests[0].ContentLength != int64(len("direct body")) || requests[0].ContentType != "text/plain" {
+		t.Fatalf("PUT fetch request = %#v, want original body and content metadata", requests[0])
+	}
+
+	deleteReq := s3SignHeaderRequestWithBody(t, http.MethodDelete, "/blue/demo-bucket/file.txt", http.NoBody, 0, map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+	deleteResp := httptest.NewRecorder()
+	edge.ServeHTTP(deleteResp, deleteReq)
+	if got := deleteResp.Result().StatusCode; got != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d, want %d; body=%q", got, http.StatusNoContent, deleteResp.Body.String())
+	}
+	if deleteResp.Body.Len() != 0 {
+		t.Fatalf("DELETE body = %q, want empty", deleteResp.Body.String())
+	}
+	requests = fetcher.snapshot()
+	if len(requests) != 2 || requests[1].Operation != tickets.OperationDeleteObject || requests[1].Body != nil || requests[1].ContentLength != nil || requests[1].ContentType != "" {
+		t.Fatalf("DELETE fetch request = %#v, want no body/content fields", requests)
+	}
+	if pub.count() != 0 {
+		t.Fatalf("published %d tickets, want 0", pub.count())
+	}
+	if _, err := reg.StartIngest("req-s3", "ingest-s3-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+		t.Fatalf("direct mutation registered pending request: %v", err)
+	}
+	if _, err := edge.uploadSources.Claim("req-s3", "upload-s3-token"); !errors.Is(err, uploadsource.ErrNotFound) {
+		t.Fatalf("direct mutation registered upload source: %v", err)
+	}
+}
+
+func TestS3APIRoutedMutationsPublishTicketsAndCleanup(t *testing.T) {
+	t.Run("put", func(t *testing.T) {
+		pub := &fakePublisher{}
+		edge, reg := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}, MutationsEnabled: true}, nil)
+		var uploaded string
+		var uploadedLength *int64
+		var uploadedType string
+		pub.on = func(ticket tickets.Ticket) {
+			claim, err := edge.uploadSources.Claim(ticket.RequestID, ticket.UploadToken)
+			if err != nil {
+				t.Errorf("Claim() error = %v", err)
+				return
+			}
+			uploadedLength = claim.ContentLength()
+			uploadedType = claim.ContentType()
+			body, err := io.ReadAll(claim)
+			if err != nil {
+				t.Errorf("ReadAll(claim) error = %v", err)
+			}
+			uploaded = string(body)
+			if err := claim.Close(); err != nil {
+				t.Errorf("claim.Close() error = %v", err)
+			}
+			stream, err := reg.StartIngest(ticket.RequestID, ticket.IngestToken, pending.Metadata{StatusCode: http.StatusOK, ETag: "\"stored\""})
+			if err != nil {
+				t.Errorf("StartIngest() error = %v", err)
+				return
+			}
+			_ = stream.Close()
+		}
+		req := s3SignHeaderRequestWithBody(t, http.MethodPut, "/demo-bucket/file.txt", io.NopCloser(strings.NewReader("routed body")), int64(len("routed body")), map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD", "Content-Type": "text/plain"})
+
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, req)
+
+		if got := resp.Result().StatusCode; got != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%q", got, http.StatusOK, resp.Body.String())
+		}
+		published := pub.snapshot()
+		if len(published) != 1 {
+			t.Fatalf("published tickets = %#v, want one", published)
+		}
+		ticket := published[0]
+		if ticket.Operation != tickets.OperationPutObject || ticket.UploadSourceURL == "" || ticket.UploadToken != "upload-s3-token" || ticket.ContentLength == nil || *ticket.ContentLength != int64(len("routed body")) || ticket.ContentType != "text/plain" {
+			t.Fatalf("PUT ticket = %#v, want upload envelope", ticket)
+		}
+		encoded, err := tickets.Marshal(ticket, s3TestNow)
+		if err != nil {
+			t.Fatalf("Marshal(PUT ticket) error = %v", err)
+		}
+		for _, secret := range []string{"Authorization", "X-Amz", s3TestAccessKey, s3TestSecretKey, "routed body"} {
+			if strings.Contains(string(encoded), secret) {
+				t.Fatalf("ticket leaked %q in %s", secret, encoded)
+			}
+		}
+		if uploaded != "routed body" || uploadedLength == nil || *uploadedLength != int64(len("routed body")) || uploadedType != "text/plain" {
+			t.Fatalf("upload source = body %q length %v type %q", uploaded, uploadedLength, uploadedType)
+		}
+		if _, err := edge.uploadSources.Claim(ticket.RequestID, ticket.UploadToken); !errors.Is(err, uploadsource.ErrNotFound) {
+			t.Fatalf("upload source remained after completion: %v", err)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		pub := &fakePublisher{}
+		edge, reg := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}, MutationsEnabled: true}, nil)
+		pub.on = func(ticket tickets.Ticket) {
+			stream, err := reg.StartIngest(ticket.RequestID, ticket.IngestToken, pending.Metadata{StatusCode: http.StatusNoContent})
+			if err != nil {
+				t.Errorf("StartIngest() error = %v", err)
+				return
+			}
+			_ = stream.Close()
+		}
+		req := s3SignHeaderRequestWithBody(t, http.MethodDelete, "/demo-bucket/file.txt", http.NoBody, 0, map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, req)
+
+		if got := resp.Result().StatusCode; got != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d; body=%q", got, http.StatusNoContent, resp.Body.String())
+		}
+		published := pub.snapshot()
+		if len(published) != 1 {
+			t.Fatalf("published tickets = %#v, want one", published)
+		}
+		if published[0].Operation != tickets.OperationDeleteObject || published[0].UploadSourceURL != "" || published[0].UploadToken != "" || published[0].ContentLength != nil || published[0].ContentType != "" {
+			t.Fatalf("DELETE ticket = %#v, want no upload envelope", published[0])
+		}
+		if _, err := edge.uploadSources.Claim(published[0].RequestID, "upload-s3-token"); !errors.Is(err, uploadsource.ErrNotFound) {
+			t.Fatalf("DELETE registered upload source: %v", err)
+		}
+	})
+}
+
+func TestS3APIRoutedPUTCleanupOnPublishFailureAndCancellation(t *testing.T) {
+	bodyHeaders := map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD", "Content-Type": "text/plain"}
+	t.Run("publish failure", func(t *testing.T) {
+		pub := &fakePublisher{err: errors.New("nats down")}
+		edge, reg := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}, MutationsEnabled: true}, nil)
+		req := s3SignHeaderRequestWithBody(t, http.MethodPut, "/demo-bucket/file.txt", io.NopCloser(strings.NewReader("body")), 4, bodyHeaders)
+
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, req)
+
+		if got := resp.Result().StatusCode; got != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want %d; body=%q", got, http.StatusServiceUnavailable, resp.Body.String())
+		}
+		if _, err := edge.uploadSources.Claim("req-s3", "upload-s3-token"); !errors.Is(err, uploadsource.ErrNotFound) {
+			t.Fatalf("upload source remained after publish failure: %v", err)
+		}
+		if _, err := reg.StartIngest("req-s3", "ingest-s3-token", pending.Metadata{StatusCode: http.StatusOK}); !errors.Is(err, pending.ErrNotFound) {
+			t.Fatalf("pending request remained after publish failure: %v", err)
+		}
+	})
+
+	t.Run("client cancellation", func(t *testing.T) {
+		pub := &fakePublisher{}
+		edge, _ := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}, MutationsEnabled: true}, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		pub.on = func(tickets.Ticket) { cancel() }
+		req := s3SignHeaderRequestWithBody(t, http.MethodPut, "/demo-bucket/file.txt", io.NopCloser(strings.NewReader("body")), 4, bodyHeaders).WithContext(ctx)
+
+		resp := httptest.NewRecorder()
+		edge.ServeHTTP(resp, req)
+
+		if _, err := edge.uploadSources.Claim("req-s3", "upload-s3-token"); !errors.Is(err, uploadsource.ErrNotFound) {
+			t.Fatalf("upload source remained after cancellation: %v", err)
+		}
+	})
+}
+
+func TestPrivateIngestMuxMountsUploadSourceAndPublicDoesNot(t *testing.T) {
+	pendingReg := pending.NewRegistry(pending.Options{Now: func() time.Time { return s3TestNow }})
+	uploadReg := uploadsource.NewRegistry(uploadsource.Options{Now: func() time.Time { return s3TestNow }})
+	ingestHandler, err := ingest.NewHandler(ingest.Options{Registry: pendingReg})
+	if err != nil {
+		t.Fatalf("New ingest handler: %v", err)
+	}
+	uploadHandler, err := uploadsource.NewHandler(uploadsource.HandlerOptions{Registry: uploadReg})
+	if err != nil {
+		t.Fatalf("New upload handler: %v", err)
+	}
+	private := newPrivateIngestHandler(ingestHandler, uploadHandler)
+	length := int64(len("upload-body"))
+	if err := uploadReg.Register(uploadsource.Source{RequestID: "upload-req", Token: "upload-token", Body: io.NopCloser(strings.NewReader("upload-body")), ContentLength: &length, ContentType: "text/plain", Deadline: s3TestNow.Add(time.Minute), Context: context.Background()}); err != nil {
+		t.Fatalf("Register upload source: %v", err)
+	}
+	uploadReq := httptest.NewRequest(http.MethodGet, uploadsource.PathPrefix+"upload-req", nil)
+	uploadReq.Header.Set(uploadsource.TokenHeader, "upload-token")
+	uploadResp := httptest.NewRecorder()
+	private.ServeHTTP(uploadResp, uploadReq)
+	if got := uploadResp.Result().StatusCode; got != http.StatusOK || uploadResp.Body.String() != "upload-body" {
+		t.Fatalf("private upload response status=%d body=%q", got, uploadResp.Body.String())
+	}
+
+	publicSinkResp := httptest.NewRecorder()
+	if err := pendingReg.Register(pending.Request{ID: "ingest-req", Deadline: s3TestNow.Add(time.Minute), IngestToken: "ingest-token", Method: http.MethodGet, Operation: tickets.OperationGetObject, Bucket: "demo-bucket", Key: "file.txt"}, newResponseSink(publicSinkResp, http.MethodGet, context.Background())); err != nil {
+		t.Fatalf("Register pending request: %v", err)
+	}
+	ingestReq := httptest.NewRequest(http.MethodPost, ingest.PathPrefix+"ingest-req", strings.NewReader("ingest-body"))
+	ingestReq.Header.Set(ingest.TokenHeader, "ingest-token")
+	ingestReq.Header.Set(ingest.StatusCodeHeader, "200")
+	ingestResp := httptest.NewRecorder()
+	private.ServeHTTP(ingestResp, ingestReq)
+	if got := ingestResp.Result().StatusCode; got != http.StatusNoContent {
+		t.Fatalf("private ingest response status=%d body=%q", got, ingestResp.Body.String())
+	}
+
+	pub := &fakePublisher{}
+	edge, _ := testEdge(pub, time.Second)
+	publicResp := httptest.NewRecorder()
+	edge.ServeHTTP(publicResp, httptest.NewRequest(http.MethodGet, uploadsource.PathPrefix+"upload-req", nil))
+	if got := publicResp.Result().StatusCode; got == http.StatusOK && publicResp.Body.String() == "upload-body" {
+		t.Fatalf("public edge exposed upload source route")
+	}
+}
+
 func TestS3APIHeadBucketIsEdgeOnly(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
@@ -811,7 +1172,7 @@ func TestTCPIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
 		AllowedBuckets:      []string{"demo-bucket"},
 		Signing:             config.SigningConfig{Disabled: true},
 		Timeouts:            config.TimeoutConfig{PendingRequestTTL: 2 * time.Second},
-	}, reg, pub, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 	tokens := []string{"req-tcp", "ingest-tcp-token"}
 	edge.newToken = func() (string, error) {
 		v := tokens[0]
@@ -931,7 +1292,7 @@ func TestSMUXIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
 		AllowedBuckets:      []string{"demo-bucket"},
 		Signing:             config.SigningConfig{Disabled: true},
 		Timeouts:            config.TimeoutConfig{PendingRequestTTL: 2 * time.Second},
-	}, reg, pub, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 	tokens := []string{"req-smux", "ingest-smux-token"}
 	edge.newToken = func() (string, error) {
 		v := tokens[0]
@@ -1084,7 +1445,7 @@ func TestQUICIngestListenerSharesRegistryAndTicketKeepsHTTPSURL(t *testing.T) {
 		AllowedBuckets:       []string{"demo-bucket"},
 		Signing:              config.SigningConfig{Disabled: true},
 		Timeouts:             config.TimeoutConfig{PendingRequestTTL: 2 * time.Second},
-	}, reg, pub, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 	tokens := []string{"req-quic", "ingest-quic-token"}
 	edge.newToken = func() (string, error) {
 		v := tokens[0]
@@ -1134,7 +1495,7 @@ func TestBadSignatureAndDisallowedPathFailBeforePublish(t *testing.T) {
 		AllowedBuckets: []string{"demo-bucket"},
 		Signing:        config.SigningConfig{Secret: "secret"},
 		Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-	}, reg, pub, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 
 	badSigReq := httptest.NewRequest(http.MethodGet, "/demo-bucket/file.txt?expires=9999999999&sig=bad", nil)
 	badSigResp := httptest.NewRecorder()
@@ -1163,7 +1524,7 @@ func TestSignedURLAcceptedAndPublishesTicket(t *testing.T) {
 		AllowedBuckets: []string{"demo-bucket"},
 		Signing:        config.SigningConfig{Secret: "secret"},
 		Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-	}, reg, pub, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 	edge.now = func() time.Time { return now }
 	edge.newToken = func() (string, error) { return "signed-token", nil }
 
@@ -1208,7 +1569,7 @@ func TestSingleServerDefaultBucketShortPathPublishesTicket(t *testing.T) {
 		NATS:           config.NATSConfig{Subject: "air3.tickets"},
 		Signing:        config.SigningConfig{Disabled: true},
 		Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-	}, reg, pub, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 	edge.newToken = func() (string, error) { return "single-default-token", nil }
 
 	resp := httptest.NewRecorder()
@@ -1232,7 +1593,7 @@ func TestSingleServerDefaultBucketShortFormWinsOverBucketPrefix(t *testing.T) {
 		AllowedBuckets: []string{"demo"},
 		Signing:        config.SigningConfig{Disabled: true},
 		Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-	}, reg, pub, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 	edge.newToken = func() (string, error) { return "single-explicit-token", nil }
 
 	resp := httptest.NewRecorder()
@@ -1256,7 +1617,7 @@ func TestSingleServerDefaultBucketShortPathAllowlistUsesResolvedBucket(t *testin
 		AllowedBuckets: []string{"other"},
 		Signing:        config.SigningConfig{Disabled: true},
 		Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-	}, reg, pub, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 
 	resp := httptest.NewRecorder()
 	edge.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/file.txt", nil))
@@ -1281,7 +1642,7 @@ func TestSignedSingleServerDefaultBucketShortURLAcceptedAndTamperingRejected(t *
 			AllowedBuckets: []string{"demo"},
 			Signing:        config.SigningConfig{Secret: "secret"},
 			Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-		}, reg, pub, nil)
+		}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 		edge.now = func() time.Time { return now }
 		edge.newToken = func() (string, error) { return "signed-single-default-token", nil }
 
@@ -1313,7 +1674,7 @@ func TestSignedSingleServerDefaultBucketShortURLAcceptedAndTamperingRejected(t *
 				AllowedBuckets: []string{"demo"},
 				Signing:        config.SigningConfig{Secret: "secret"},
 				Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-			}, reg, pub, nil)
+			}, reg, uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 			edge.now = func() time.Time { return now }
 
 			resp := httptest.NewRecorder()
@@ -1735,7 +2096,7 @@ func TestRangeRequestValidationAndTicketPropagation(t *testing.T) {
 			AllowedBuckets: []string{"demo-bucket"},
 			Signing:        config.SigningConfig{Secret: "secret"},
 			Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-		}, pending.NewRegistry(pending.Options{}), pub, nil)
+		}, pending.NewRegistry(pending.Options{}), uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 		edge.now = func() time.Time { return now }
 		edge.newToken = func() (string, error) { return "signed-range-token", nil }
 
@@ -1760,7 +2121,7 @@ func TestRangeRequestValidationAndTicketPropagation(t *testing.T) {
 			AllowedBuckets: []string{"demo-bucket"},
 			Signing:        config.SigningConfig{Secret: "secret"},
 			Timeouts:       config.TimeoutConfig{PendingRequestTTL: time.Second},
-		}, pending.NewRegistry(pending.Options{}), pub, nil)
+		}, pending.NewRegistry(pending.Options{}), uploadsource.NewRegistry(uploadsource.Options{}), pub, nil)
 		edge.now = func() time.Time { return now }
 
 		signed, err := signing.SignURL(signing.SignInput{Method: http.MethodGet, BaseURL: "https://files.example", Bucket: "demo-bucket", Key: "file.txt", Expires: now.Add(time.Minute), Secret: "secret"})

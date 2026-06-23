@@ -34,6 +34,7 @@ import (
 	"github.com/terion-name/air3/internal/s3fetch"
 	"github.com/terion-name/air3/internal/signing"
 	"github.com/terion-name/air3/internal/tickets"
+	"github.com/terion-name/air3/internal/uploadsource"
 )
 
 type ticketPublisher interface {
@@ -47,6 +48,7 @@ type objectFetcher interface {
 type edgeServer struct {
 	cfg            config.EdgeConfig
 	registry       *pending.Registry
+	uploadSources  *uploadsource.Registry
 	publisher      ticketPublisher
 	directFetchers map[string]objectFetcher
 	logger         *slog.Logger
@@ -84,11 +86,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	reg := pending.NewRegistry(pending.Options{})
-	edge := newEdgeServer(cfg, reg, publisher, logger, directFetchers)
+	uploadReg := uploadsource.NewRegistry(uploadsource.Options{})
+	edge := newEdgeServer(cfg, reg, uploadReg, publisher, logger, directFetchers)
 	ingestHandler, err := ingest.NewHandler(ingest.Options{Registry: reg, AllowedConnectorIdentities: cfg.AllowedConnectorIdentities, StreamCopyBufferBytes: cfg.StreamCopyBufferBytes})
 	if err != nil {
 		return err
 	}
+	uploadHandler, err := uploadsource.NewHandler(uploadsource.HandlerOptions{Registry: uploadReg, AllowedConnectorIdentities: cfg.AllowedConnectorIdentities, StreamCopyBufferBytes: cfg.StreamCopyBufferBytes})
+	if err != nil {
+		return err
+	}
+	privateHandler := newPrivateIngestHandler(ingestHandler, uploadHandler)
 
 	publicServer := &http.Server{Addr: cfg.PublicListenAddr, Handler: edge}
 	var tlsCfg *tls.Config
@@ -101,7 +109,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if tlsConfigured(cfg.MTLS) {
 		publicServer.TLSConfig = publicTLSConfig(tlsCfg)
 	}
-	ingestServer := newIngestHTTPServer(cfg, ingestHandler, tlsCfg)
+	ingestServer := newIngestHTTPServer(cfg, privateHandler, tlsCfg)
 	ingestListener, err := newNonHTTPIngestListener(cfg, reg, tlsCfg)
 	if err != nil {
 		return err
@@ -160,7 +168,7 @@ func newDirectFetchers(ctx context.Context, directServers map[string]config.S3Co
 	return fetchers, nil
 }
 
-func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, publisher ticketPublisher, logger *slog.Logger, directFetchers ...map[string]objectFetcher) *edgeServer {
+func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, uploadSources *uploadsource.Registry, publisher ticketPublisher, logger *slog.Logger, directFetchers ...map[string]objectFetcher) *edgeServer {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -168,7 +176,14 @@ func newEdgeServer(cfg config.EdgeConfig, reg *pending.Registry, publisher ticke
 	if len(directFetchers) > 0 {
 		fetchers = directFetchers[0]
 	}
-	return &edgeServer{cfg: cfg, registry: reg, publisher: publisher, directFetchers: fetchers, logger: logger, now: time.Now, newToken: randomToken}
+	return &edgeServer{cfg: cfg, registry: reg, uploadSources: uploadSources, publisher: publisher, directFetchers: fetchers, logger: logger, now: time.Now, newToken: randomToken}
+}
+
+func newPrivateIngestHandler(ingestHandler, uploadHandler http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle(ingest.PathPrefix, ingestHandler)
+	mux.Handle(uploadsource.PathPrefix, uploadHandler)
+	return mux
 }
 
 func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -255,13 +270,15 @@ func (s *edgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type s3EdgeRequest struct {
-	server      string
-	bucket      string
-	key         string
-	rangeHeader string
-	operation   tickets.Operation
-	list        *tickets.ListRequest
-	headBucket  bool
+	server        string
+	bucket        string
+	key           string
+	rangeHeader   string
+	operation     tickets.Operation
+	list          *tickets.ListRequest
+	headBucket    bool
+	contentLength *int64
+	contentType   string
 }
 
 func edgeS3APIMode(cfg config.EdgeConfig) s3api.RoutingMode {
@@ -307,6 +324,24 @@ func (s *edgeServer) serveS3API(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: req.bucket, Key: req.key, Method: r.Method, Operation: req.operation, Range: req.rangeHeader, List: req.list, Server: req.server, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
+	if req.operation == tickets.OperationPutObject {
+		uploadToken, err := s.newToken()
+		if err != nil {
+			writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
+			return
+		}
+		uploadURL, err := uploadsource.URLForRequest(s.cfg.IngestURL, reqID)
+		if err != nil {
+			writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
+			return
+		}
+		ticket.UploadSourceURL = uploadURL
+		ticket.UploadToken = uploadToken
+		ticket.ContentLength = req.contentLength
+		ticket.ContentType = req.contentType
+	}
+
 	sink := newResponseSink(w, r.Method, r.Context())
 	pendingReq := pending.Request{ID: reqID, Deadline: deadline, IngestToken: ingestToken, Method: r.Method, Operation: req.operation, Bucket: req.bucket, Key: req.key, Range: req.rangeHeader, List: req.list}
 	if err := s.registry.Register(pendingReq, sink); err != nil {
@@ -315,10 +350,43 @@ func (s *edgeServer) serveS3API(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.registry.Cancel(reqID, pending.ErrCanceled)
 
-	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: req.bucket, Key: req.key, Method: r.Method, Operation: req.operation, Range: req.rangeHeader, List: req.list, Server: req.server, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
+	uploadRegistered := false
+	if req.operation == tickets.OperationPutObject {
+		if s.uploadSources == nil {
+			s.registry.Cancel(reqID, uploadsource.ErrInvalidSource)
+			writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
+			return
+		}
+		source := uploadsource.Source{RequestID: reqID, Token: ticket.UploadToken, Body: r.Body, ContentLength: req.contentLength, ContentType: req.contentType, Deadline: deadline, Context: r.Context()}
+		if err := s.uploadSources.Register(source); err != nil {
+			s.registry.Cancel(reqID, err)
+			writeS3Error(w, r, s3ErrorForUploadSetup(err))
+			return
+		}
+		uploadRegistered = true
+		defer func() {
+			if uploadRegistered {
+				s.uploadSources.Cancel(reqID, uploadsource.ErrCanceled)
+			}
+		}()
+	}
+
+	if _, err := tickets.Marshal(ticket, s.now()); err != nil {
+		s.registry.Cancel(reqID, err)
+		if uploadRegistered {
+			s.uploadSources.Cancel(reqID, err)
+			uploadRegistered = false
+		}
+		writeS3Error(w, r, s3ErrorForSetup(err))
+		return
+	}
 	subject, err := s.ticketSubject(req.server)
 	if err != nil {
 		s.registry.Cancel(reqID, err)
+		if uploadRegistered {
+			s.uploadSources.Cancel(reqID, err)
+			uploadRegistered = false
+		}
 		writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
 		return
 	}
@@ -326,6 +394,11 @@ func (s *edgeServer) serveS3API(w http.ResponseWriter, r *http.Request) {
 	err = s.publisher.PublishTicketTo(publishCtx, subject, ticket)
 	cancelPublish()
 	if err != nil {
+		s.registry.Cancel(reqID, err)
+		if uploadRegistered {
+			s.uploadSources.Cancel(reqID, err)
+			uploadRegistered = false
+		}
 		s.logger.Warn("ticket publish failed", "request_id", reqID, "error", safeLogError(err))
 		writeS3Error(w, r, s3HTTPError{status: http.StatusServiceUnavailable, code: "ServiceUnavailable", message: "Backend unavailable"})
 		return
@@ -349,11 +422,12 @@ func (s *edgeServer) serveS3API(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *edgeServer) resolveS3Request(r *http.Request) (s3EdgeRequest, error) {
-	if _, err := s3api.VerifySigV4(r, s3api.VerifyOptions{
+	authCtx, err := s3api.VerifySigV4(r, s3api.VerifyOptions{
 		Credentials: s3api.Credentials{AccessKeyID: s.cfg.S3API.AccessKeyID, SecretAccessKey: s.cfg.S3API.SecretAccessKey},
 		Region:      s.cfg.S3API.Region,
 		Now:         s.now,
-	}); err != nil {
+	})
+	if err != nil {
 		return s3EdgeRequest{}, s3ErrorForAuth(err)
 	}
 
@@ -381,6 +455,27 @@ func (s *edgeServer) resolveS3Request(r *http.Request) (s3EdgeRequest, error) {
 		if err := validateS3ObjectRequest(req); err != nil {
 			return s3EdgeRequest{}, err
 		}
+	case s3api.OperationPutObject:
+		req.operation = tickets.OperationPutObject
+		req.contentType = r.Header.Get("Content-Type")
+		if r.ContentLength >= 0 {
+			contentLength := r.ContentLength
+			req.contentLength = &contentLength
+		}
+		if err := validateS3ObjectRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := s.validateS3MutationRequest(r, mapping.Operation, authCtx, req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+	case s3api.OperationDeleteObject:
+		req.operation = tickets.OperationDeleteObject
+		if err := validateS3ObjectRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := s.validateS3MutationRequest(r, mapping.Operation, authCtx, req); err != nil {
+			return s3EdgeRequest{}, err
+		}
 	case s3api.OperationListObjectsV2:
 		req.operation = tickets.OperationListObjectsV2
 		req.list = s3ListRequest(mapping)
@@ -399,6 +494,64 @@ func (s *edgeServer) resolveS3Request(r *http.Request) (s3EdgeRequest, error) {
 		return s3EdgeRequest{}, s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
 	}
 	return req, nil
+}
+
+func (s *edgeServer) validateS3MutationRequest(r *http.Request, operation s3api.Operation, authCtx s3api.AuthContext, req s3EdgeRequest) error {
+	if !s.cfg.MutationsEnabled {
+		return s3HTTPError{status: http.StatusMethodNotAllowed, code: "MethodNotAllowed", message: "Method not allowed"}
+	}
+	if strings.TrimSpace(r.Header.Get("Range")) != "" {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	if err := s3api.ValidatePayloadHashForOperation(operation, authCtx); err != nil {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	if operation == s3api.OperationPutObject {
+		if req.contentLength == nil || *req.contentLength < 0 {
+			return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+		}
+		if hasAWSChunkedMarkers(r, authCtx) {
+			return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+		}
+		return nil
+	}
+	if deleteHasBodyOrChunkedMarkers(r, authCtx) {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	return nil
+}
+
+func hasAWSChunkedMarkers(r *http.Request, authCtx s3api.AuthContext) bool {
+	return authCtx.PayloadHashMode() == s3api.PayloadHashModeStreaming ||
+		headerHasToken(r.Header, "Content-Encoding", "aws-chunked") ||
+		r.Header.Get("X-Amz-Decoded-Content-Length") != "" ||
+		r.Header.Get("X-Amz-Trailer") != "" ||
+		r.Header.Get("Trailer") != "" ||
+		hasTransferEncoding(r, "chunked")
+}
+
+func deleteHasBodyOrChunkedMarkers(r *http.Request, authCtx s3api.AuthContext) bool {
+	return r.ContentLength != 0 || hasAWSChunkedMarkers(r, authCtx)
+}
+
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasTransferEncoding(r *http.Request, encoding string) bool {
+	for _, value := range r.TransferEncoding {
+		if strings.EqualFold(strings.TrimSpace(value), encoding) {
+			return true
+		}
+	}
+	return false
 }
 
 func s3HeadBucketBackend(cfg config.EdgeConfig, mapping s3api.RequestMapping) string {
@@ -479,7 +632,13 @@ func (s *edgeServer) serveS3Direct(w http.ResponseWriter, r *http.Request, req s
 		return
 	}
 
-	fetched, err := fetcher.Fetch(r.Context(), s3fetch.Request{Method: r.Method, Operation: req.operation, Bucket: req.bucket, Key: req.key, Range: req.rangeHeader, List: req.list})
+	fetchReq := s3fetch.Request{Method: r.Method, Operation: req.operation, Bucket: req.bucket, Key: req.key, Range: req.rangeHeader, List: req.list}
+	if req.operation == tickets.OperationPutObject {
+		fetchReq.Body = r.Body
+		fetchReq.ContentLength = req.contentLength
+		fetchReq.ContentType = req.contentType
+	}
+	fetched, err := fetcher.Fetch(r.Context(), fetchReq)
 	if err != nil {
 		s.writeS3DirectFetchError(w, r, req.server, err)
 		return
@@ -491,6 +650,15 @@ func (s *edgeServer) serveS3Direct(w http.ResponseWriter, r *http.Request, req s
 	}
 	if fetched.Body != nil {
 		defer fetched.Body.Close()
+	}
+	if req.operation == tickets.OperationPutObject {
+		setTrimmedHeader(w.Header(), "ETag", fetched.ETag)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if req.operation == tickets.OperationDeleteObject {
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 
 	metadata := directMetadata(fetched)
@@ -573,6 +741,13 @@ func s3ErrorForClassify(err error) s3HTTPError {
 
 func s3ErrorForSetup(err error) s3HTTPError {
 	if errors.Is(err, pending.ErrExpired) || errors.Is(err, pending.ErrInvalidRequest) || errors.Is(err, tickets.ErrInvalidTicket) {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	return s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"}
+}
+
+func s3ErrorForUploadSetup(err error) s3HTTPError {
+	if errors.Is(err, uploadsource.ErrExpired) || errors.Is(err, uploadsource.ErrInvalidSource) {
 		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
 	}
 	return s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"}

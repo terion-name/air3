@@ -314,6 +314,16 @@ func validateRequest(req Request, now time.Time) error {
 		if err := tickets.ValidateByteRange(req.Range); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}
+	case tickets.OperationPutObject, tickets.OperationDeleteObject:
+		if req.List != nil {
+			return fmt.Errorf("%w: list metadata must be omitted for object requests", ErrInvalidRequest)
+		}
+		if req.Range != "" {
+			return fmt.Errorf("%w: range must be omitted for mutation requests", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateKey(req.Key); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
 	case tickets.OperationListObjectsV2:
 		if req.Key != "" {
 			return fmt.Errorf("%w: key must be empty for ListObjectsV2", ErrInvalidRequest)

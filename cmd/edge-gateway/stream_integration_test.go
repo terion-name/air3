@@ -17,6 +17,7 @@ import (
 	"github.com/terion-name/air3/internal/ingest"
 	"github.com/terion-name/air3/internal/pending"
 	"github.com/terion-name/air3/internal/tickets"
+	"github.com/terion-name/air3/internal/uploadsource"
 )
 
 const fullPathStreamBufferBytes = 256 * 1024
@@ -48,7 +49,7 @@ func newFullPathHarness(tb testing.TB, ingestHTTP2 bool) *fullPathHarness {
 		Signing:               config.SigningConfig{Disabled: true},
 		Timeouts:              config.TimeoutConfig{PendingRequestTTL: 30 * time.Second, StreamTimeout: 30 * time.Second},
 		StreamCopyBufferBytes: fullPathStreamBufferBytes,
-	}, reg, publisher, nil)
+	}, reg, uploadsource.NewRegistry(uploadsource.Options{}), publisher, nil)
 	var nextID atomic.Uint64
 	edge.newToken = func() (string, error) {
 		id := nextID.Add(1)
