@@ -196,6 +196,20 @@ func TestVerifySigV4ValidVectors(t *testing.T) {
 			headers:   []string{"host"},
 		},
 		{
+			name:      "presigned PUT",
+			request:   testSignPresignedRequest(t, http.MethodPut, "/photos/puppy.jpg", nil, nil, nil, 300),
+			presigned: true,
+			payload:   sigv4UnsignedPayload,
+			headers:   []string{"host"},
+		},
+		{
+			name:      "presigned DELETE",
+			request:   testSignPresignedRequest(t, http.MethodDelete, "/photos/puppy.jpg", nil, nil, nil, 300),
+			presigned: true,
+			payload:   sigv4UnsignedPayload,
+			headers:   []string{"host"},
+		},
+		{
 			name:      "header GET",
 			request:   testSignHeaderRequest(t, http.MethodGet, "/photos/puppy.jpg", nil, nil),
 			presigned: false,
@@ -208,6 +222,20 @@ func TestVerifySigV4ValidVectors(t *testing.T) {
 			presigned: false,
 			payload:   sigv4EmptySHA256,
 			headers:   []string{"host", "x-amz-date"},
+		},
+		{
+			name:      "header PUT",
+			request:   testSignHeaderRequest(t, http.MethodPut, "/photos/puppy.jpg", []string{"host", "x-amz-content-sha256", "x-amz-date"}, map[string]string{"x-amz-content-sha256": sigv4UnsignedPayload}),
+			presigned: false,
+			payload:   sigv4UnsignedPayload,
+			headers:   []string{"host", "x-amz-content-sha256", "x-amz-date"},
+		},
+		{
+			name:      "header DELETE",
+			request:   testSignHeaderRequest(t, http.MethodDelete, "/photos/puppy.jpg", []string{"host", "x-amz-content-sha256", "x-amz-date"}, map[string]string{"x-amz-content-sha256": sigv4EmptySHA256}),
+			presigned: false,
+			payload:   sigv4EmptySHA256,
+			headers:   []string{"host", "x-amz-content-sha256", "x-amz-date"},
 		},
 	}
 	for _, tc := range cases {
@@ -395,8 +423,8 @@ func TestVerifySigV4PayloadHashRules(t *testing.T) {
 		if err != nil {
 			t.Fatalf("VerifySigV4 returned error: %v", err)
 		}
-		if ctx.PayloadHash != sigv4UnsignedPayload {
-			t.Fatalf("payload hash = %q", ctx.PayloadHash)
+		if ctx.PayloadHash != sigv4UnsignedPayload || ctx.PayloadHashMode() != PayloadHashModeUnsigned {
+			t.Fatalf("payload hash = %q mode = %s", ctx.PayloadHash, ctx.PayloadHashMode())
 		}
 	})
 
@@ -410,14 +438,182 @@ func TestVerifySigV4PayloadHashRules(t *testing.T) {
 		assertErrorContains(t, err, "payload hash")
 	})
 
-	t.Run("presigned PUT accepts query content hash", func(t *testing.T) {
+	t.Run("presigned PUT defaults to unsigned payload", func(t *testing.T) {
+		r := testSignPresignedRequest(t, http.MethodPut, "/object", nil, nil, nil, 300)
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		if ctx.PayloadHash != sigv4UnsignedPayload || ctx.PayloadHashMode() != PayloadHashModeUnsigned {
+			t.Fatalf("payload hash = %q mode = %s", ctx.PayloadHash, ctx.PayloadHashMode())
+		}
+	})
+
+	t.Run("malformed PUT payload hash fails verification", func(t *testing.T) {
+		r := testNewRequest(t, http.MethodPut, "/object")
+		r.Header.Set("x-amz-date", testSignedAt.Format(sigv4DateTimeLayout))
+		r.Header.Set("x-amz-content-sha256", "not-a-payload-hash")
+		date := testSignedAt.Format(sigv4DateLayout)
+		scope := sigv4CredentialScopeString(date, testRegion)
+		r.Header.Set("Authorization", fmt.Sprintf("%s Credential=%s/%s, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=%s", sigv4Algorithm, testAccessKey, scope, strings.Repeat("0", 64)))
+		_, err := VerifySigV4(r, testVerifyOptions())
+		assertErrorContains(t, err, "payload hash")
+	})
+}
+
+func TestValidatePayloadHashForOperation(t *testing.T) {
+	signedHash := strings.Repeat("0", 64)
+	tests := []struct {
+		name      string
+		operation Operation
+		hash      string
+		wantMode  PayloadHashMode
+		wantError bool
+	}{
+		{
+			name:      "put unsigned",
+			operation: OperationPutObject,
+			hash:      sigv4UnsignedPayload,
+			wantMode:  PayloadHashModeUnsigned,
+		},
+		{
+			name:      "put signed empty rejected",
+			operation: OperationPutObject,
+			hash:      sigv4EmptySHA256,
+			wantMode:  PayloadHashModeEmpty,
+			wantError: true,
+		},
+		{
+			name:      "put signed payload rejected",
+			operation: OperationPutObject,
+			hash:      signedHash,
+			wantMode:  PayloadHashModeSigned,
+			wantError: true,
+		},
+		{
+			name:      "put streaming rejected",
+			operation: OperationPutObject,
+			hash:      sigv4StreamingAWS4HMACSHA256Payload,
+			wantMode:  PayloadHashModeStreaming,
+			wantError: true,
+		},
+		{
+			name:      "delete unsigned",
+			operation: OperationDeleteObject,
+			hash:      sigv4UnsignedPayload,
+			wantMode:  PayloadHashModeUnsigned,
+		},
+		{
+			name:      "delete empty",
+			operation: OperationDeleteObject,
+			hash:      sigv4EmptySHA256,
+			wantMode:  PayloadHashModeEmpty,
+		},
+		{
+			name:      "delete signed payload rejected",
+			operation: OperationDeleteObject,
+			hash:      signedHash,
+			wantMode:  PayloadHashModeSigned,
+			wantError: true,
+		},
+		{
+			name:      "delete streaming rejected",
+			operation: OperationDeleteObject,
+			hash:      sigv4StreamingUnsignedPayloadTrailer,
+			wantMode:  PayloadHashModeStreaming,
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := AuthContext{PayloadHash: tt.hash}
+			if got := ctx.PayloadHashMode(); got != tt.wantMode {
+				t.Fatalf("PayloadHashMode() = %s, want %s", got, tt.wantMode)
+			}
+			err := ValidatePayloadHashForOperation(tt.operation, ctx)
+			if tt.wantError && err == nil {
+				t.Fatal("ValidatePayloadHashForOperation() error = nil, want error")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestMutationPayloadHashPolicyAfterVerification(t *testing.T) {
+	t.Run("header PUT rejects signed payload after verification", func(t *testing.T) {
+		r := testSignHeaderRequest(t, http.MethodPut, "/object", []string{"host", "x-amz-content-sha256", "x-amz-date"}, map[string]string{"x-amz-content-sha256": sigv4EmptySHA256})
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		assertErrorContains(t, ValidatePayloadHashForOperation(OperationPutObject, ctx), "payload hash")
+	})
+
+	t.Run("header PUT rejects streaming marker after verification", func(t *testing.T) {
+		r := testSignHeaderRequest(t, http.MethodPut, "/object", []string{"host", "x-amz-content-sha256", "x-amz-date"}, map[string]string{"x-amz-content-sha256": sigv4StreamingAWS4HMACSHA256Payload})
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		if ctx.PayloadHashMode() != PayloadHashModeStreaming {
+			t.Fatalf("PayloadHashMode() = %s, want %s", ctx.PayloadHashMode(), PayloadHashModeStreaming)
+		}
+		assertErrorContains(t, ValidatePayloadHashForOperation(OperationPutObject, ctx), "payload hash")
+	})
+
+	t.Run("presigned PUT accepts unsigned payload", func(t *testing.T) {
+		r := testSignPresignedRequest(t, http.MethodPut, "/object", nil, nil, nil, 300)
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		if err := ValidatePayloadHashForOperation(OperationPutObject, ctx); err != nil {
+			t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
+		}
+	})
+
+	t.Run("presigned PUT rejects signed payload after verification", func(t *testing.T) {
 		r := testSignPresignedRequest(t, http.MethodPut, "/object", nil, nil, []testRawParam{{key: "X-Amz-Content-Sha256", value: sigv4EmptySHA256}}, 300)
 		ctx, err := VerifySigV4(r, testVerifyOptions())
 		if err != nil {
 			t.Fatalf("VerifySigV4 returned error: %v", err)
 		}
-		if ctx.PayloadHash != sigv4EmptySHA256 {
-			t.Fatalf("payload hash = %q", ctx.PayloadHash)
+		assertErrorContains(t, ValidatePayloadHashForOperation(OperationPutObject, ctx), "payload hash")
+	})
+
+	t.Run("header DELETE accepts empty payload hash", func(t *testing.T) {
+		r := testSignHeaderRequest(t, http.MethodDelete, "/object", []string{"host", "x-amz-content-sha256", "x-amz-date"}, map[string]string{"x-amz-content-sha256": sigv4EmptySHA256})
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		if err := ValidatePayloadHashForOperation(OperationDeleteObject, ctx); err != nil {
+			t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
+		}
+	})
+
+	t.Run("presigned DELETE accepts unsigned payload", func(t *testing.T) {
+		r := testSignPresignedRequest(t, http.MethodDelete, "/object", nil, nil, nil, 300)
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		if err := ValidatePayloadHashForOperation(OperationDeleteObject, ctx); err != nil {
+			t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
+		}
+	})
+
+	t.Run("presigned DELETE accepts empty payload hash", func(t *testing.T) {
+		r := testSignPresignedRequest(t, http.MethodDelete, "/object", nil, nil, []testRawParam{{key: "X-Amz-Content-Sha256", value: sigv4EmptySHA256}}, 300)
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		if err := ValidatePayloadHashForOperation(OperationDeleteObject, ctx); err != nil {
+			t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
 		}
 	})
 }

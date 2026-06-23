@@ -29,6 +29,8 @@ const (
 	OperationHeadObject    Operation = "HeadObject"
 	OperationHeadBucket    Operation = "HeadBucket"
 	OperationListObjectsV2 Operation = "ListObjectsV2"
+	OperationPutObject     Operation = "PutObject"
+	OperationDeleteObject  Operation = "DeleteObject"
 )
 
 type RequestMapping struct {
@@ -57,7 +59,7 @@ func Classify(r *http.Request, opts ClassifyOptions) (RequestMapping, error) {
 	if r == nil {
 		return RequestMapping{}, fmt.Errorf("classify s3 operation: nil request")
 	}
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+	if !operationSupportedMethod(r.Method) {
 		return RequestMapping{}, fmt.Errorf("classify s3 operation: unsupported method %s", r.Method)
 	}
 
@@ -110,17 +112,16 @@ func operationClassifySingleServer(r *http.Request, segments []string, opts Clas
 		}, nil
 	}
 
-	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+	if operation, ok := operationObjectOperationForMethod(r.Method); ok {
 		if len(segments) < 2 {
 			return RequestMapping{}, fmt.Errorf("classify s3 operation: unsupported bucket-level %s operation", r.Method)
+		}
+		if err := operationValidateObjectMutationQuery(r, operation); err != nil {
+			return RequestMapping{}, err
 		}
 		key := strings.Join(segments[1:], "/")
 		if key == "" {
 			return RequestMapping{}, fmt.Errorf("classify s3 operation: missing object key")
-		}
-		operation := OperationGetObject
-		if r.Method == http.MethodHead {
-			operation = OperationHeadObject
 		}
 		return RequestMapping{
 			Operation:     operation,
@@ -194,10 +195,9 @@ func operationClassifyMultiServer(r *http.Request, segments []string, opts Class
 		}, nil
 	}
 
-	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		operation := OperationGetObject
-		if r.Method == http.MethodHead {
-			operation = OperationHeadObject
+	if operation, ok := operationObjectOperationForMethod(r.Method); ok {
+		if err := operationValidateObjectMutationQuery(r, operation); err != nil {
+			return RequestMapping{}, err
 		}
 
 		if directPrefix {
@@ -246,6 +246,53 @@ func operationClassifyMultiServer(r *http.Request, segments []string, opts Class
 	}
 
 	return RequestMapping{}, fmt.Errorf("classify s3 operation: unsupported method %s", r.Method)
+}
+
+func operationSupportedMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func operationObjectOperationForMethod(method string) (Operation, bool) {
+	switch method {
+	case http.MethodGet:
+		return OperationGetObject, true
+	case http.MethodHead:
+		return OperationHeadObject, true
+	case http.MethodPut:
+		return OperationPutObject, true
+	case http.MethodDelete:
+		return OperationDeleteObject, true
+	default:
+		return "", false
+	}
+}
+
+func operationValidateObjectMutationQuery(r *http.Request, operation Operation) error {
+	if operation != OperationPutObject && operation != OperationDeleteObject {
+		return nil
+	}
+	for _, key := range operationUnsupportedMutationQueryKeys(operation) {
+		if _, ok := r.URL.Query()[key]; ok {
+			return fmt.Errorf("classify s3 operation: unsupported %s query parameter %q", operation, key)
+		}
+	}
+	return nil
+}
+
+func operationUnsupportedMutationQueryKeys(operation Operation) []string {
+	switch operation {
+	case OperationPutObject:
+		return []string{"acl", "tagging", "uploads", "uploadId", "partNumber"}
+	case OperationDeleteObject:
+		return []string{"versionId"}
+	default:
+		return nil
+	}
 }
 
 func operationPathSegments(u *url.URL) ([]string, error) {

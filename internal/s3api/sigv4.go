@@ -15,13 +15,16 @@ import (
 )
 
 const (
-	sigv4Algorithm       = "AWS4-HMAC-SHA256"
-	sigv4Service         = "s3"
-	sigv4TerminalScope   = "aws4_request"
-	sigv4DateLayout      = "20060102"
-	sigv4DateTimeLayout  = "20060102T150405Z"
-	sigv4EmptySHA256     = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	sigv4UnsignedPayload = "UNSIGNED-PAYLOAD"
+	sigv4Algorithm                             = "AWS4-HMAC-SHA256"
+	sigv4Service                               = "s3"
+	sigv4TerminalScope                         = "aws4_request"
+	sigv4DateLayout                            = "20060102"
+	sigv4DateTimeLayout                        = "20060102T150405Z"
+	sigv4EmptySHA256                           = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	sigv4UnsignedPayload                       = "UNSIGNED-PAYLOAD"
+	sigv4StreamingAWS4HMACSHA256Payload        = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	sigv4StreamingAWS4HMACSHA256PayloadTrailer = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+	sigv4StreamingUnsignedPayloadTrailer       = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
 )
 
 // Credentials are the AWS SigV4 access key pair accepted by VerifySigV4.
@@ -47,6 +50,56 @@ type AuthContext struct {
 	SignedHeaders  []string
 	PayloadHash    string
 	Presigned      bool
+}
+
+// PayloadHashMode identifies the canonical SigV4 payload hash form after verification.
+type PayloadHashMode string
+
+const (
+	PayloadHashModeUnknown   PayloadHashMode = "Unknown"
+	PayloadHashModeUnsigned  PayloadHashMode = "UnsignedPayload"
+	PayloadHashModeEmpty     PayloadHashMode = "EmptySHA256"
+	PayloadHashModeSigned    PayloadHashMode = "SignedSHA256"
+	PayloadHashModeStreaming PayloadHashMode = "Streaming"
+)
+
+// PayloadHashMode reports the verified request's canonical payload hash mode.
+func (ctx AuthContext) PayloadHashMode() PayloadHashMode {
+	return PayloadHashModeForValue(ctx.PayloadHash)
+}
+
+// PayloadHashModeForValue classifies a canonical SigV4 payload hash value.
+func PayloadHashModeForValue(value string) PayloadHashMode {
+	switch {
+	case value == sigv4UnsignedPayload:
+		return PayloadHashModeUnsigned
+	case value == sigv4EmptySHA256:
+		return PayloadHashModeEmpty
+	case sigv4IsStreamingPayloadHash(value):
+		return PayloadHashModeStreaming
+	case sigv4IsSHA256PayloadHash(value):
+		return PayloadHashModeSigned
+	default:
+		return PayloadHashModeUnknown
+	}
+}
+
+// ValidatePayloadHashForOperation applies the S3 API v1 mutation payload-hash policy.
+func ValidatePayloadHashForOperation(operation Operation, auth AuthContext) error {
+	mode := auth.PayloadHashMode()
+	switch operation {
+	case OperationPutObject:
+		if mode == PayloadHashModeUnsigned {
+			return nil
+		}
+	case OperationDeleteObject:
+		if mode == PayloadHashModeUnsigned || mode == PayloadHashModeEmpty {
+			return nil
+		}
+	default:
+		return nil
+	}
+	return fmt.Errorf("payload hash: %s does not allow %s", operation, mode)
 }
 
 type sigv4CredentialScope struct {
@@ -396,10 +449,7 @@ func sigv4PresignedPayloadHash(r *http.Request, signedHeaders []string) (string,
 		payloadHash = queryHash
 	}
 	if payloadHash == "" {
-		if sigv4IsReadOnlyMethod(r.Method) {
-			return sigv4UnsignedPayload, nil
-		}
-		return "", errors.New("payload hash: non-GET/HEAD presigned requests require content hash")
+		return sigv4UnsignedPayload, nil
 	}
 	if sigv4IsReadOnlyMethod(r.Method) && payloadHash != sigv4UnsignedPayload && payloadHash != sigv4EmptySHA256 {
 		return "", errors.New("payload hash: GET/HEAD presigned payload hash must be UNSIGNED-PAYLOAD or empty SHA256")
@@ -659,9 +709,10 @@ func sigv4HasSignedHeader(signedHeaders []string, header string) bool {
 }
 
 func sigv4ValidPayloadHash(value string) bool {
-	if value == sigv4UnsignedPayload {
-		return true
-	}
+	return value == sigv4UnsignedPayload || sigv4IsSHA256PayloadHash(value) || sigv4IsStreamingPayloadHash(value)
+}
+
+func sigv4IsSHA256PayloadHash(value string) bool {
 	if len(value) != 64 {
 		return false
 	}
@@ -671,6 +722,15 @@ func sigv4ValidPayloadHash(value string) bool {
 		}
 	}
 	return true
+}
+
+func sigv4IsStreamingPayloadHash(value string) bool {
+	switch value {
+	case sigv4StreamingAWS4HMACSHA256Payload, sigv4StreamingAWS4HMACSHA256PayloadTrailer, sigv4StreamingUnsignedPayloadTrailer:
+		return true
+	default:
+		return false
+	}
 }
 
 func sigv4IsReadOnlyMethod(method string) bool {

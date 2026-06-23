@@ -4,13 +4,12 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
-	"strings"
 	"testing"
 )
 
 func TestClassifyRejectsUnsupportedMethodsBeforeValidation(t *testing.T) {
 	boom := errors.New("validation should not run")
-	got, err := Classify(operationRequest(t, http.MethodPut, "/photos/2024/cat.jpg"), ClassifyOptions{
+	got, err := Classify(operationRequest(t, http.MethodPost, "/photos/2024/cat.jpg"), ClassifyOptions{
 		Mode:           RoutingSingleServer,
 		ValidateBucket: func(bucket string) error { return boom },
 	})
@@ -44,6 +43,28 @@ func TestClassifySingleServerOperations(t *testing.T) {
 			req:  operationRequest(t, http.MethodHead, "/photos/2024/cat.jpg"),
 			want: RequestMapping{
 				Operation:     OperationHeadObject,
+				S3Bucket:      "photos",
+				S3Key:         "2024/cat.jpg",
+				BackendBucket: "photos",
+				BackendKey:    "2024/cat.jpg",
+			},
+		},
+		{
+			name: "put object",
+			req:  operationRequest(t, http.MethodPut, "/photos/2024/cat.jpg"),
+			want: RequestMapping{
+				Operation:     OperationPutObject,
+				S3Bucket:      "photos",
+				S3Key:         "2024/cat.jpg",
+				BackendBucket: "photos",
+				BackendKey:    "2024/cat.jpg",
+			},
+		},
+		{
+			name: "delete object",
+			req:  operationRequest(t, http.MethodDelete, "/photos/2024/cat.jpg"),
+			want: RequestMapping{
+				Operation:     OperationDeleteObject,
 				S3Bucket:      "photos",
 				S3Key:         "2024/cat.jpg",
 				BackendBucket: "photos",
@@ -115,13 +136,15 @@ func TestClassifySingleServerRejectsShortObjectAndV1List(t *testing.T) {
 
 func TestClassifyMultiServerStandardObjectMapping(t *testing.T) {
 	tests := []struct {
-		name string
-		url  string
-		want RequestMapping
+		name   string
+		method string
+		url    string
+		want   RequestMapping
 	}{
 		{
-			name: "get object",
-			url:  "/edge-a/photos/2024/cat.jpg",
+			name:   "get object",
+			method: http.MethodGet,
+			url:    "/edge-a/photos/2024/cat.jpg",
 			want: RequestMapping{
 				Operation:     OperationGetObject,
 				Server:        "edge-a",
@@ -132,10 +155,37 @@ func TestClassifyMultiServerStandardObjectMapping(t *testing.T) {
 			},
 		},
 		{
-			name: "head object",
-			url:  "/edge-a/photos/2024/cat.jpg",
+			name:   "head object",
+			method: http.MethodHead,
+			url:    "/edge-a/photos/2024/cat.jpg",
 			want: RequestMapping{
 				Operation:     OperationHeadObject,
+				Server:        "edge-a",
+				S3Bucket:      "edge-a",
+				S3Key:         "photos/2024/cat.jpg",
+				BackendBucket: "photos",
+				BackendKey:    "2024/cat.jpg",
+			},
+		},
+		{
+			name:   "put object",
+			method: http.MethodPut,
+			url:    "/edge-a/photos/2024/cat.jpg",
+			want: RequestMapping{
+				Operation:     OperationPutObject,
+				Server:        "edge-a",
+				S3Bucket:      "edge-a",
+				S3Key:         "photos/2024/cat.jpg",
+				BackendBucket: "photos",
+				BackendKey:    "2024/cat.jpg",
+			},
+		},
+		{
+			name:   "delete object",
+			method: http.MethodDelete,
+			url:    "/edge-a/photos/2024/cat.jpg",
+			want: RequestMapping{
+				Operation:     OperationDeleteObject,
 				Server:        "edge-a",
 				S3Bucket:      "edge-a",
 				S3Key:         "photos/2024/cat.jpg",
@@ -147,11 +197,7 @@ func TestClassifyMultiServerStandardObjectMapping(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			method := http.MethodGet
-			if strings.HasPrefix(tt.name, "head") {
-				method = http.MethodHead
-			}
-			got, err := Classify(operationRequest(t, method, tt.url), ClassifyOptions{Mode: RoutingMultiServer})
+			got, err := Classify(operationRequest(t, tt.method, tt.url), ClassifyOptions{Mode: RoutingMultiServer})
 			if err != nil {
 				t.Fatalf("Classify() error = %v", err)
 			}
@@ -245,6 +291,30 @@ func TestClassifyMultiServerDefaultBucketDirectPrefix(t *testing.T) {
 			},
 		},
 		{
+			name: "put object",
+			req:  operationRequest(t, http.MethodPut, "/edge-a/2024/cat.jpg"),
+			want: RequestMapping{
+				Operation:     OperationPutObject,
+				Server:        "edge-a",
+				S3Bucket:      "edge-a",
+				S3Key:         "2024/cat.jpg",
+				BackendBucket: "default-photos",
+				BackendKey:    "2024/cat.jpg",
+			},
+		},
+		{
+			name: "delete object",
+			req:  operationRequest(t, http.MethodDelete, "/edge-a/2024/cat.jpg"),
+			want: RequestMapping{
+				Operation:     OperationDeleteObject,
+				Server:        "edge-a",
+				S3Bucket:      "edge-a",
+				S3Key:         "2024/cat.jpg",
+				BackendBucket: "default-photos",
+				BackendKey:    "2024/cat.jpg",
+			},
+		},
+		{
 			name: "list direct prefix",
 			req:  operationRequest(t, http.MethodGet, "/edge-a?list-type=2&prefix=2024/"),
 			want: RequestMapping{
@@ -329,6 +399,58 @@ func TestClassifyBucketValidationHook(t *testing.T) {
 	})
 	if !errors.Is(err, boom) {
 		t.Fatalf("Classify() error = %v, want wrapping boom", err)
+	}
+}
+
+func TestClassifyRejectsBucketLevelAndUnsupportedMutationVariants(t *testing.T) {
+	tests := []struct {
+		name string
+		req  *http.Request
+		opts ClassifyOptions
+	}{
+		{
+			name: "single-server put bucket",
+			req:  operationRequest(t, http.MethodPut, "/photos"),
+			opts: ClassifyOptions{Mode: RoutingSingleServer},
+		},
+		{
+			name: "single-server delete bucket",
+			req:  operationRequest(t, http.MethodDelete, "/photos"),
+			opts: ClassifyOptions{Mode: RoutingSingleServer},
+		},
+		{
+			name: "put acl",
+			req:  operationRequest(t, http.MethodPut, "/photos/2024/cat.jpg?acl"),
+			opts: ClassifyOptions{Mode: RoutingSingleServer},
+		},
+		{
+			name: "put tagging",
+			req:  operationRequest(t, http.MethodPut, "/photos/2024/cat.jpg?tagging"),
+			opts: ClassifyOptions{Mode: RoutingSingleServer},
+		},
+		{
+			name: "put multipart",
+			req:  operationRequest(t, http.MethodPut, "/photos/2024/cat.jpg?partNumber=1&uploadId=upload"),
+			opts: ClassifyOptions{Mode: RoutingSingleServer},
+		},
+		{
+			name: "delete version",
+			req:  operationRequest(t, http.MethodDelete, "/photos/2024/cat.jpg?versionId=1"),
+			opts: ClassifyOptions{Mode: RoutingSingleServer},
+		},
+		{
+			name: "multi-server put without backend object",
+			req:  operationRequest(t, http.MethodPut, "/edge-a/photos"),
+			opts: ClassifyOptions{Mode: RoutingMultiServer},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := Classify(tt.req, tt.opts); err == nil {
+				t.Fatalf("Classify() = %#v, want error", got)
+			}
+		})
 	}
 }
 
