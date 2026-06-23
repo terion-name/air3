@@ -350,7 +350,8 @@ While air3 primarily relies on its highly-secure HMAC signed URLs, you can optio
 ### Security First
 
 - **No Real S3 Credentials at the Edge:** You must define a *brand new, gateway-only* set of credentials (`AIR3_S3_API_ACCESS_KEY_ID` and `AIR3_S3_API_SECRET_ACCESS_KEY`). The Edge Gateway only uses these to verify incoming AWS SigV4 requests. It **does not** give the Edge access to the backend storage. These are completely separate from your real, private S3 credentials and your HMAC `AIR3_SIGNING_SECRET`.
-- **Strictly Read-Only:** The API deliberately only supports safe read operations: `GetObject`, `HeadObject`, `ListObjectsV2`, and `HeadBucket`. Any attempt to write, delete, manage buckets, or perform complex bucket operations is immediately rejected at the Edge.
+- **Mutations Off by Default:** The API defaults to safe read operations: `GetObject`, `HeadObject`, `ListObjectsV2`, and `HeadBucket`. S3-compatible `PUT`/`DELETE` handling must be explicitly gated with `MUTATIONS_ENABLED=true`.
+- **Independent Edge/Connector Gates:** Routed mutations require `MUTATIONS_ENABLED=true` on both the Edge and the target Connector. Direct-server aliases bypass the Connector, so direct alias mutations require only the Edge gate. `AIR3_MUTATIONS_ENABLED` remains as a compatibility alias; if both names are non-empty, their boolean values must match.
 
 ### Using the API (Path-Style)
 

@@ -82,6 +82,7 @@ type EdgeConfig struct {
 	ServerDefaultBuckets       map[string]string
 	NATS                       NATSConfig
 	S3API                      S3APIConfig
+	MutationsEnabled           bool
 	Signing                    SigningConfig
 	MTLS                       MTLSPaths
 	Timeouts                   TimeoutConfig
@@ -109,6 +110,7 @@ type ConnectorConfig struct {
 	TicketWorkers      int
 	AllowedBuckets     []string
 	NATS               NATSConfig
+	MutationsEnabled   bool
 	S3                 S3Config
 	MTLS               MTLSPaths
 	Timeouts           TimeoutConfig
@@ -181,6 +183,10 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 	if err != nil {
 		return EdgeConfig{}, err
 	}
+	mutationsEnabled, err := env.boolAlias("MUTATIONS_ENABLED", "AIR3_MUTATIONS_ENABLED", false)
+	if err != nil {
+		return EdgeConfig{}, err
+	}
 	ingestTransport, err := loadIngestTransport(env)
 	if err != nil {
 		return EdgeConfig{}, err
@@ -194,6 +200,7 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 		IngestQUICListenAddr:  env.get("AIR3_EDGE_INGEST_QUIC_ADDR", ""),
 		StreamCopyBufferBytes: streamCopyBufferBytes,
 		MultiServer:           multiServer,
+		MutationsEnabled:      mutationsEnabled,
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
@@ -252,6 +259,10 @@ func LoadEdge(opts Options) (EdgeConfig, error) {
 
 func LoadConnector(opts Options) (ConnectorConfig, error) {
 	env := normalizedOptions(opts)
+	mutationsEnabled, err := env.boolAlias("MUTATIONS_ENABLED", "AIR3_MUTATIONS_ENABLED", false)
+	if err != nil {
+		return ConnectorConfig{}, err
+	}
 	ingestDisableHTTP2, err := env.bool("AIR3_INGEST_DISABLE_HTTP2", true)
 	if err != nil {
 		return ConnectorConfig{}, err
@@ -281,6 +292,7 @@ func LoadConnector(opts Options) (ConnectorConfig, error) {
 		IngestQUICAddr:     env.get("AIR3_INGEST_QUIC_ADDR", ""),
 		IngestPoolSize:     ingestPoolSize,
 		TicketWorkers:      ticketWorkers,
+		MutationsEnabled:   mutationsEnabled,
 	}
 	cfg.AllowedBuckets, err = env.list("AIR3_ALLOWED_BUCKETS", "demo")
 	if err != nil {
@@ -843,6 +855,37 @@ func (e envReader) bool(name string, fallback bool) (bool, error) {
 		return false, fmt.Errorf("%s must be a boolean: %w", name, err)
 	}
 	return v, nil
+}
+
+func (e envReader) boolAlias(name, alias string, fallback bool) (bool, error) {
+	value, valueOK := e.lookupTrimmed(name)
+	aliasValue, aliasOK := e.lookupTrimmed(alias)
+
+	valueSet := valueOK && value != ""
+	aliasSet := aliasOK && aliasValue != ""
+	if !valueSet && !aliasSet {
+		return fallback, nil
+	}
+
+	var parsed bool
+	if valueSet {
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return false, fmt.Errorf("%s must be a boolean: %w", name, err)
+		}
+		parsed = v
+	}
+	if aliasSet {
+		v, err := strconv.ParseBool(aliasValue)
+		if err != nil {
+			return false, fmt.Errorf("%s must be a boolean: %w", alias, err)
+		}
+		if valueSet && v != parsed {
+			return false, fmt.Errorf("%s and %s conflict: %s=%q differs from %s=%q", name, alias, name, value, alias, aliasValue)
+		}
+		parsed = v
+	}
+	return parsed, nil
 }
 
 func (e envReader) list(name, fallback string) ([]string, error) {

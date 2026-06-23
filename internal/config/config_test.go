@@ -29,6 +29,9 @@ func TestLoadEdgeDefaultsWithDisabledSigning(t *testing.T) {
 	if cfg.IngestTransport != IngestTransportHTTP || cfg.IngestTCPListenAddr != "" || cfg.IngestQUICListenAddr != "" {
 		t.Fatalf("ingest transport defaults = %q/%q/%q, want http with no direct address", cfg.IngestTransport, cfg.IngestTCPListenAddr, cfg.IngestQUICListenAddr)
 	}
+	if cfg.MutationsEnabled {
+		t.Fatal("MutationsEnabled = true, want default false")
+	}
 	if cfg.MultiServer {
 		t.Fatal("MultiServer = true, want default false")
 	}
@@ -166,6 +169,124 @@ func TestLoadEdgeRejectsS3APIConfigErrors(t *testing.T) {
 	}
 }
 
+func TestLoadMutationsEnabledAliases(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want bool
+	}{
+		{
+			name: "canonical enables mutations",
+			env:  map[string]string{"MUTATIONS_ENABLED": "true"},
+			want: true,
+		},
+		{
+			name: "compatibility alias enables mutations",
+			env:  map[string]string{"AIR3_MUTATIONS_ENABLED": "true"},
+			want: true,
+		},
+		{
+			name: "matching aliases succeed",
+			env: map[string]string{
+				"MUTATIONS_ENABLED":      "TRUE",
+				"AIR3_MUTATIONS_ENABLED": "true",
+			},
+			want: true,
+		},
+		{
+			name: "empty canonical uses compatibility alias",
+			env: map[string]string{
+				"MUTATIONS_ENABLED":      "",
+				"AIR3_MUTATIONS_ENABLED": "true",
+			},
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run("edge/"+tc.name, func(t *testing.T) {
+			env := map[string]string{"AIR3_SIGNING_DISABLED": "true"}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			cfg, err := LoadEdge(testOptions(env, nil))
+			if err != nil {
+				t.Fatalf("LoadEdge() error = %v", err)
+			}
+			if cfg.MutationsEnabled != tc.want {
+				t.Fatalf("MutationsEnabled = %t, want %t", cfg.MutationsEnabled, tc.want)
+			}
+		})
+		t.Run("connector/"+tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"AIR3_S3_ACCESS_KEY_ID":     "access",
+				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+			}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			cfg, err := LoadConnector(testOptions(env, nil))
+			if err != nil {
+				t.Fatalf("LoadConnector() error = %v", err)
+			}
+			if cfg.MutationsEnabled != tc.want {
+				t.Fatalf("MutationsEnabled = %t, want %t", cfg.MutationsEnabled, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadMutationsEnabledRejectsInvalidAndConflictingAliases(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "invalid canonical",
+			env:  map[string]string{"MUTATIONS_ENABLED": "sometimes"},
+			want: "MUTATIONS_ENABLED must be a boolean",
+		},
+		{
+			name: "invalid compatibility alias",
+			env:  map[string]string{"AIR3_MUTATIONS_ENABLED": "sometimes"},
+			want: "AIR3_MUTATIONS_ENABLED must be a boolean",
+		},
+		{
+			name: "conflicting non-empty aliases",
+			env: map[string]string{
+				"MUTATIONS_ENABLED":      "true",
+				"AIR3_MUTATIONS_ENABLED": "false",
+			},
+			want: "MUTATIONS_ENABLED and AIR3_MUTATIONS_ENABLED conflict",
+		},
+	}
+	for _, tc := range tests {
+		t.Run("edge/"+tc.name, func(t *testing.T) {
+			env := map[string]string{"AIR3_SIGNING_DISABLED": "true"}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			_, err := LoadEdge(testOptions(env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadEdge() error = %v, want containing %q", err, tc.want)
+			}
+		})
+		t.Run("connector/"+tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"AIR3_S3_ACCESS_KEY_ID":     "access",
+				"AIR3_S3_SECRET_ACCESS_KEY": "secret",
+			}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			_, err := LoadConnector(testOptions(env, nil))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadConnector() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadConnectorParsesS3AndDoesNotRequireSigning(t *testing.T) {
 	env := map[string]string{
 		"AIR3_S3_ACCESS_KEY_ID":     "access",
@@ -210,6 +331,9 @@ func TestLoadConnectorDefaultsIngestDisableHTTP2True(t *testing.T) {
 	}
 	if cfg.IngestTransport != IngestTransportHTTP || cfg.IngestTCPAddr != "" || cfg.IngestQUICAddr != "" {
 		t.Fatalf("ingest transport defaults = %q/%q/%q, want http with no direct address", cfg.IngestTransport, cfg.IngestTCPAddr, cfg.IngestQUICAddr)
+	}
+	if cfg.MutationsEnabled {
+		t.Fatal("MutationsEnabled = true, want default false")
 	}
 	if cfg.IngestPoolSize != 32 {
 		t.Fatalf("IngestPoolSize = %d, want 32", cfg.IngestPoolSize)

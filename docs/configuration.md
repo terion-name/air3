@@ -24,6 +24,7 @@ The Edge Gateway is your public-facing entry point. In the default recommended t
 | `DIRECT_SERVERS` | unset | Bare fallback name for `AIR3_DIRECT_SERVERS`. If both are set, the values must match exactly or startup fails. |
 | `AIR3_EDGE_ALLOWED_CONNECTOR_IDENTITIES` | unset | (Optional) Comma-separated list of allowed Connector certificate identities for mTLS ingest connections. |
 | `AIR3_S3_API_ENABLED` | `false` | Opt in to the public read-only S3-compatible API for AWS SigV4-shaped requests. When `false`, normal air3 HMAC signed URLs continue unchanged and S3 API credentials are not required. |
+| `MUTATIONS_ENABLED` | `false` | Enables S3-compatible mutation methods at the Edge when mutation handling is installed. S3 API mutations are off by default. `AIR3_MUTATIONS_ENABLED` is a compatibility alias; if both names are non-empty, they must parse to the same boolean. Routed Connector mutations require this gate on both Edge and Connector; direct-server alias mutations require only the Edge gate. |
 | `AIR3_S3_API_REGION` | `us-east-1` | Region clients must use in the AWS SigV4 credential scope. Region matching is strict. |
 | `AIR3_S3_API_ACCESS_KEY_ID` | unset | Public gateway SigV4 verifier access key ID. Required only when `AIR3_S3_API_ENABLED=true`; not a backend connector/direct S3 credential. |
 | `AIR3_S3_API_SECRET_ACCESS_KEY` | unset | Public gateway SigV4 verifier secret. Required only when `AIR3_S3_API_ENABLED=true`; not a backend connector/direct S3 credential and not `AIR3_SIGNING_SECRET`. |
@@ -42,6 +43,7 @@ The Private Connector is your secure worker. It has **no public inbound listener
 | `AIR3_CONNECTOR_WORKERS` | `1` (perf: `1024`) | Per-connector concurrent ticket handling worker limit. Must be `1`-`4096`. |
 | `AIR3_ALLOWED_BUCKETS` | `demo` | Defense-in-depth: the Connector also enforces this allowlist before attempting to reach S3. |
 | `AIR3_SERVER_NAME` | unset | Optional connector server alias for routed multi-server mode. When set, the connector rejects tickets for other aliases and derives its NATS subject from `AIR3_NATS_SUBJECT_TEMPLATE` unless `AIR3_NATS_SUBJECT` is explicitly set. |
+| `MUTATIONS_ENABLED` | `false` | Enables Connector-side processing for routed S3-compatible mutations when mutation handling is installed. S3 API mutations are off by default. `AIR3_MUTATIONS_ENABLED` is a compatibility alias; if both names are non-empty, they must parse to the same boolean. Routed mutations require this gate on both Edge and Connector. |
 | `AIR3_INGEST_DISABLE_HTTP2` | `false` | Legacy compatibility knob used only when `AIR3_INGEST_TRANSPORT=http`: `true` forces HTTP/1.1 and `false` enables HTTP/2. Explicit `AIR3_INGEST_TRANSPORT=http1`, `http2`, or `http3` ignores this setting. |
 
 ## NATS Broker
@@ -100,7 +102,8 @@ The Edge Gateway can expose a **read-only, path-style S3-compatible API** for cl
 You must provide a brand new set of *gateway verifier credentials*: `AIR3_S3_API_ACCESS_KEY_ID` and `AIR3_S3_API_SECRET_ACCESS_KEY`.
 - These credentials **only** live on the Edge and are used merely to authenticate incoming AWS SigV4 requests.
 - They **do not** grant access to backend S3 storage, and they are completely separate from your real S3 backend credentials.
-- The API is strictly read-only (`GetObject`, `HeadObject`, `ListObjectsV2`, `HeadBucket`). Writes, deletes, and complex bucket operations are forcefully rejected at the Edge.
+- By default, the API is read-only (`GetObject`, `HeadObject`, `ListObjectsV2`, `HeadBucket`). S3-compatible mutations (`PUT`/`DELETE`) are disabled unless `MUTATIONS_ENABLED=true` is set.
+- Routed S3 mutations require `MUTATIONS_ENABLED=true` on both the Edge and the target Connector. Direct-server aliases bypass the Connector, so direct alias mutations require only the Edge gate.
 
 ### Path-Style Mapping Examples
 
@@ -240,7 +243,7 @@ Our included `deploy/compose.yaml` demo clearly illustrates the required network
 | `broker` | `edge-gateway`, `nats`, `private-connector` | The middle ground for NATS control messages and Edge ingest routing. |
 | `private` | `private-connector`, `versitygw`, `aws-cli` | Deeply isolated S3 access. Marked `internal: true`. The Edge Gateway cannot reach this. |
 
-The Compose demo wires the optional S3-compatible API variables through to the Edge with `AIR3_S3_API_ENABLED=false` and empty verifier credentials by default, so credentials are not required unless you explicitly enable the API:
+The Compose demo wires the optional S3-compatible API variables through to the Edge with `AIR3_S3_API_ENABLED=false`, `MUTATIONS_ENABLED=false`, and empty verifier credentials by default, so credentials and mutation support are not required unless you explicitly enable them:
 
 ```sh
 AIR3_S3_API_ENABLED=true \
