@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -28,8 +29,10 @@ import (
 	"github.com/terion-name/air3/internal/mtls"
 	"github.com/terion-name/air3/internal/natsclient"
 	"github.com/terion-name/air3/internal/pending"
+	"github.com/terion-name/air3/internal/s3api"
 	"github.com/terion-name/air3/internal/s3fetch"
 	"github.com/terion-name/air3/internal/tickets"
+	"github.com/terion-name/air3/internal/uploadsource"
 )
 
 const ingestTransportBufferBytes = 256 * 1024
@@ -40,6 +43,41 @@ type objectFetcher interface {
 
 type ingestSender interface {
 	Send(context.Context, tickets.Ticket, ingestMetadata, io.Reader) error
+}
+
+type uploadSourceOpener interface {
+	Open(context.Context, tickets.Ticket) (*openedUploadSource, error)
+}
+
+type openedUploadSource struct {
+	Body          io.ReadCloser
+	ContentLength int64
+}
+
+type httpUploadSourceOpener struct {
+	client *http.Client
+}
+
+func (o httpUploadSourceOpener) Open(ctx context.Context, ticket tickets.Ticket) (*openedUploadSource, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ticket.UploadSourceURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create upload source request: %w", err)
+	}
+	req.Header.Set(uploadsource.TokenHeader, ticket.UploadToken)
+
+	client := o.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get upload source: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("upload source returned status %d", resp.StatusCode)
+	}
+	return &openedUploadSource{Body: resp.Body, ContentLength: resp.ContentLength}, nil
 }
 
 type closeableIngestSender interface {
@@ -55,11 +93,12 @@ func closeIngestSender(sender any) error {
 }
 
 type connector struct {
-	cfg     config.ConnectorConfig
-	fetcher objectFetcher
-	sender  ingestSender
-	logger  *slog.Logger
-	now     func() time.Time
+	cfg          config.ConnectorConfig
+	fetcher      objectFetcher
+	sender       ingestSender
+	uploadOpener uploadSourceOpener
+	logger       *slog.Logger
+	now          func() time.Time
 }
 
 var errTicketWorkerPoolClosed = errors.New("ticket worker pool is closed")
@@ -193,7 +232,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			logger.Warn("ingest sender close failed", "error", safeLogError(err))
 		}
 	}()
-	worker := newConnector(cfg, fetcher, sender, logger)
+	uploadClient, err := ingestHTTPClient(cfg.MTLS, cfg.Timeouts.StreamTimeout, cfg.IngestDisableHTTP2, cfg.IngestPoolSize)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := closeHTTPClient(uploadClient); err != nil {
+			logger.Warn("upload source client close failed", "error", safeLogError(err))
+		}
+	}()
+	worker := newConnectorWithUploadSourceOpener(cfg, fetcher, sender, httpUploadSourceOpener{client: uploadClient}, logger)
 
 	natsCtx, cancelNATS := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelNATS()
@@ -228,13 +276,20 @@ func run(ctx context.Context, logger *slog.Logger) error {
 }
 
 func newConnector(cfg config.ConnectorConfig, fetcher objectFetcher, sender ingestSender, logger *slog.Logger) *connector {
+	return newConnectorWithUploadSourceOpener(cfg, fetcher, sender, httpUploadSourceOpener{client: http.DefaultClient}, logger)
+}
+
+func newConnectorWithUploadSourceOpener(cfg config.ConnectorConfig, fetcher objectFetcher, sender ingestSender, uploadOpener uploadSourceOpener, logger *slog.Logger) *connector {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	if sender == nil {
 		sender = httpIngestSender{client: http.DefaultClient}
 	}
-	return &connector{cfg: cfg, fetcher: fetcher, sender: sender, logger: logger, now: time.Now}
+	if uploadOpener == nil {
+		uploadOpener = httpUploadSourceOpener{client: http.DefaultClient}
+	}
+	return &connector{cfg: cfg, fetcher: fetcher, sender: sender, uploadOpener: uploadOpener, logger: logger, now: time.Now}
 }
 
 func (c *connector) handleTicket(ctx context.Context, ticket tickets.Ticket) error {
@@ -245,7 +300,30 @@ func (c *connector) handleTicket(ctx context.Context, ticket tickets.Ticket) err
 	ticketCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	obj, err := c.fetcher.Fetch(ticketCtx, s3fetch.Request{Method: ticket.Method, Operation: ticket.Operation, Bucket: ticket.Bucket, Key: ticket.Key, Range: ticket.Range, List: ticket.List})
+	op, err := tickets.ResolveOperation(ticket.Method, ticket.Operation)
+	if err != nil {
+		return err
+	}
+	if isMutationOperation(op) && !c.cfg.MutationsEnabled {
+		return c.sendS3Error(ticketCtx, ticket, http.StatusMethodNotAllowed, "MethodNotAllowed", "mutations are disabled")
+	}
+
+	req := s3fetch.Request{Method: ticket.Method, Operation: op, Bucket: ticket.Bucket, Key: ticket.Key, Range: ticket.Range, List: ticket.List}
+	if op == tickets.OperationPutObject {
+		upload, err := c.uploadOpener.Open(ticketCtx, ticket)
+		if err != nil || upload == nil || upload.Body == nil {
+			return c.sendS3Error(ticketCtx, ticket, http.StatusServiceUnavailable, "ServiceUnavailable", "upload source is unavailable")
+		}
+		defer upload.Body.Close()
+		if upload.ContentLength >= 0 && ticket.ContentLength != nil && upload.ContentLength != *ticket.ContentLength {
+			return c.sendS3Error(ticketCtx, ticket, http.StatusBadRequest, "InvalidRequest", "upload source content length does not match ticket content length")
+		}
+		req.Body = upload.Body
+		req.ContentLength = ticket.ContentLength
+		req.ContentType = ticket.ContentType
+	}
+
+	obj, err := c.fetcher.Fetch(ticketCtx, req)
 	if err != nil {
 		status := statusForFetchError(err)
 		return c.sender.Send(ticketCtx, ticket, metadataForStatus(status), http.NoBody)
@@ -254,7 +332,7 @@ func (c *connector) handleTicket(ctx context.Context, ticket tickets.Ticket) err
 
 	metadata := metadataForObject(obj)
 	body := obj.Body
-	if ticket.Method == http.MethodHead {
+	if op == tickets.OperationHeadObject {
 		body = http.NoBody
 	}
 	return c.sender.Send(ticketCtx, ticket, metadata, body)
@@ -275,13 +353,51 @@ func (c *connector) validateTicket(ticket tickets.Ticket) error {
 	if !bucketAllowed(ticket.Bucket, c.cfg.AllowedBuckets) || !bucketAllowed(ticket.Bucket, c.cfg.S3.AllowedBuckets) {
 		return errors.New("ticket bucket is not allowed")
 	}
-	if ticket.Method != http.MethodGet && ticket.Method != http.MethodHead {
-		return errors.New("ticket method is not supported")
+	op, err := tickets.ResolveOperation(ticket.Method, ticket.Operation)
+	if err != nil {
+		return err
+	}
+	if !operationAllowed(op) {
+		return errors.New("ticket operation is not supported")
 	}
 	if err := validateIngestURL(ticket.IngestURL); err != nil {
 		return err
 	}
 	return nil
+}
+
+func operationAllowed(op tickets.Operation) bool {
+	switch op {
+	case tickets.OperationGetObject, tickets.OperationHeadObject, tickets.OperationListObjectsV2, tickets.OperationPutObject, tickets.OperationDeleteObject:
+		return true
+	default:
+		return false
+	}
+}
+
+func isMutationOperation(op tickets.Operation) bool {
+	return op == tickets.OperationPutObject || op == tickets.OperationDeleteObject
+}
+
+func (c *connector) sendS3Error(ctx context.Context, ticket tickets.Ticket, status int, code, message string) error {
+	body, err := s3api.RenderErrorXML(s3api.ErrorResponse{
+		Code:      code,
+		Message:   message,
+		Resource:  s3ErrorResource(ticket),
+		RequestID: ticket.RequestID,
+	})
+	if err != nil {
+		return fmt.Errorf("render s3 error xml: %w", err)
+	}
+	metadata := ingestMetadata{StatusCode: status, ContentType: "application/xml", ContentLength: int64(len(body))}
+	return c.sender.Send(ctx, ticket, metadata, bytes.NewReader(body))
+}
+
+func s3ErrorResource(ticket tickets.Ticket) string {
+	if ticket.Key == "" {
+		return "/" + ticket.Bucket
+	}
+	return "/" + ticket.Bucket + "/" + ticket.Key
 }
 
 type httpIngestSender struct {
