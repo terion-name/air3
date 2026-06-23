@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"time"
+	"unicode"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -28,12 +29,15 @@ var (
 )
 
 type Request struct {
-	Method    string
-	Operation tickets.Operation
-	Bucket    string
-	Key       string
-	Range     string
-	List      *tickets.ListRequest
+	Method        string
+	Operation     tickets.Operation
+	Bucket        string
+	Key           string
+	Range         string
+	List          *tickets.ListRequest
+	Body          io.Reader
+	ContentLength *int64
+	ContentType   string
 }
 
 type Object struct {
@@ -103,6 +107,10 @@ func (f *Fetcher) Fetch(ctx context.Context, req Request) (*Object, error) {
 		return f.head(ctx, req)
 	case tickets.OperationListObjectsV2:
 		return f.list(ctx, req)
+	case tickets.OperationPutObject:
+		return f.put(ctx, req)
+	case tickets.OperationDeleteObject:
+		return f.delete(ctx, req)
 	default:
 		return f.get(ctx, req)
 	}
@@ -130,6 +138,38 @@ func (f *Fetcher) get(ctx context.Context, req Request) (*Object, error) {
 		LastModified:  formatHTTPTime(out.LastModified),
 		AcceptRanges:  value(out.AcceptRanges),
 		Body:          out.Body,
+	}, nil
+}
+
+func (f *Fetcher) put(ctx context.Context, req Request) (*Object, error) {
+	input := &s3.PutObjectInput{
+		Bucket:        aws.String(req.Bucket),
+		Key:           aws.String(req.Key),
+		Body:          req.Body,
+		ContentLength: req.ContentLength,
+	}
+	if req.ContentType != "" {
+		input.ContentType = aws.String(req.ContentType)
+	}
+	out, err := f.client.PutObject(ctx, input)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &Object{
+		StatusCode: http.StatusOK,
+		ETag:       value(out.ETag),
+		Body:       http.NoBody,
+	}, nil
+}
+
+func (f *Fetcher) delete(ctx context.Context, req Request) (*Object, error) {
+	_, err := f.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(req.Bucket), Key: aws.String(req.Key)})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &Object{
+		StatusCode: http.StatusNoContent,
+		Body:       http.NoBody,
 	}, nil
 }
 
@@ -241,6 +281,9 @@ func validateRequest(req Request) (tickets.Operation, error) {
 
 	switch operation {
 	case tickets.OperationGetObject, tickets.OperationHeadObject:
+		if err := validateMutationFieldsOmitted(req); err != nil {
+			return "", err
+		}
 		if req.List != nil {
 			return "", fmt.Errorf("%w: list metadata must be omitted for object requests", ErrInvalidRequest)
 		}
@@ -251,6 +294,9 @@ func validateRequest(req Request) (tickets.Operation, error) {
 			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}
 	case tickets.OperationListObjectsV2:
+		if err := validateMutationFieldsOmitted(req); err != nil {
+			return "", err
+		}
 		if req.Key != "" {
 			return "", fmt.Errorf("%w: key must be empty for ListObjectsV2", ErrInvalidRequest)
 		}
@@ -260,10 +306,70 @@ func validateRequest(req Request) (tickets.Operation, error) {
 		if err := tickets.ValidateListRequest(req.List); err != nil {
 			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}
+	case tickets.OperationPutObject:
+		if req.List != nil {
+			return "", fmt.Errorf("%w: list metadata must be omitted for PutObject", ErrInvalidRequest)
+		}
+		if req.Range != "" {
+			return "", fmt.Errorf("%w: range must be omitted for PutObject", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateKey(req.Key); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if req.Body == nil {
+			return "", fmt.Errorf("%w: body is required for PutObject", ErrInvalidRequest)
+		}
+		if req.ContentLength == nil {
+			return "", fmt.Errorf("%w: content length is required for PutObject", ErrInvalidRequest)
+		}
+		if *req.ContentLength < 0 {
+			return "", fmt.Errorf("%w: content length must be non-negative", ErrInvalidRequest)
+		}
+		if err := validateContentType(req.ContentType); err != nil {
+			return "", err
+		}
+	case tickets.OperationDeleteObject:
+		if err := validateMutationFieldsOmitted(req); err != nil {
+			return "", err
+		}
+		if req.List != nil {
+			return "", fmt.Errorf("%w: list metadata must be omitted for DeleteObject", ErrInvalidRequest)
+		}
+		if req.Range != "" {
+			return "", fmt.Errorf("%w: range must be omitted for DeleteObject", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateKey(req.Key); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
 	default:
 		return "", fmt.Errorf("%w: unsupported operation", ErrInvalidRequest)
 	}
 	return operation, nil
+}
+
+func validateMutationFieldsOmitted(req Request) error {
+	if req.Body != nil {
+		return fmt.Errorf("%w: body must be omitted", ErrInvalidRequest)
+	}
+	if req.ContentLength != nil {
+		return fmt.Errorf("%w: content length must be omitted", ErrInvalidRequest)
+	}
+	if req.ContentType != "" {
+		return fmt.Errorf("%w: content type must be omitted", ErrInvalidRequest)
+	}
+	return nil
+}
+
+func validateContentType(contentType string) error {
+	if len(contentType) > 255 {
+		return fmt.Errorf("%w: content type is too long", ErrInvalidRequest)
+	}
+	for _, r := range contentType {
+		if r == 0 || unicode.IsControl(r) {
+			return fmt.Errorf("%w: content type must not contain control characters", ErrInvalidRequest)
+		}
+	}
+	return nil
 }
 
 func mapError(err error) error {

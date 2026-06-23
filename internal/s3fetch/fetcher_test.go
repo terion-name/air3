@@ -76,6 +76,75 @@ func TestFetcherHeadObjectUsesHEADAndNoBody(t *testing.T) {
 	}
 }
 
+func TestFetcherPutObjectStreamsBodyAndMapsETag(t *testing.T) {
+	var gotMethod, gotPath, gotContentType, gotBody string
+	var gotContentLength int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotContentLength = r.ContentLength
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll(request body) error = %v", err)
+		}
+		gotBody = string(body)
+		w.Header().Set("ETag", `"put-etag"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	fetcher, err := New(context.Background(), testConfig(ts.URL))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	contentLength := int64(len("hello mutation"))
+	obj, err := fetcher.Fetch(context.Background(), Request{
+		Method:        http.MethodPut,
+		Operation:     tickets.OperationPutObject,
+		Bucket:        "demo-bucket",
+		Key:           "objects/file.txt",
+		Body:          strings.NewReader("hello mutation"),
+		ContentLength: &contentLength,
+		ContentType:   "text/plain",
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+
+	if gotMethod != http.MethodPut || gotPath != "/demo-bucket/objects/file.txt" || gotContentType != "text/plain" || gotContentLength != contentLength || gotBody != "hello mutation" {
+		t.Fatalf("request method=%q path=%q contentType=%q contentLength=%d body=%q", gotMethod, gotPath, gotContentType, gotContentLength, gotBody)
+	}
+	if obj.StatusCode != http.StatusOK || obj.ETag != `"put-etag"` || obj.Body != http.NoBody {
+		t.Fatalf("object = %#v", obj)
+	}
+}
+
+func TestFetcherDeleteObjectUsesDeleteAndNoBody(t *testing.T) {
+	var gotMethod, gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	fetcher, err := New(context.Background(), testConfig(ts.URL))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	obj, err := fetcher.Fetch(context.Background(), Request{Method: http.MethodDelete, Operation: tickets.OperationDeleteObject, Bucket: "demo-bucket", Key: "objects/file.txt"})
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if gotMethod != http.MethodDelete || gotPath != "/demo-bucket/objects/file.txt" {
+		t.Fatalf("request method=%q path=%q", gotMethod, gotPath)
+	}
+	if obj.StatusCode != http.StatusNoContent || obj.Body != http.NoBody {
+		t.Fatalf("object = %#v", obj)
+	}
+}
+
 func TestFetcherListObjectsV2RequestShapeAndXMLMetadata(t *testing.T) {
 	var gotMethod, gotPath string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -322,6 +391,100 @@ func TestFetcherRejectsInvalidListRequestBeforeS3(t *testing.T) {
 	}
 	if called {
 		t.Fatal("S3 server was called for invalid list request")
+	}
+}
+
+func TestFetcherRejectsInvalidMutationRequestBeforeS3(t *testing.T) {
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	defer ts.Close()
+
+	fetcher, err := New(context.Background(), testConfig(ts.URL))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	validLength := int64(5)
+	negativeLength := int64(-1)
+	tests := []struct {
+		name string
+		req  Request
+	}{
+		{
+			name: "put missing body",
+			req:  Request{Method: http.MethodPut, Operation: tickets.OperationPutObject, Bucket: "demo-bucket", Key: "objects/file.txt", ContentLength: &validLength},
+		},
+		{
+			name: "put missing content length",
+			req:  Request{Method: http.MethodPut, Operation: tickets.OperationPutObject, Bucket: "demo-bucket", Key: "objects/file.txt", Body: strings.NewReader("hello")},
+		},
+		{
+			name: "put negative content length",
+			req:  Request{Method: http.MethodPut, Operation: tickets.OperationPutObject, Bucket: "demo-bucket", Key: "objects/file.txt", Body: strings.NewReader("hello"), ContentLength: &negativeLength},
+		},
+		{
+			name: "put range",
+			req:  Request{Method: http.MethodPut, Operation: tickets.OperationPutObject, Bucket: "demo-bucket", Key: "objects/file.txt", Range: "bytes=0-1", Body: strings.NewReader("hello"), ContentLength: &validLength},
+		},
+		{
+			name: "put list metadata",
+			req:  Request{Method: http.MethodPut, Operation: tickets.OperationPutObject, Bucket: "demo-bucket", Key: "objects/file.txt", List: &tickets.ListRequest{MaxKeys: 10, Rewrite: tickets.ListRewrite{Bucket: "public-bucket"}}, Body: strings.NewReader("hello"), ContentLength: &validLength},
+		},
+		{
+			name: "put unsafe content type",
+			req:  Request{Method: http.MethodPut, Operation: tickets.OperationPutObject, Bucket: "demo-bucket", Key: "objects/file.txt", Body: strings.NewReader("hello"), ContentLength: &validLength, ContentType: "text/plain\n"},
+		},
+		{
+			name: "delete body",
+			req:  Request{Method: http.MethodDelete, Operation: tickets.OperationDeleteObject, Bucket: "demo-bucket", Key: "objects/file.txt", Body: strings.NewReader("hello")},
+		},
+		{
+			name: "delete content length",
+			req:  Request{Method: http.MethodDelete, Operation: tickets.OperationDeleteObject, Bucket: "demo-bucket", Key: "objects/file.txt", ContentLength: &validLength},
+		},
+		{
+			name: "delete range",
+			req:  Request{Method: http.MethodDelete, Operation: tickets.OperationDeleteObject, Bucket: "demo-bucket", Key: "objects/file.txt", Range: "bytes=0-1"},
+		},
+		{
+			name: "delete list metadata",
+			req:  Request{Method: http.MethodDelete, Operation: tickets.OperationDeleteObject, Bucket: "demo-bucket", Key: "objects/file.txt", List: &tickets.ListRequest{MaxKeys: 10, Rewrite: tickets.ListRewrite{Bucket: "public-bucket"}}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := fetcher.Fetch(context.Background(), tc.req)
+			if !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("Fetch() error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+	if called {
+		t.Fatal("S3 server was called for invalid mutation request")
+	}
+}
+
+func TestFetcherMapsMutationBackendErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`<Error><Code>NoSuchBucket</Code><Message>missing bucket</Message></Error>`))
+	}))
+	defer ts.Close()
+
+	fetcher, err := New(context.Background(), testConfig(ts.URL))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	contentLength := int64(5)
+	_, err = fetcher.Fetch(context.Background(), Request{Method: http.MethodPut, Operation: tickets.OperationPutObject, Bucket: "demo-bucket", Key: "objects/file.txt", Body: strings.NewReader("hello"), ContentLength: &contentLength})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("PutObject Fetch() error = %v, want ErrNotFound", err)
+	}
+	_, err = fetcher.Fetch(context.Background(), Request{Method: http.MethodDelete, Operation: tickets.OperationDeleteObject, Bucket: "demo-bucket", Key: "objects/file.txt"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteObject Fetch() error = %v, want ErrNotFound", err)
 	}
 }
 
