@@ -107,6 +107,17 @@ aws_s3api() {
   return "$rc"
 }
 
+# Like aws_s3api but with stock CLI settings (no payload-signing or checksum
+# overrides), proving default-configured clients work against the edge.
+aws_default() {
+  AWS_CONFIG_FILE=/dev/null \
+    AWS_ACCESS_KEY_ID="$AIR3_S3_API_ACCESS_KEY_ID" \
+    AWS_SECRET_ACCESS_KEY="$AIR3_S3_API_SECRET_ACCESS_KEY" \
+    AWS_DEFAULT_REGION="${AIR3_S3_API_REGION:-us-east-1}" \
+    AWS_PAGER="" \
+    aws --endpoint-url "$BASE_URL" --ca-bundle "$CERT_DIR/dev-ca.crt" "$@"
+}
+
 mutation_gate_enabled() {
   local primary=${MUTATIONS_ENABLED:-}
   local alias=${AIR3_MUTATIONS_ENABLED:-}
@@ -207,6 +218,81 @@ run_optional_s3_mutation_smoke() {
 
   deleted_url=$(sign_url GET "$mutation_key" 2m)
   assert_status "signed GET after S3 API DeleteObject" "404" "$deleted_url"
+
+  run_default_client_mutation_smoke
+  run_multipart_mutation_smoke
+}
+
+run_default_client_mutation_smoke() {
+  echo "Running default-settings AWS CLI mutation smoke checks..."
+  local key body readback
+  key="air3-smoke-default-$(date +%s)-$$.txt"
+  body=$(mktemp)
+  readback=$(mktemp)
+  printf 'default client settings\n' >"$body"
+
+  if ! aws_default s3api put-object --bucket "$BUCKET" --key "$key" --body "$body" --content-type text/plain >/dev/null; then
+    rm -f "$body" "$readback"
+    echo "error: default-settings PutObject (aws-chunked) failed" >&2
+    exit 1
+  fi
+  echo "ok: default-settings PutObject (aws-chunked trailer mode) succeeded"
+
+  if ! aws_default s3api get-object --bucket "$BUCKET" --key "$key" "$readback" >/dev/null; then
+    rm -f "$body" "$readback"
+    echo "error: default-settings GetObject failed" >&2
+    exit 1
+  fi
+  if ! cmp -s "$body" "$readback"; then
+    rm -f "$body" "$readback"
+    echo "error: default-settings readback did not match uploaded content" >&2
+    exit 1
+  fi
+  rm -f "$body" "$readback"
+  echo "ok: default-settings readback matched uploaded content"
+
+  if ! aws_default s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null; then
+    echo "error: default-settings DeleteObject failed" >&2
+    exit 1
+  fi
+  echo "ok: default-settings DeleteObject removed temporary object"
+}
+
+run_multipart_mutation_smoke() {
+  echo "Running multipart upload smoke checks (aws s3 cp)..."
+  local key big_body big_readback size_mb
+  key="air3-smoke-multipart-$(date +%s)-$$.bin"
+  size_mb=${AIR3_DEMO_MULTIPART_MB:-16}
+  big_body=$(mktemp)
+  big_readback=$(mktemp)
+  dd if=/dev/urandom of="$big_body" bs=1048576 count="$size_mb" status=none
+
+  # aws s3 cp switches to multipart upload above the 8 MiB threshold.
+  if ! aws_default s3 cp "$big_body" "s3://$BUCKET/$key" >/dev/null; then
+    rm -f "$big_body" "$big_readback"
+    echo "error: multipart upload via aws s3 cp failed" >&2
+    exit 1
+  fi
+  echo "ok: multipart upload via aws s3 cp succeeded (${size_mb} MiB)"
+
+  if ! aws_default s3 cp "s3://$BUCKET/$key" "$big_readback" >/dev/null; then
+    rm -f "$big_body" "$big_readback"
+    echo "error: multipart download via aws s3 cp failed" >&2
+    exit 1
+  fi
+  if ! cmp -s "$big_body" "$big_readback"; then
+    rm -f "$big_body" "$big_readback"
+    echo "error: multipart readback did not match uploaded content" >&2
+    exit 1
+  fi
+  rm -f "$big_body" "$big_readback"
+  echo "ok: multipart readback matched uploaded content"
+
+  if ! aws_default s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null; then
+    echo "error: multipart cleanup DeleteObject failed" >&2
+    exit 1
+  fi
+  echo "ok: multipart cleanup removed temporary object"
 }
 
 wait_for_edge() {
