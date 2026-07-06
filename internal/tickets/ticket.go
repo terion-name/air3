@@ -22,12 +22,24 @@ const Version = 1
 type Operation string
 
 const (
-	OperationGetObject     Operation = "GetObject"
-	OperationHeadObject    Operation = "HeadObject"
-	OperationListObjectsV2 Operation = "ListObjectsV2"
-	OperationPutObject     Operation = "PutObject"
-	OperationDeleteObject  Operation = "DeleteObject"
+	OperationGetObject               Operation = "GetObject"
+	OperationHeadObject              Operation = "HeadObject"
+	OperationListObjectsV2           Operation = "ListObjectsV2"
+	OperationPutObject               Operation = "PutObject"
+	OperationDeleteObject            Operation = "DeleteObject"
+	OperationCreateMultipartUpload   Operation = "CreateMultipartUpload"
+	OperationUploadPart              Operation = "UploadPart"
+	OperationCompleteMultipartUpload Operation = "CompleteMultipartUpload"
+	OperationAbortMultipartUpload    Operation = "AbortMultipartUpload"
 )
+
+// MaxCompleteMultipartBodyBytes caps the CompleteMultipartUpload part-list XML
+// accepted from clients. S3 allows at most 10,000 parts, which stays well
+// under this limit.
+const MaxCompleteMultipartBodyBytes = 1 << 20
+
+// MaxPartNumber is the highest S3 multipart part number.
+const MaxPartNumber = 10000
 
 var (
 	ErrInvalidTicket = errors.New("invalid ticket")
@@ -55,6 +67,23 @@ type ListRewrite struct {
 	KeyPrefix string `json:"key_prefix,omitempty"`
 }
 
+// MultipartRequest carries the multipart-upload identity for one ticket and
+// the public bucket/key names echoed in multipart response XML. Part lists
+// never ride tickets; the CompleteMultipartUpload XML streams through the
+// upload source instead.
+type MultipartRequest struct {
+	UploadID   string           `json:"upload_id,omitempty"`
+	PartNumber int32            `json:"part_number,omitempty"`
+	Rewrite    MultipartRewrite `json:"rewrite"`
+}
+
+// MultipartRewrite describes the public bucket/key names for multipart
+// response XML.
+type MultipartRewrite struct {
+	Bucket string `json:"bucket"`
+	Key    string `json:"key"`
+}
+
 // Ticket is the NATS control-plane message for one live HTTP work item.
 //
 // The JSON schema is intentionally small and closed. Tickets carry only the
@@ -63,23 +92,24 @@ type ListRewrite struct {
 // credentials, object bytes, public client secrets, or raw untrusted request
 // headers.
 type Ticket struct {
-	Version         int          `json:"version"`
-	RequestID       string       `json:"request_id"`
-	Bucket          string       `json:"bucket"`
-	Key             string       `json:"key"`
-	Method          string       `json:"method"`
-	Operation       Operation    `json:"operation,omitempty"`
-	Range           string       `json:"range,omitempty"`
-	List            *ListRequest `json:"list,omitempty"`
-	UploadSourceURL string       `json:"upload_source_url,omitempty"`
-	UploadToken     string       `json:"upload_token,omitempty"`
-	ContentLength   *int64       `json:"content_length,omitempty"`
-	ContentType     string       `json:"content_type,omitempty"`
-	Server          string       `json:"server,omitempty"`
-	DeadlineUnixMS  int64        `json:"deadline_unix_ms"`
-	IngestURL       string       `json:"ingest_url"`
-	IngestToken     string       `json:"ingest_token"`
-	TraceID         string       `json:"trace_id,omitempty"`
+	Version         int               `json:"version"`
+	RequestID       string            `json:"request_id"`
+	Bucket          string            `json:"bucket"`
+	Key             string            `json:"key"`
+	Method          string            `json:"method"`
+	Operation       Operation         `json:"operation,omitempty"`
+	Range           string            `json:"range,omitempty"`
+	List            *ListRequest      `json:"list,omitempty"`
+	Multipart       *MultipartRequest `json:"multipart,omitempty"`
+	UploadSourceURL string            `json:"upload_source_url,omitempty"`
+	UploadToken     string            `json:"upload_token,omitempty"`
+	ContentLength   *int64            `json:"content_length,omitempty"`
+	ContentType     string            `json:"content_type,omitempty"`
+	Server          string            `json:"server,omitempty"`
+	DeadlineUnixMS  int64             `json:"deadline_unix_ms"`
+	IngestURL       string            `json:"ingest_url"`
+	IngestToken     string            `json:"ingest_token"`
+	TraceID         string            `json:"trace_id,omitempty"`
 }
 
 // Marshal validates t against now before returning its canonical JSON encoding.
@@ -158,6 +188,14 @@ func (t Ticket) Validate(now time.Time) error {
 		return t.validatePutObjectOperation()
 	case OperationDeleteObject:
 		return t.validateDeleteObjectOperation()
+	case OperationCreateMultipartUpload:
+		return t.validateCreateMultipartOperation()
+	case OperationUploadPart:
+		return t.validateUploadPartOperation()
+	case OperationCompleteMultipartUpload:
+		return t.validateCompleteMultipartOperation()
+	case OperationAbortMultipartUpload:
+		return t.validateAbortMultipartOperation()
 	default:
 		return fieldError("operation", "is unsupported")
 	}
@@ -198,6 +236,22 @@ func ResolveOperation(method string, op Operation) (Operation, error) {
 		if method != "DELETE" {
 			return "", fieldError("operation", "DeleteObject requires method DELETE")
 		}
+	case OperationCreateMultipartUpload:
+		if method != "POST" {
+			return "", fieldError("operation", "CreateMultipartUpload requires method POST")
+		}
+	case OperationUploadPart:
+		if method != "PUT" {
+			return "", fieldError("operation", "UploadPart requires method PUT")
+		}
+	case OperationCompleteMultipartUpload:
+		if method != "POST" {
+			return "", fieldError("operation", "CompleteMultipartUpload requires method POST")
+		}
+	case OperationAbortMultipartUpload:
+		if method != "DELETE" {
+			return "", fieldError("operation", "AbortMultipartUpload requires method DELETE")
+		}
 	default:
 		return "", fieldError("operation", "is unsupported")
 	}
@@ -207,6 +261,9 @@ func ResolveOperation(method string, op Operation) (Operation, error) {
 func (t Ticket) validateObjectOperation() error {
 	if t.List != nil {
 		return fieldError("list", "must be omitted for object operations")
+	}
+	if t.Multipart != nil {
+		return fieldError("multipart", "must be omitted for object operations")
 	}
 	if err := t.validateUploadEnvelopeOmitted(); err != nil {
 		return err
@@ -224,6 +281,9 @@ func (t Ticket) validateListOperation() error {
 	if t.Range != "" {
 		return fieldError("range", "must be omitted for ListObjectsV2")
 	}
+	if t.Multipart != nil {
+		return fieldError("multipart", "must be omitted for ListObjectsV2")
+	}
 	if err := t.validateUploadEnvelopeOmitted(); err != nil {
 		return err
 	}
@@ -237,20 +297,14 @@ func (t Ticket) validatePutObjectOperation() error {
 	if t.Range != "" {
 		return fieldError("range", "must be omitted for PutObject")
 	}
+	if t.Multipart != nil {
+		return fieldError("multipart", "must be omitted for PutObject")
+	}
 	if err := ValidateKey(t.Key); err != nil {
 		return err
 	}
-	if err := validateUploadSourceURL(t.UploadSourceURL); err != nil {
+	if err := t.validateUploadEnvelope(); err != nil {
 		return err
-	}
-	if !saneToken(t.UploadToken) {
-		return fieldError("upload_token", "is required and may contain only safe token characters")
-	}
-	if t.ContentLength == nil {
-		return fieldError("content_length", "is required for PutObject")
-	}
-	if *t.ContentLength < 0 {
-		return fieldError("content_length", "must be non-negative")
 	}
 	return validateContentType(t.ContentType)
 }
@@ -262,10 +316,115 @@ func (t Ticket) validateDeleteObjectOperation() error {
 	if t.Range != "" {
 		return fieldError("range", "must be omitted for DeleteObject")
 	}
+	if t.Multipart != nil {
+		return fieldError("multipart", "must be omitted for DeleteObject")
+	}
 	if err := t.validateUploadEnvelopeOmitted(); err != nil {
 		return err
 	}
 	return ValidateKey(t.Key)
+}
+
+func (t Ticket) validateCreateMultipartOperation() error {
+	if t.List != nil {
+		return fieldError("list", "must be omitted for CreateMultipartUpload")
+	}
+	if t.Range != "" {
+		return fieldError("range", "must be omitted for CreateMultipartUpload")
+	}
+	if err := ValidateKey(t.Key); err != nil {
+		return err
+	}
+	// CreateMultipartUpload carries the object content type but no body, so
+	// the upload envelope stays empty.
+	if t.UploadSourceURL != "" {
+		return fieldError("upload_source_url", "must be omitted for CreateMultipartUpload")
+	}
+	if t.UploadToken != "" {
+		return fieldError("upload_token", "must be omitted for CreateMultipartUpload")
+	}
+	if t.ContentLength != nil {
+		return fieldError("content_length", "must be omitted for CreateMultipartUpload")
+	}
+	if err := validateContentType(t.ContentType); err != nil {
+		return err
+	}
+	return ValidateMultipartRequest(OperationCreateMultipartUpload, t.Multipart)
+}
+
+func (t Ticket) validateUploadPartOperation() error {
+	if t.List != nil {
+		return fieldError("list", "must be omitted for UploadPart")
+	}
+	if t.Range != "" {
+		return fieldError("range", "must be omitted for UploadPart")
+	}
+	if t.ContentType != "" {
+		return fieldError("content_type", "must be omitted for UploadPart")
+	}
+	if err := ValidateKey(t.Key); err != nil {
+		return err
+	}
+	if err := t.validateUploadEnvelope(); err != nil {
+		return err
+	}
+	return ValidateMultipartRequest(OperationUploadPart, t.Multipart)
+}
+
+func (t Ticket) validateCompleteMultipartOperation() error {
+	if t.List != nil {
+		return fieldError("list", "must be omitted for CompleteMultipartUpload")
+	}
+	if t.Range != "" {
+		return fieldError("range", "must be omitted for CompleteMultipartUpload")
+	}
+	if t.ContentType != "" {
+		return fieldError("content_type", "must be omitted for CompleteMultipartUpload")
+	}
+	if err := ValidateKey(t.Key); err != nil {
+		return err
+	}
+	if err := t.validateUploadEnvelope(); err != nil {
+		return err
+	}
+	if *t.ContentLength > MaxCompleteMultipartBodyBytes {
+		return fieldError("content_length", "exceeds the CompleteMultipartUpload body limit")
+	}
+	return ValidateMultipartRequest(OperationCompleteMultipartUpload, t.Multipart)
+}
+
+func (t Ticket) validateAbortMultipartOperation() error {
+	if t.List != nil {
+		return fieldError("list", "must be omitted for AbortMultipartUpload")
+	}
+	if t.Range != "" {
+		return fieldError("range", "must be omitted for AbortMultipartUpload")
+	}
+	if err := t.validateUploadEnvelopeOmitted(); err != nil {
+		return err
+	}
+	if err := ValidateKey(t.Key); err != nil {
+		return err
+	}
+	return ValidateMultipartRequest(OperationAbortMultipartUpload, t.Multipart)
+}
+
+// validateUploadEnvelope checks the upload-source fields required by
+// operations whose request body streams through the edge upload source.
+func (t Ticket) validateUploadEnvelope() error {
+	if err := validateUploadSourceURL(t.UploadSourceURL); err != nil {
+		return err
+	}
+	if !saneToken(t.UploadToken) {
+		return fieldError("upload_token", "is required and may contain only safe token characters")
+	}
+	if t.ContentLength == nil {
+		return fieldError("content_length", "is required for upload operations")
+	}
+	if *t.ContentLength < 0 {
+		return fieldError("content_length", "must be non-negative")
+	}
+	return nil
 }
 
 func (t Ticket) validateUploadEnvelopeOmitted() error {
@@ -343,6 +502,51 @@ func ValidateListRequest(list *ListRequest) error {
 	}
 	if err := validateKeyLike("list.rewrite.key_prefix", list.Rewrite.KeyPrefix, false); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ValidateMultipartRequest checks the multipart identity carried by tickets
+// for op, which must be one of the four multipart operations.
+func ValidateMultipartRequest(op Operation, m *MultipartRequest) error {
+	if m == nil {
+		return fieldError("multipart", "is required for multipart operations")
+	}
+	switch op {
+	case OperationCreateMultipartUpload:
+		if m.UploadID != "" {
+			return fieldError("multipart.upload_id", "must be empty for CreateMultipartUpload")
+		}
+	case OperationUploadPart, OperationCompleteMultipartUpload, OperationAbortMultipartUpload:
+		if err := validateUploadID(m.UploadID); err != nil {
+			return err
+		}
+	default:
+		return fieldError("multipart", "must be omitted for non-multipart operations")
+	}
+	if op == OperationUploadPart {
+		if m.PartNumber < 1 || m.PartNumber > MaxPartNumber {
+			return fieldError("multipart.part_number", "must be between 1 and 10000")
+		}
+	} else if m.PartNumber != 0 {
+		return fieldError("multipart.part_number", "must be set only for UploadPart")
+	}
+	if err := ValidateBucket(m.Rewrite.Bucket); err != nil {
+		return fieldError("multipart.rewrite.bucket", "must be a valid DNS-style S3 bucket name")
+	}
+	return validateKeyLike("multipart.rewrite.key", m.Rewrite.Key, true)
+}
+
+// validateUploadID accepts the printable-ASCII upload IDs minted by S3
+// backends (base64-like, sometimes long) without trusting anything wider.
+func validateUploadID(id string) error {
+	if id == "" || len(id) > 1024 {
+		return fieldError("multipart.upload_id", "is required and must be at most 1024 characters")
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < '!' || id[i] > '~' {
+			return fieldError("multipart.upload_id", "must contain only printable non-space ASCII characters")
+		}
 	}
 	return nil
 }

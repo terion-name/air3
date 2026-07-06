@@ -276,9 +276,24 @@ type s3EdgeRequest struct {
 	rangeHeader   string
 	operation     tickets.Operation
 	list          *tickets.ListRequest
+	multipart     *tickets.MultipartRequest
 	headBucket    bool
 	contentLength *int64
 	contentType   string
+	// body is the effective upload body for operations that stream one:
+	// the raw request body, or an aws-chunked decoder wrapped around it.
+	body io.ReadCloser
+}
+
+// operationStreamsUploadBody reports whether op carries a client request body
+// that streams through the edge (upload source or direct backend call).
+func operationStreamsUploadBody(op tickets.Operation) bool {
+	switch op {
+	case tickets.OperationPutObject, tickets.OperationUploadPart, tickets.OperationCompleteMultipartUpload:
+		return true
+	default:
+		return false
+	}
 }
 
 func edgeS3APIMode(cfg config.EdgeConfig) s3api.RoutingMode {
@@ -324,8 +339,11 @@ func (s *edgeServer) serveS3API(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: req.bucket, Key: req.key, Method: r.Method, Operation: req.operation, Range: req.rangeHeader, List: req.list, Server: req.server, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
-	if req.operation == tickets.OperationPutObject {
+	ticket := tickets.Ticket{Version: tickets.Version, RequestID: reqID, Bucket: req.bucket, Key: req.key, Method: r.Method, Operation: req.operation, Range: req.rangeHeader, List: req.list, Multipart: req.multipart, Server: req.server, DeadlineUnixMS: deadline.UnixMilli(), IngestURL: ingestURL, IngestToken: ingestToken, TraceID: reqID}
+	if req.operation == tickets.OperationCreateMultipartUpload {
+		ticket.ContentType = req.contentType
+	}
+	if operationStreamsUploadBody(req.operation) {
 		uploadToken, err := s.newToken()
 		if err != nil {
 			writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
@@ -351,13 +369,13 @@ func (s *edgeServer) serveS3API(w http.ResponseWriter, r *http.Request) {
 	defer s.registry.Cancel(reqID, pending.ErrCanceled)
 
 	uploadRegistered := false
-	if req.operation == tickets.OperationPutObject {
+	if operationStreamsUploadBody(req.operation) {
 		if s.uploadSources == nil {
 			s.registry.Cancel(reqID, uploadsource.ErrInvalidSource)
 			writeS3Error(w, r, s3HTTPError{status: http.StatusInternalServerError, code: "InternalError", message: "Request setup failed"})
 			return
 		}
-		source := uploadsource.Source{RequestID: reqID, Token: ticket.UploadToken, Body: r.Body, ContentLength: req.contentLength, ContentType: req.contentType, Deadline: deadline, Context: r.Context()}
+		source := uploadsource.Source{RequestID: reqID, Token: ticket.UploadToken, Body: req.body, ContentLength: req.contentLength, ContentType: req.contentType, Deadline: deadline, Context: r.Context()}
 		if err := s.uploadSources.Register(source); err != nil {
 			s.registry.Cancel(reqID, err)
 			writeS3Error(w, r, s3ErrorForUploadSetup(err))
@@ -438,7 +456,7 @@ func (s *edgeServer) resolveS3Request(r *http.Request) (s3EdgeRequest, error) {
 		ValidateServer:         publicpath.ValidateAlias,
 	})
 	if err != nil {
-		return s3EdgeRequest{}, s3ErrorForClassify(err)
+		return s3EdgeRequest{}, s3ErrorForClassify(err, s.cfg.MutationsEnabled)
 	}
 
 	req := s3EdgeRequest{server: mapping.Server, bucket: mapping.BackendBucket, key: mapping.BackendKey}
@@ -458,14 +476,13 @@ func (s *edgeServer) resolveS3Request(r *http.Request) (s3EdgeRequest, error) {
 	case s3api.OperationPutObject:
 		req.operation = tickets.OperationPutObject
 		req.contentType = r.Header.Get("Content-Type")
-		if r.ContentLength >= 0 {
-			contentLength := r.ContentLength
-			req.contentLength = &contentLength
-		}
 		if err := validateS3ObjectRequest(req); err != nil {
 			return s3EdgeRequest{}, err
 		}
-		if err := s.validateS3MutationRequest(r, mapping.Operation, authCtx, req); err != nil {
+		if err := s.validateS3MutationRequest(r, req.operation, authCtx); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := resolveS3UploadBody(r, authCtx, &req); err != nil {
 			return s3EdgeRequest{}, err
 		}
 	case s3api.OperationDeleteObject:
@@ -473,7 +490,53 @@ func (s *edgeServer) resolveS3Request(r *http.Request) (s3EdgeRequest, error) {
 		if err := validateS3ObjectRequest(req); err != nil {
 			return s3EdgeRequest{}, err
 		}
-		if err := s.validateS3MutationRequest(r, mapping.Operation, authCtx, req); err != nil {
+		if err := s.validateS3MutationRequest(r, req.operation, authCtx); err != nil {
+			return s3EdgeRequest{}, err
+		}
+	case s3api.OperationCreateMultipartUpload:
+		req.operation = tickets.OperationCreateMultipartUpload
+		req.contentType = r.Header.Get("Content-Type")
+		req.multipart = multipartFromMapping(mapping)
+		if err := validateS3ObjectRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := s.validateS3MutationRequest(r, req.operation, authCtx); err != nil {
+			return s3EdgeRequest{}, err
+		}
+	case s3api.OperationUploadPart:
+		req.operation = tickets.OperationUploadPart
+		req.multipart = multipartFromMapping(mapping)
+		if err := validateS3ObjectRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := s.validateS3MutationRequest(r, req.operation, authCtx); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := resolveS3UploadBody(r, authCtx, &req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+	case s3api.OperationCompleteMultipartUpload:
+		req.operation = tickets.OperationCompleteMultipartUpload
+		req.multipart = multipartFromMapping(mapping)
+		if err := validateS3ObjectRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := s.validateS3MutationRequest(r, req.operation, authCtx); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := resolveS3UploadBody(r, authCtx, &req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if *req.contentLength > tickets.MaxCompleteMultipartBodyBytes {
+			return s3EdgeRequest{}, s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+		}
+	case s3api.OperationAbortMultipartUpload:
+		req.operation = tickets.OperationAbortMultipartUpload
+		req.multipart = multipartFromMapping(mapping)
+		if err := validateS3ObjectRequest(req); err != nil {
+			return s3EdgeRequest{}, err
+		}
+		if err := s.validateS3MutationRequest(r, req.operation, authCtx); err != nil {
 			return s3EdgeRequest{}, err
 		}
 	case s3api.OperationListObjectsV2:
@@ -496,21 +559,20 @@ func (s *edgeServer) resolveS3Request(r *http.Request) (s3EdgeRequest, error) {
 	return req, nil
 }
 
-func (s *edgeServer) validateS3MutationRequest(r *http.Request, operation s3api.Operation, authCtx s3api.AuthContext, req s3EdgeRequest) error {
+func (s *edgeServer) validateS3MutationRequest(r *http.Request, operation tickets.Operation, authCtx s3api.AuthContext) error {
 	if !s.cfg.MutationsEnabled {
 		return s3HTTPError{status: http.StatusMethodNotAllowed, code: "MethodNotAllowed", message: "Method not allowed"}
 	}
 	if strings.TrimSpace(r.Header.Get("Range")) != "" {
 		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
 	}
-	if err := s3api.ValidatePayloadHashForOperation(operation, authCtx); err != nil {
+	if err := s3api.ValidatePayloadHashForOperation(s3api.Operation(operation), authCtx); err != nil {
 		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
 	}
-	if operation == s3api.OperationPutObject {
-		if req.contentLength == nil || *req.contentLength < 0 {
-			return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
-		}
-		if hasAWSChunkedMarkers(r, authCtx) {
+	if operationStreamsUploadBody(operation) {
+		// The aws-chunked markers belong to the unsigned-trailer mode, which
+		// resolveS3UploadBody decodes; anything else must be a plain body.
+		if authCtx.PayloadHashMode() != s3api.PayloadHashModeStreamingUnsignedTrailer && hasAWSChunkedMarkers(r, authCtx) {
 			return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
 		}
 		return nil
@@ -519,6 +581,40 @@ func (s *edgeServer) validateS3MutationRequest(r *http.Request, operation s3api.
 		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
 	}
 	return nil
+}
+
+// resolveS3UploadBody sets req.body and req.contentLength to the effective
+// (decoded) upload body: aws-chunked framing is unwrapped for the unsigned
+// trailer mode, everything else streams the raw body and needs an explicit
+// Content-Length.
+func resolveS3UploadBody(r *http.Request, authCtx s3api.AuthContext, req *s3EdgeRequest) error {
+	if authCtx.PayloadHashMode() == s3api.PayloadHashModeStreamingUnsignedTrailer {
+		decoded, err := strconv.ParseInt(strings.TrimSpace(r.Header.Get("X-Amz-Decoded-Content-Length")), 10, 64)
+		if err != nil || decoded < 0 {
+			return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+		}
+		req.contentLength = &decoded
+		req.body = struct {
+			io.Reader
+			io.Closer
+		}{s3api.NewAWSChunkedReader(r.Body, decoded), r.Body}
+		return nil
+	}
+	if r.ContentLength < 0 {
+		return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
+	}
+	contentLength := r.ContentLength
+	req.contentLength = &contentLength
+	req.body = r.Body
+	return nil
+}
+
+func multipartFromMapping(mapping s3api.RequestMapping) *tickets.MultipartRequest {
+	return &tickets.MultipartRequest{
+		UploadID:   mapping.Multipart.UploadID,
+		PartNumber: int32(mapping.Multipart.PartNumber),
+		Rewrite:    tickets.MultipartRewrite{Bucket: mapping.S3Bucket, Key: mapping.S3Key},
+	}
 }
 
 func hasAWSChunkedMarkers(r *http.Request, authCtx s3api.AuthContext) bool {
@@ -632,10 +728,12 @@ func (s *edgeServer) serveS3Direct(w http.ResponseWriter, r *http.Request, req s
 		return
 	}
 
-	fetchReq := s3fetch.Request{Method: r.Method, Operation: req.operation, Bucket: req.bucket, Key: req.key, Range: req.rangeHeader, List: req.list}
-	if req.operation == tickets.OperationPutObject {
-		fetchReq.Body = r.Body
+	fetchReq := s3fetch.Request{Method: r.Method, Operation: req.operation, Bucket: req.bucket, Key: req.key, Range: req.rangeHeader, List: req.list, Multipart: req.multipart}
+	if operationStreamsUploadBody(req.operation) {
+		fetchReq.Body = req.body
 		fetchReq.ContentLength = req.contentLength
+	}
+	if req.operation == tickets.OperationPutObject || req.operation == tickets.OperationCreateMultipartUpload {
 		fetchReq.ContentType = req.contentType
 	}
 	fetched, err := fetcher.Fetch(r.Context(), fetchReq)
@@ -651,12 +749,12 @@ func (s *edgeServer) serveS3Direct(w http.ResponseWriter, r *http.Request, req s
 	if fetched.Body != nil {
 		defer fetched.Body.Close()
 	}
-	if req.operation == tickets.OperationPutObject {
+	if req.operation == tickets.OperationPutObject || req.operation == tickets.OperationUploadPart {
 		setTrimmedHeader(w.Header(), "ETag", fetched.ETag)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if req.operation == tickets.OperationDeleteObject {
+	if req.operation == tickets.OperationDeleteObject || req.operation == tickets.OperationAbortMultipartUpload {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -688,6 +786,7 @@ type s3HTTPError struct {
 	status  int
 	code    string
 	message string
+	allow   string
 }
 
 func (e s3HTTPError) Error() string {
@@ -697,7 +796,11 @@ func (e s3HTTPError) Error() string {
 func writeS3Error(w http.ResponseWriter, r *http.Request, err error) {
 	s3err := s3ErrorFor(err)
 	if s3err.status == http.StatusMethodNotAllowed {
-		w.Header().Set("Allow", "GET, HEAD")
+		allow := s3err.allow
+		if allow == "" {
+			allow = "GET, HEAD"
+		}
+		w.Header().Set("Allow", allow)
 	}
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(s3err.status)
@@ -731,10 +834,14 @@ func s3ErrorForAuth(err error) s3HTTPError {
 	}
 }
 
-func s3ErrorForClassify(err error) s3HTTPError {
+func s3ErrorForClassify(err error, mutationsEnabled bool) s3HTTPError {
 	message := err.Error()
 	if strings.Contains(message, "unsupported method") {
-		return s3HTTPError{status: http.StatusMethodNotAllowed, code: "MethodNotAllowed", message: "Method not allowed"}
+		allow := "GET, HEAD"
+		if mutationsEnabled {
+			allow = "GET, HEAD, PUT, POST, DELETE"
+		}
+		return s3HTTPError{status: http.StatusMethodNotAllowed, code: "MethodNotAllowed", message: "Method not allowed", allow: allow}
 	}
 	return s3HTTPError{status: http.StatusBadRequest, code: "InvalidRequest", message: "Invalid request"}
 }

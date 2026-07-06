@@ -477,18 +477,22 @@ func TestValidatePayloadHashForOperation(t *testing.T) {
 			wantMode:  PayloadHashModeUnsigned,
 		},
 		{
-			name:      "put signed empty rejected",
+			name:      "put empty accepted",
 			operation: OperationPutObject,
 			hash:      sigv4EmptySHA256,
 			wantMode:  PayloadHashModeEmpty,
-			wantError: true,
 		},
 		{
-			name:      "put signed payload rejected",
+			name:      "put signed payload accepted without body verification",
 			operation: OperationPutObject,
 			hash:      signedHash,
 			wantMode:  PayloadHashModeSigned,
-			wantError: true,
+		},
+		{
+			name:      "put unsigned streaming trailer accepted",
+			operation: OperationPutObject,
+			hash:      sigv4StreamingUnsignedPayloadTrailer,
+			wantMode:  PayloadHashModeStreamingUnsignedTrailer,
 		},
 		{
 			name:      "put streaming rejected",
@@ -520,7 +524,7 @@ func TestValidatePayloadHashForOperation(t *testing.T) {
 			name:      "delete streaming rejected",
 			operation: OperationDeleteObject,
 			hash:      sigv4StreamingUnsignedPayloadTrailer,
-			wantMode:  PayloadHashModeStreaming,
+			wantMode:  PayloadHashModeStreamingUnsignedTrailer,
 			wantError: true,
 		},
 	}
@@ -543,13 +547,67 @@ func TestValidatePayloadHashForOperation(t *testing.T) {
 }
 
 func TestMutationPayloadHashPolicyAfterVerification(t *testing.T) {
-	t.Run("header PUT rejects signed payload after verification", func(t *testing.T) {
+	t.Run("header PUT accepts empty payload hash after verification", func(t *testing.T) {
 		r := testSignHeaderRequest(t, http.MethodPut, "/object", []string{"host", "x-amz-content-sha256", "x-amz-date"}, map[string]string{"x-amz-content-sha256": sigv4EmptySHA256})
 		ctx, err := VerifySigV4(r, testVerifyOptions())
 		if err != nil {
 			t.Fatalf("VerifySigV4 returned error: %v", err)
 		}
-		assertErrorContains(t, ValidatePayloadHashForOperation(OperationPutObject, ctx), "payload hash")
+		if err := ValidatePayloadHashForOperation(OperationPutObject, ctx); err != nil {
+			t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
+		}
+	})
+
+	t.Run("header PUT accepts signed payload hash without body verification", func(t *testing.T) {
+		signedHash := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+		r := testSignHeaderRequest(t, http.MethodPut, "/object", []string{"host", "x-amz-content-sha256", "x-amz-date"}, map[string]string{"x-amz-content-sha256": signedHash})
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		if got := ctx.PayloadHashMode(); got != PayloadHashModeSigned {
+			t.Fatalf("PayloadHashMode() = %s, want %s", got, PayloadHashModeSigned)
+		}
+		if err := ValidatePayloadHashForOperation(OperationPutObject, ctx); err != nil {
+			t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
+		}
+	})
+
+	t.Run("header PUT accepts unsigned streaming trailer mode", func(t *testing.T) {
+		r := testSignHeaderRequest(t, http.MethodPut, "/object", []string{"host", "x-amz-content-sha256", "x-amz-date"}, map[string]string{"x-amz-content-sha256": sigv4StreamingUnsignedPayloadTrailer})
+		ctx, err := VerifySigV4(r, testVerifyOptions())
+		if err != nil {
+			t.Fatalf("VerifySigV4 returned error: %v", err)
+		}
+		if got := ctx.PayloadHashMode(); got != PayloadHashModeStreamingUnsignedTrailer {
+			t.Fatalf("PayloadHashMode() = %s, want %s", got, PayloadHashModeStreamingUnsignedTrailer)
+		}
+		if err := ValidatePayloadHashForOperation(OperationPutObject, ctx); err != nil {
+			t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
+		}
+	})
+
+	t.Run("multipart payload hash policy", func(t *testing.T) {
+		signedStreaming := AuthContext{PayloadHash: sigv4StreamingAWS4HMACSHA256Payload}
+		unsignedTrailer := AuthContext{PayloadHash: sigv4StreamingUnsignedPayloadTrailer}
+		unsigned := AuthContext{PayloadHash: sigv4UnsignedPayload}
+		empty := AuthContext{PayloadHash: sigv4EmptySHA256}
+
+		for _, op := range []Operation{OperationUploadPart, OperationCompleteMultipartUpload} {
+			if err := ValidatePayloadHashForOperation(op, unsignedTrailer); err != nil {
+				t.Fatalf("%s unsigned trailer: %v", op, err)
+			}
+			assertErrorContains(t, ValidatePayloadHashForOperation(op, signedStreaming), "payload hash")
+		}
+		for _, op := range []Operation{OperationCreateMultipartUpload, OperationAbortMultipartUpload} {
+			if err := ValidatePayloadHashForOperation(op, unsigned); err != nil {
+				t.Fatalf("%s unsigned: %v", op, err)
+			}
+			if err := ValidatePayloadHashForOperation(op, empty); err != nil {
+				t.Fatalf("%s empty: %v", op, err)
+			}
+			assertErrorContains(t, ValidatePayloadHashForOperation(op, unsignedTrailer), "payload hash")
+		}
 	})
 
 	t.Run("header PUT rejects streaming marker after verification", func(t *testing.T) {
@@ -575,13 +633,15 @@ func TestMutationPayloadHashPolicyAfterVerification(t *testing.T) {
 		}
 	})
 
-	t.Run("presigned PUT rejects signed payload after verification", func(t *testing.T) {
+	t.Run("presigned PUT accepts empty payload hash after verification", func(t *testing.T) {
 		r := testSignPresignedRequest(t, http.MethodPut, "/object", nil, nil, []testRawParam{{key: "X-Amz-Content-Sha256", value: sigv4EmptySHA256}}, 300)
 		ctx, err := VerifySigV4(r, testVerifyOptions())
 		if err != nil {
 			t.Fatalf("VerifySigV4 returned error: %v", err)
 		}
-		assertErrorContains(t, ValidatePayloadHashForOperation(OperationPutObject, ctx), "payload hash")
+		if err := ValidatePayloadHashForOperation(OperationPutObject, ctx); err != nil {
+			t.Fatalf("ValidatePayloadHashForOperation() error = %v", err)
+		}
 	})
 
 	t.Run("header DELETE accepts empty payload hash", func(t *testing.T) {

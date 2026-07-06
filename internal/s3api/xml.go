@@ -1,6 +1,11 @@
 package s3api
 
-import "encoding/xml"
+import (
+	"encoding/xml"
+	"fmt"
+	"io"
+	"sort"
+)
 
 const xmlS3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
 
@@ -101,6 +106,90 @@ func ApplyListPublicPrefix(result *ListBucketResult, publicKeyPrefix string) {
 	}
 }
 
+// InitiateMultipartUploadResult contains the CreateMultipartUpload response
+// fields rendered by this package.
+type InitiateMultipartUploadResult struct {
+	Bucket   string
+	Key      string
+	UploadID string
+}
+
+// RenderInitiateMultipartUploadResult renders a deterministic S3
+// InitiateMultipartUploadResult XML document.
+func RenderInitiateMultipartUploadResult(result InitiateMultipartUploadResult) ([]byte, error) {
+	return xmlRenderDocument(xmlInitiateMultipartUploadResult{
+		XMLNS:    xmlS3Namespace,
+		Bucket:   result.Bucket,
+		Key:      result.Key,
+		UploadID: result.UploadID,
+	})
+}
+
+// CompleteMultipartUploadResult contains the CompleteMultipartUpload response
+// fields rendered by this package.
+type CompleteMultipartUploadResult struct {
+	Location string
+	Bucket   string
+	Key      string
+	ETag     string
+}
+
+// RenderCompleteMultipartUploadResult renders a deterministic S3
+// CompleteMultipartUploadResult XML document.
+func RenderCompleteMultipartUploadResult(result CompleteMultipartUploadResult) ([]byte, error) {
+	return xmlRenderDocument(xmlCompleteMultipartUploadResult{
+		XMLNS:    xmlS3Namespace,
+		Location: result.Location,
+		Bucket:   result.Bucket,
+		Key:      result.Key,
+		ETag:     result.ETag,
+	})
+}
+
+// CompletedPart is one part entry parsed from a CompleteMultipartUpload
+// request body.
+type CompletedPart struct {
+	PartNumber int32
+	ETag       string
+}
+
+const maxCompleteMultipartParts = 10000
+
+// ParseCompleteMultipartUpload parses a client CompleteMultipartUpload XML
+// body of at most maxBytes, returning parts sorted by part number. Unknown
+// elements (checksum members and the like) are ignored; part numbers must be
+// unique and within 1..10000 and every part needs an ETag.
+func ParseCompleteMultipartUpload(r io.Reader, maxBytes int64) ([]CompletedPart, error) {
+	var body xmlCompleteMultipartUpload
+	if err := xml.NewDecoder(io.LimitReader(r, maxBytes)).Decode(&body); err != nil {
+		return nil, fmt.Errorf("parse CompleteMultipartUpload: %w", err)
+	}
+	if len(body.Parts) == 0 {
+		return nil, fmt.Errorf("parse CompleteMultipartUpload: at least one part is required")
+	}
+	if len(body.Parts) > maxCompleteMultipartParts {
+		return nil, fmt.Errorf("parse CompleteMultipartUpload: too many parts")
+	}
+
+	parts := make([]CompletedPart, 0, len(body.Parts))
+	seen := make(map[int32]bool, len(body.Parts))
+	for _, part := range body.Parts {
+		if part.PartNumber < 1 || part.PartNumber > maxCompleteMultipartParts {
+			return nil, fmt.Errorf("parse CompleteMultipartUpload: part number %d out of range 1..10000", part.PartNumber)
+		}
+		if part.ETag == "" {
+			return nil, fmt.Errorf("parse CompleteMultipartUpload: part %d is missing an ETag", part.PartNumber)
+		}
+		if seen[part.PartNumber] {
+			return nil, fmt.Errorf("parse CompleteMultipartUpload: duplicate part number %d", part.PartNumber)
+		}
+		seen[part.PartNumber] = true
+		parts = append(parts, CompletedPart{PartNumber: part.PartNumber, ETag: part.ETag})
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].PartNumber < parts[j].PartNumber })
+	return parts, nil
+}
+
 type xmlErrorResponse struct {
 	XMLName   xml.Name `xml:"Error"`
 	Code      string   `xml:"Code"`
@@ -136,6 +225,33 @@ type xmlListObject struct {
 
 type xmlCommonPrefix struct {
 	Prefix string `xml:"Prefix"`
+}
+
+type xmlInitiateMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+	XMLNS    string   `xml:"xmlns,attr"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadID string   `xml:"UploadId"`
+}
+
+type xmlCompleteMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+	XMLNS    string   `xml:"xmlns,attr"`
+	Location string   `xml:"Location,omitempty"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	ETag     string   `xml:"ETag"`
+}
+
+type xmlCompleteMultipartUpload struct {
+	XMLName xml.Name           `xml:"CompleteMultipartUpload"`
+	Parts   []xmlCompletedPart `xml:"Part"`
+}
+
+type xmlCompletedPart struct {
+	PartNumber int32  `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
 }
 
 func xmlRenderDocument(value any) ([]byte, error) {

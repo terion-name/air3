@@ -56,11 +56,17 @@ type AuthContext struct {
 type PayloadHashMode string
 
 const (
-	PayloadHashModeUnknown   PayloadHashMode = "Unknown"
-	PayloadHashModeUnsigned  PayloadHashMode = "UnsignedPayload"
-	PayloadHashModeEmpty     PayloadHashMode = "EmptySHA256"
-	PayloadHashModeSigned    PayloadHashMode = "SignedSHA256"
+	PayloadHashModeUnknown  PayloadHashMode = "Unknown"
+	PayloadHashModeUnsigned PayloadHashMode = "UnsignedPayload"
+	PayloadHashModeEmpty    PayloadHashMode = "EmptySHA256"
+	PayloadHashModeSigned   PayloadHashMode = "SignedSHA256"
+	// PayloadHashModeStreaming covers the signed-chunk streaming modes, which
+	// this gateway does not support.
 	PayloadHashModeStreaming PayloadHashMode = "Streaming"
+	// PayloadHashModeStreamingUnsignedTrailer is the aws-chunked unsigned
+	// upload mode modern AWS clients use by default; the body can be decoded
+	// without per-chunk signature verification.
+	PayloadHashModeStreamingUnsignedTrailer PayloadHashMode = "StreamingUnsignedTrailer"
 )
 
 // PayloadHashMode reports the verified request's canonical payload hash mode.
@@ -75,6 +81,8 @@ func PayloadHashModeForValue(value string) PayloadHashMode {
 		return PayloadHashModeUnsigned
 	case value == sigv4EmptySHA256:
 		return PayloadHashModeEmpty
+	case value == sigv4StreamingUnsignedPayloadTrailer:
+		return PayloadHashModeStreamingUnsignedTrailer
 	case sigv4IsStreamingPayloadHash(value):
 		return PayloadHashModeStreaming
 	case sigv4IsSHA256PayloadHash(value):
@@ -84,15 +92,19 @@ func PayloadHashModeForValue(value string) PayloadHashMode {
 	}
 }
 
-// ValidatePayloadHashForOperation applies the S3 API v1 mutation payload-hash policy.
+// ValidatePayloadHashForOperation applies the S3 API mutation payload-hash
+// policy. Upload bodies may be unsigned, carry a signed SHA-256 (accepted but
+// not re-verified against the streamed body), or use the aws-chunked unsigned
+// trailer mode. Signed-chunk streaming stays rejected.
 func ValidatePayloadHashForOperation(operation Operation, auth AuthContext) error {
 	mode := auth.PayloadHashMode()
 	switch operation {
-	case OperationPutObject:
-		if mode == PayloadHashModeUnsigned {
+	case OperationPutObject, OperationUploadPart, OperationCompleteMultipartUpload:
+		switch mode {
+		case PayloadHashModeUnsigned, PayloadHashModeEmpty, PayloadHashModeSigned, PayloadHashModeStreamingUnsignedTrailer:
 			return nil
 		}
-	case OperationDeleteObject:
+	case OperationCreateMultipartUpload, OperationDeleteObject, OperationAbortMultipartUpload:
 		if mode == PayloadHashModeUnsigned || mode == PayloadHashModeEmpty {
 			return nil
 		}

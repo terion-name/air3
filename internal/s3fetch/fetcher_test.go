@@ -77,12 +77,13 @@ func TestFetcherHeadObjectUsesHEADAndNoBody(t *testing.T) {
 }
 
 func TestFetcherPutObjectStreamsBodyAndMapsETag(t *testing.T) {
-	var gotMethod, gotPath, gotContentType, gotBody string
+	var gotMethod, gotPath, gotContentType, gotPayloadHash, gotBody string
 	var gotContentLength int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotPath = r.URL.Path
 		gotContentType = r.Header.Get("Content-Type")
+		gotPayloadHash = r.Header.Get("X-Amz-Content-Sha256")
 		gotContentLength = r.ContentLength
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -100,11 +101,13 @@ func TestFetcherPutObjectStreamsBodyAndMapsETag(t *testing.T) {
 	}
 	contentLength := int64(len("hello mutation"))
 	obj, err := fetcher.Fetch(context.Background(), Request{
-		Method:        http.MethodPut,
-		Operation:     tickets.OperationPutObject,
-		Bucket:        "demo-bucket",
-		Key:           "objects/file.txt",
-		Body:          strings.NewReader("hello mutation"),
+		Method:    http.MethodPut,
+		Operation: tickets.OperationPutObject,
+		Bucket:    "demo-bucket",
+		Key:       "objects/file.txt",
+		// Real upload bodies stream from the edge and are not seekable;
+		// io.MultiReader hides Seek so the test matches production.
+		Body:          io.MultiReader(strings.NewReader("hello mutation")),
 		ContentLength: &contentLength,
 		ContentType:   "text/plain",
 	})
@@ -114,6 +117,9 @@ func TestFetcherPutObjectStreamsBodyAndMapsETag(t *testing.T) {
 
 	if gotMethod != http.MethodPut || gotPath != "/demo-bucket/objects/file.txt" || gotContentType != "text/plain" || gotContentLength != contentLength || gotBody != "hello mutation" {
 		t.Fatalf("request method=%q path=%q contentType=%q contentLength=%d body=%q", gotMethod, gotPath, gotContentType, gotContentLength, gotBody)
+	}
+	if gotPayloadHash != "UNSIGNED-PAYLOAD" {
+		t.Fatalf("payload hash = %q, want UNSIGNED-PAYLOAD", gotPayloadHash)
 	}
 	if obj.StatusCode != http.StatusOK || obj.ETag != `"put-etag"` || obj.Body != http.NoBody {
 		t.Fatalf("object = %#v", obj)

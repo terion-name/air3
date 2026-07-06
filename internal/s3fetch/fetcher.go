@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -35,6 +36,7 @@ type Request struct {
 	Key           string
 	Range         string
 	List          *tickets.ListRequest
+	Multipart     *tickets.MultipartRequest
 	Body          io.Reader
 	ContentLength *int64
 	ContentType   string
@@ -111,6 +113,14 @@ func (f *Fetcher) Fetch(ctx context.Context, req Request) (*Object, error) {
 		return f.put(ctx, req)
 	case tickets.OperationDeleteObject:
 		return f.delete(ctx, req)
+	case tickets.OperationCreateMultipartUpload:
+		return f.createMultipart(ctx, req)
+	case tickets.OperationUploadPart:
+		return f.uploadPart(ctx, req)
+	case tickets.OperationCompleteMultipartUpload:
+		return f.completeMultipart(ctx, req)
+	case tickets.OperationAbortMultipartUpload:
+		return f.abortMultipart(ctx, req)
 	default:
 		return f.get(ctx, req)
 	}
@@ -151,7 +161,13 @@ func (f *Fetcher) put(ctx context.Context, req Request) (*Object, error) {
 	if req.ContentType != "" {
 		input.ContentType = aws.String(req.ContentType)
 	}
-	out, err := f.client.PutObject(ctx, input)
+	// Upload bodies stream from the edge and are not seekable, so the SigV4
+	// payload hash cannot be precomputed; sign the request with
+	// UNSIGNED-PAYLOAD instead (the SDK otherwise rejects unseekable bodies
+	// on non-TLS endpoints).
+	out, err := f.client.PutObject(ctx, input, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware)
+	})
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -171,6 +187,102 @@ func (f *Fetcher) delete(ctx context.Context, req Request) (*Object, error) {
 		StatusCode: http.StatusNoContent,
 		Body:       http.NoBody,
 	}, nil
+}
+
+func (f *Fetcher) createMultipart(ctx context.Context, req Request) (*Object, error) {
+	input := &s3.CreateMultipartUploadInput{Bucket: aws.String(req.Bucket), Key: aws.String(req.Key)}
+	if req.ContentType != "" {
+		input.ContentType = aws.String(req.ContentType)
+	}
+	out, err := f.client.CreateMultipartUpload(ctx, input)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	xmlBody, err := s3api.RenderInitiateMultipartUploadResult(s3api.InitiateMultipartUploadResult{
+		Bucket:   req.Multipart.Rewrite.Bucket,
+		Key:      req.Multipart.Rewrite.Key,
+		UploadID: value(out.UploadId),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return xmlObject(xmlBody), nil
+}
+
+func (f *Fetcher) uploadPart(ctx context.Context, req Request) (*Object, error) {
+	input := &s3.UploadPartInput{
+		Bucket:        aws.String(req.Bucket),
+		Key:           aws.String(req.Key),
+		UploadId:      aws.String(req.Multipart.UploadID),
+		PartNumber:    aws.Int32(req.Multipart.PartNumber),
+		Body:          req.Body,
+		ContentLength: req.ContentLength,
+	}
+	// Part bodies stream from the edge and are not seekable; see put.
+	out, err := f.client.UploadPart(ctx, input, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware)
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &Object{
+		StatusCode: http.StatusOK,
+		ETag:       value(out.ETag),
+		Body:       http.NoBody,
+	}, nil
+}
+
+func (f *Fetcher) completeMultipart(ctx context.Context, req Request) (*Object, error) {
+	parts, err := s3api.ParseCompleteMultipartUpload(req.Body, tickets.MaxCompleteMultipartBodyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	completed := make([]types.CompletedPart, 0, len(parts))
+	for _, part := range parts {
+		completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(part.PartNumber), ETag: aws.String(part.ETag)})
+	}
+	out, err := f.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(req.Bucket),
+		Key:             aws.String(req.Key),
+		UploadId:        aws.String(req.Multipart.UploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	xmlBody, err := s3api.RenderCompleteMultipartUploadResult(s3api.CompleteMultipartUploadResult{
+		Bucket: req.Multipart.Rewrite.Bucket,
+		Key:    req.Multipart.Rewrite.Key,
+		ETag:   value(out.ETag),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return xmlObject(xmlBody), nil
+}
+
+func (f *Fetcher) abortMultipart(ctx context.Context, req Request) (*Object, error) {
+	_, err := f.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(req.Bucket),
+		Key:      aws.String(req.Key),
+		UploadId: aws.String(req.Multipart.UploadID),
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &Object{
+		StatusCode: http.StatusNoContent,
+		Body:       http.NoBody,
+	}, nil
+}
+
+func xmlObject(body []byte) *Object {
+	return &Object{
+		StatusCode:    http.StatusOK,
+		ContentType:   "application/xml",
+		ContentLength: int64(len(body)),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+	}
 }
 
 func (f *Fetcher) head(ctx context.Context, req Request) (*Object, error) {
@@ -232,13 +344,7 @@ func (f *Fetcher) list(ctx context.Context, req Request) (*Object, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	return &Object{
-		StatusCode:    http.StatusOK,
-		ContentType:   "application/xml",
-		ContentLength: int64(len(xmlBody)),
-		Body:          io.NopCloser(bytes.NewReader(xmlBody)),
-	}, nil
+	return xmlObject(xmlBody), nil
 }
 
 func listBucketResult(req Request, out *s3.ListObjectsV2Output) s3api.ListBucketResult {
@@ -287,6 +393,9 @@ func validateRequest(req Request) (tickets.Operation, error) {
 		if req.List != nil {
 			return "", fmt.Errorf("%w: list metadata must be omitted for object requests", ErrInvalidRequest)
 		}
+		if req.Multipart != nil {
+			return "", fmt.Errorf("%w: multipart metadata must be omitted for object requests", ErrInvalidRequest)
+		}
 		if err := tickets.ValidateKey(req.Key); err != nil {
 			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}
@@ -303,27 +412,18 @@ func validateRequest(req Request) (tickets.Operation, error) {
 		if req.Range != "" {
 			return "", fmt.Errorf("%w: range must be omitted for ListObjectsV2", ErrInvalidRequest)
 		}
+		if req.Multipart != nil {
+			return "", fmt.Errorf("%w: multipart metadata must be omitted for ListObjectsV2", ErrInvalidRequest)
+		}
 		if err := tickets.ValidateListRequest(req.List); err != nil {
 			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}
 	case tickets.OperationPutObject:
-		if req.List != nil {
-			return "", fmt.Errorf("%w: list metadata must be omitted for PutObject", ErrInvalidRequest)
+		if req.Multipart != nil {
+			return "", fmt.Errorf("%w: multipart metadata must be omitted for PutObject", ErrInvalidRequest)
 		}
-		if req.Range != "" {
-			return "", fmt.Errorf("%w: range must be omitted for PutObject", ErrInvalidRequest)
-		}
-		if err := tickets.ValidateKey(req.Key); err != nil {
-			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-		}
-		if req.Body == nil {
-			return "", fmt.Errorf("%w: body is required for PutObject", ErrInvalidRequest)
-		}
-		if req.ContentLength == nil {
-			return "", fmt.Errorf("%w: content length is required for PutObject", ErrInvalidRequest)
-		}
-		if *req.ContentLength < 0 {
-			return "", fmt.Errorf("%w: content length must be non-negative", ErrInvalidRequest)
+		if err := validateUploadRequest(req, "PutObject"); err != nil {
+			return "", err
 		}
 		if err := validateContentType(req.ContentType); err != nil {
 			return "", err
@@ -338,13 +438,98 @@ func validateRequest(req Request) (tickets.Operation, error) {
 		if req.Range != "" {
 			return "", fmt.Errorf("%w: range must be omitted for DeleteObject", ErrInvalidRequest)
 		}
+		if req.Multipart != nil {
+			return "", fmt.Errorf("%w: multipart metadata must be omitted for DeleteObject", ErrInvalidRequest)
+		}
 		if err := tickets.ValidateKey(req.Key); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	case tickets.OperationCreateMultipartUpload:
+		if req.List != nil {
+			return "", fmt.Errorf("%w: list metadata must be omitted for CreateMultipartUpload", ErrInvalidRequest)
+		}
+		if req.Range != "" {
+			return "", fmt.Errorf("%w: range must be omitted for CreateMultipartUpload", ErrInvalidRequest)
+		}
+		if req.Body != nil || req.ContentLength != nil {
+			return "", fmt.Errorf("%w: body must be omitted for CreateMultipartUpload", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateKey(req.Key); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if err := validateContentType(req.ContentType); err != nil {
+			return "", err
+		}
+		if err := tickets.ValidateMultipartRequest(operation, req.Multipart); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	case tickets.OperationUploadPart:
+		if err := validateUploadRequest(req, "UploadPart"); err != nil {
+			return "", err
+		}
+		if req.ContentType != "" {
+			return "", fmt.Errorf("%w: content type must be omitted for UploadPart", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateMultipartRequest(operation, req.Multipart); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	case tickets.OperationCompleteMultipartUpload:
+		if err := validateUploadRequest(req, "CompleteMultipartUpload"); err != nil {
+			return "", err
+		}
+		if req.ContentType != "" {
+			return "", fmt.Errorf("%w: content type must be omitted for CompleteMultipartUpload", ErrInvalidRequest)
+		}
+		if *req.ContentLength > tickets.MaxCompleteMultipartBodyBytes {
+			return "", fmt.Errorf("%w: CompleteMultipartUpload body is too large", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateMultipartRequest(operation, req.Multipart); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	case tickets.OperationAbortMultipartUpload:
+		if err := validateMutationFieldsOmitted(req); err != nil {
+			return "", err
+		}
+		if req.List != nil {
+			return "", fmt.Errorf("%w: list metadata must be omitted for AbortMultipartUpload", ErrInvalidRequest)
+		}
+		if req.Range != "" {
+			return "", fmt.Errorf("%w: range must be omitted for AbortMultipartUpload", ErrInvalidRequest)
+		}
+		if err := tickets.ValidateKey(req.Key); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		if err := tickets.ValidateMultipartRequest(operation, req.Multipart); err != nil {
 			return "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}
 	default:
 		return "", fmt.Errorf("%w: unsupported operation", ErrInvalidRequest)
 	}
 	return operation, nil
+}
+
+// validateUploadRequest checks the fields shared by operations that stream a
+// request body to the backend.
+func validateUploadRequest(req Request, operation string) error {
+	if req.List != nil {
+		return fmt.Errorf("%w: list metadata must be omitted for %s", ErrInvalidRequest, operation)
+	}
+	if req.Range != "" {
+		return fmt.Errorf("%w: range must be omitted for %s", ErrInvalidRequest, operation)
+	}
+	if err := tickets.ValidateKey(req.Key); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if req.Body == nil {
+		return fmt.Errorf("%w: body is required for %s", ErrInvalidRequest, operation)
+	}
+	if req.ContentLength == nil {
+		return fmt.Errorf("%w: content length is required for %s", ErrInvalidRequest, operation)
+	}
+	if *req.ContentLength < 0 {
+		return fmt.Errorf("%w: content length must be non-negative", ErrInvalidRequest)
+	}
+	return nil
 }
 
 func validateMutationFieldsOmitted(req Request) error {
@@ -381,11 +566,17 @@ func mapError(err error) error {
 	if errors.As(err, &noSuchBucket) {
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
 	}
+	var noSuchUpload *types.NoSuchUpload
+	if errors.As(err, &noSuchUpload) {
+		return fmt.Errorf("%w: %w", ErrNotFound, err)
+	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
-		case "NoSuchKey", "NoSuchBucket", "NotFound", "404":
+		case "NoSuchKey", "NoSuchBucket", "NoSuchUpload", "NotFound", "404":
 			return fmt.Errorf("%w: %w", ErrNotFound, err)
+		case "InvalidPart", "InvalidPartOrder":
+			return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 		}
 	}
 	return err

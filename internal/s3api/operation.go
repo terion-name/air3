@@ -25,12 +25,16 @@ type ClassifyOptions struct {
 type Operation string
 
 const (
-	OperationGetObject     Operation = "GetObject"
-	OperationHeadObject    Operation = "HeadObject"
-	OperationHeadBucket    Operation = "HeadBucket"
-	OperationListObjectsV2 Operation = "ListObjectsV2"
-	OperationPutObject     Operation = "PutObject"
-	OperationDeleteObject  Operation = "DeleteObject"
+	OperationGetObject               Operation = "GetObject"
+	OperationHeadObject              Operation = "HeadObject"
+	OperationHeadBucket              Operation = "HeadBucket"
+	OperationListObjectsV2           Operation = "ListObjectsV2"
+	OperationPutObject               Operation = "PutObject"
+	OperationDeleteObject            Operation = "DeleteObject"
+	OperationCreateMultipartUpload   Operation = "CreateMultipartUpload"
+	OperationUploadPart              Operation = "UploadPart"
+	OperationCompleteMultipartUpload Operation = "CompleteMultipartUpload"
+	OperationAbortMultipartUpload    Operation = "AbortMultipartUpload"
 )
 
 type RequestMapping struct {
@@ -41,6 +45,14 @@ type RequestMapping struct {
 	BackendBucket string
 	BackendKey    string
 	List          ListMapping
+	Multipart     MultipartMapping
+}
+
+// MultipartMapping carries the multipart identity parsed from the request
+// query for the multipart operations.
+type MultipartMapping struct {
+	UploadID   string
+	PartNumber int
 }
 
 type ListMapping struct {
@@ -112,7 +124,11 @@ func operationClassifySingleServer(r *http.Request, segments []string, opts Clas
 		}, nil
 	}
 
-	if operation, ok := operationObjectOperationForMethod(r.Method); ok {
+	operation, multipart, ok, err := operationObjectOperationForRequest(r)
+	if err != nil {
+		return RequestMapping{}, err
+	}
+	if ok {
 		if len(segments) < 2 {
 			return RequestMapping{}, fmt.Errorf("classify s3 operation: unsupported bucket-level %s operation", r.Method)
 		}
@@ -129,6 +145,7 @@ func operationClassifySingleServer(r *http.Request, segments []string, opts Clas
 			S3Key:         key,
 			BackendBucket: bucket,
 			BackendKey:    key,
+			Multipart:     multipart,
 		}, nil
 	}
 
@@ -195,7 +212,11 @@ func operationClassifyMultiServer(r *http.Request, segments []string, opts Class
 		}, nil
 	}
 
-	if operation, ok := operationObjectOperationForMethod(r.Method); ok {
+	operation, multipart, ok, err := operationObjectOperationForRequest(r)
+	if err != nil {
+		return RequestMapping{}, err
+	}
+	if ok {
 		if err := operationValidateObjectMutationQuery(r, operation); err != nil {
 			return RequestMapping{}, err
 		}
@@ -218,6 +239,7 @@ func operationClassifyMultiServer(r *http.Request, segments []string, opts Class
 				S3Key:         key,
 				BackendBucket: defaultBucket,
 				BackendKey:    key,
+				Multipart:     multipart,
 			}, nil
 		}
 
@@ -242,6 +264,7 @@ func operationClassifyMultiServer(r *http.Request, segments []string, opts Class
 			S3Key:         strings.Join(segments[1:], "/"),
 			BackendBucket: backendBucket,
 			BackendKey:    backendKey,
+			Multipart:     multipart,
 		}, nil
 	}
 
@@ -250,11 +273,54 @@ func operationClassifyMultiServer(r *http.Request, segments []string, opts Class
 
 func operationSupportedMethod(method string) bool {
 	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete:
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost, http.MethodDelete:
 		return true
 	default:
 		return false
 	}
+}
+
+// operationObjectOperationForRequest resolves the object-level operation from
+// the method and the multipart query parameters (?uploads, ?uploadId,
+// ?partNumber).
+func operationObjectOperationForRequest(r *http.Request) (Operation, MultipartMapping, bool, error) {
+	query := r.URL.Query()
+	_, hasUploads := query["uploads"]
+	_, hasUploadID := query["uploadId"]
+	_, hasPartNumber := query["partNumber"]
+	uploadID := query.Get("uploadId")
+
+	switch {
+	case r.Method == http.MethodPost && hasUploads:
+		if hasUploadID || hasPartNumber {
+			return "", MultipartMapping{}, false, fmt.Errorf("classify s3 operation: uploads query conflicts with uploadId or partNumber")
+		}
+		return OperationCreateMultipartUpload, MultipartMapping{}, true, nil
+	case r.Method == http.MethodPut && hasPartNumber:
+		if uploadID == "" {
+			return "", MultipartMapping{}, false, fmt.Errorf("classify s3 operation: UploadPart requires a non-empty uploadId")
+		}
+		partNumber, err := strconv.Atoi(query.Get("partNumber"))
+		if err != nil || partNumber < 1 || partNumber > 10000 {
+			return "", MultipartMapping{}, false, fmt.Errorf("classify s3 operation: partNumber must be an integer between 1 and 10000")
+		}
+		return OperationUploadPart, MultipartMapping{UploadID: uploadID, PartNumber: partNumber}, true, nil
+	case r.Method == http.MethodPost && hasUploadID:
+		if uploadID == "" {
+			return "", MultipartMapping{}, false, fmt.Errorf("classify s3 operation: CompleteMultipartUpload requires a non-empty uploadId")
+		}
+		return OperationCompleteMultipartUpload, MultipartMapping{UploadID: uploadID}, true, nil
+	case r.Method == http.MethodDelete && hasUploadID:
+		if uploadID == "" {
+			return "", MultipartMapping{}, false, fmt.Errorf("classify s3 operation: AbortMultipartUpload requires a non-empty uploadId")
+		}
+		return OperationAbortMultipartUpload, MultipartMapping{UploadID: uploadID}, true, nil
+	case r.Method == http.MethodPost:
+		return "", MultipartMapping{}, false, fmt.Errorf("classify s3 operation: unsupported method %s", r.Method)
+	}
+
+	operation, ok := operationObjectOperationForMethod(r.Method)
+	return operation, MultipartMapping{}, ok, nil
 }
 
 func operationObjectOperationForMethod(method string) (Operation, bool) {
@@ -273,9 +339,6 @@ func operationObjectOperationForMethod(method string) (Operation, bool) {
 }
 
 func operationValidateObjectMutationQuery(r *http.Request, operation Operation) error {
-	if operation != OperationPutObject && operation != OperationDeleteObject {
-		return nil
-	}
 	for _, key := range operationUnsupportedMutationQueryKeys(operation) {
 		if _, ok := r.URL.Query()[key]; ok {
 			return fmt.Errorf("classify s3 operation: unsupported %s query parameter %q", operation, key)
@@ -290,6 +353,8 @@ func operationUnsupportedMutationQueryKeys(operation Operation) []string {
 		return []string{"acl", "tagging", "uploads", "uploadId", "partNumber"}
 	case OperationDeleteObject:
 		return []string{"versionId"}
+	case OperationCreateMultipartUpload:
+		return []string{"acl", "tagging"}
 	default:
 		return nil
 	}

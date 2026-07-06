@@ -308,8 +308,11 @@ func (c *connector) handleTicket(ctx context.Context, ticket tickets.Ticket) err
 		return c.sendS3Error(ticketCtx, ticket, http.StatusMethodNotAllowed, "MethodNotAllowed", "mutations are disabled")
 	}
 
-	req := s3fetch.Request{Method: ticket.Method, Operation: op, Bucket: ticket.Bucket, Key: ticket.Key, Range: ticket.Range, List: ticket.List}
-	if op == tickets.OperationPutObject {
+	req := s3fetch.Request{Method: ticket.Method, Operation: op, Bucket: ticket.Bucket, Key: ticket.Key, Range: ticket.Range, List: ticket.List, Multipart: ticket.Multipart}
+	if op == tickets.OperationCreateMultipartUpload {
+		req.ContentType = ticket.ContentType
+	}
+	if operationStreamsUploadSource(op) {
 		upload, err := c.uploadOpener.Open(ticketCtx, ticket)
 		if err != nil || upload == nil || upload.Body == nil {
 			return c.sendS3Error(ticketCtx, ticket, http.StatusServiceUnavailable, "ServiceUnavailable", "upload source is unavailable")
@@ -368,7 +371,10 @@ func (c *connector) validateTicket(ticket tickets.Ticket) error {
 
 func operationAllowed(op tickets.Operation) bool {
 	switch op {
-	case tickets.OperationGetObject, tickets.OperationHeadObject, tickets.OperationListObjectsV2, tickets.OperationPutObject, tickets.OperationDeleteObject:
+	case tickets.OperationGetObject, tickets.OperationHeadObject, tickets.OperationListObjectsV2,
+		tickets.OperationPutObject, tickets.OperationDeleteObject,
+		tickets.OperationCreateMultipartUpload, tickets.OperationUploadPart,
+		tickets.OperationCompleteMultipartUpload, tickets.OperationAbortMultipartUpload:
 		return true
 	default:
 		return false
@@ -376,7 +382,25 @@ func operationAllowed(op tickets.Operation) bool {
 }
 
 func isMutationOperation(op tickets.Operation) bool {
-	return op == tickets.OperationPutObject || op == tickets.OperationDeleteObject
+	switch op {
+	case tickets.OperationPutObject, tickets.OperationDeleteObject,
+		tickets.OperationCreateMultipartUpload, tickets.OperationUploadPart,
+		tickets.OperationCompleteMultipartUpload, tickets.OperationAbortMultipartUpload:
+		return true
+	default:
+		return false
+	}
+}
+
+// operationStreamsUploadSource reports whether op carries its request body
+// through the edge upload-source channel.
+func operationStreamsUploadSource(op tickets.Operation) bool {
+	switch op {
+	case tickets.OperationPutObject, tickets.OperationUploadPart, tickets.OperationCompleteMultipartUpload:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *connector) sendS3Error(ctx context.Context, ticket tickets.Ticket, status int, code, message string) error {

@@ -9,7 +9,7 @@ import (
 
 func TestClassifyRejectsUnsupportedMethodsBeforeValidation(t *testing.T) {
 	boom := errors.New("validation should not run")
-	got, err := Classify(operationRequest(t, http.MethodPost, "/photos/2024/cat.jpg"), ClassifyOptions{
+	got, err := Classify(operationRequest(t, http.MethodPatch, "/photos/2024/cat.jpg"), ClassifyOptions{
 		Mode:           RoutingSingleServer,
 		ValidateBucket: func(bucket string) error { return boom },
 	})
@@ -429,8 +429,8 @@ func TestClassifyRejectsBucketLevelAndUnsupportedMutationVariants(t *testing.T) 
 			opts: ClassifyOptions{Mode: RoutingSingleServer},
 		},
 		{
-			name: "put multipart",
-			req:  operationRequest(t, http.MethodPut, "/photos/2024/cat.jpg?partNumber=1&uploadId=upload"),
+			name: "put with uploadId but no partNumber",
+			req:  operationRequest(t, http.MethodPut, "/photos/2024/cat.jpg?uploadId=upload"),
 			opts: ClassifyOptions{Mode: RoutingSingleServer},
 		},
 		{

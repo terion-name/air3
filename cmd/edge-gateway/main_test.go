@@ -642,8 +642,39 @@ func TestS3APIMutationsDisabledBeforeSideEffects(t *testing.T) {
 	}
 }
 
+func TestS3APIUnsupportedMethodAllowHeaderReflectsMutationGate(t *testing.T) {
+	const emptyPayloadSHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	tests := []struct {
+		name             string
+		mutationsEnabled bool
+		wantAllow        string
+	}{
+		{name: "mutations disabled", wantAllow: "GET, HEAD"},
+		{name: "mutations enabled", mutationsEnabled: true, wantAllow: "GET, HEAD, PUT, POST, DELETE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &fakePublisher{}
+			edge, _ := testS3Edge(pub, config.EdgeConfig{AllowedBuckets: []string{"demo-bucket"}, MutationsEnabled: tt.mutationsEnabled}, nil)
+			req := s3SignHeaderRequestWithBody(t, http.MethodPost, "/demo-bucket/file.txt", http.NoBody, 0, map[string]string{"x-amz-content-sha256": emptyPayloadSHA})
+
+			resp := httptest.NewRecorder()
+			edge.ServeHTTP(resp, req)
+
+			if got := resp.Result().StatusCode; got != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want %d; body=%q", got, http.StatusMethodNotAllowed, resp.Body.String())
+			}
+			if got := resp.Result().Header.Get("Allow"); got != tt.wantAllow {
+				t.Fatalf("Allow = %q, want %q", got, tt.wantAllow)
+			}
+			if pub.count() != 0 {
+				t.Fatalf("published %d tickets, want 0", pub.count())
+			}
+		})
+	}
+}
+
 func TestS3APIMutationPolicyRejectsBeforeSideEffects(t *testing.T) {
-	signedPayload := sha256.Sum256([]byte("hello"))
 	tests := []struct {
 		name    string
 		method  string
@@ -652,7 +683,8 @@ func TestS3APIMutationPolicyRejectsBeforeSideEffects(t *testing.T) {
 		headers map[string]string
 		mutate  func(*http.Request)
 	}{
-		{name: "signed sha256 put", method: http.MethodPut, body: "hello", length: 5, headers: map[string]string{"x-amz-content-sha256": hex.EncodeToString(signedPayload[:])}},
+		{name: "signed streaming put", method: http.MethodPut, body: "hello", length: 5, headers: map[string]string{"x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"}},
+		{name: "streaming put without decoded length", method: http.MethodPut, body: "hello", length: 5, headers: map[string]string{"x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER"}},
 		{name: "aws chunked put", method: http.MethodPut, body: "hello", length: 5, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD", "Content-Encoding": "aws-chunked"}},
 		{name: "unknown length put", method: http.MethodPut, body: "hello", length: -1, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}},
 		{name: "delete body", method: http.MethodDelete, body: "x", length: 1, headers: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}},

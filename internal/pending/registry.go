@@ -314,7 +314,9 @@ func validateRequest(req Request, now time.Time) error {
 		if err := tickets.ValidateByteRange(req.Range); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}
-	case tickets.OperationPutObject, tickets.OperationDeleteObject:
+	case tickets.OperationPutObject, tickets.OperationDeleteObject,
+		tickets.OperationCreateMultipartUpload, tickets.OperationUploadPart,
+		tickets.OperationCompleteMultipartUpload, tickets.OperationAbortMultipartUpload:
 		if req.List != nil {
 			return fmt.Errorf("%w: list metadata must be omitted for object requests", ErrInvalidRequest)
 		}
