@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/terion-name/air3/internal/ingest"
 )
 
 const (
@@ -75,6 +77,10 @@ func NewRegistry(opts Options) *Registry {
 	return &Registry{now: now, entries: make(map[string]*entry)}
 }
 
+// URLForRequest derives the upload-source URL from the same base as the ticket
+// ingest URL, canonicalizing the path so it stays routable by the edge's
+// private listener: an explicit /_upload-source suffix is kept, an /_ingest
+// suffix is swapped for /_upload-source, and any other path is replaced.
 func URLForRequest(base string, requestID string) (string, error) {
 	if !safeToken(requestID) {
 		return "", fmt.Errorf("%w: request id is required and may contain only safe token characters", ErrInvalidSource)
@@ -88,11 +94,14 @@ func URLForRequest(base string, requestID string) (string, error) {
 	}
 
 	prefix := strings.TrimSuffix(PathPrefix, "/")
+	ingestPrefix := strings.TrimSuffix(ingest.PathPrefix, "/")
 	path := strings.TrimRight(u.Path, "/")
-	if path == "" {
+	switch {
+	case strings.HasSuffix(path, prefix):
+	case strings.HasSuffix(path, ingestPrefix):
+		path = strings.TrimSuffix(path, ingestPrefix) + prefix
+	default:
 		path = prefix
-	} else if !strings.HasSuffix(path, prefix) {
-		path += PathPrefix[:len(PathPrefix)-1]
 	}
 	u.Path = path + "/" + url.PathEscape(requestID)
 	u.RawPath = ""
